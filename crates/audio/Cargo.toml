@@ -6,3 +6,7 @@ license.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+byteorder = { workspace = true }
+
+[dev-dependencies]
+whisper-model = { path = "../model" }
