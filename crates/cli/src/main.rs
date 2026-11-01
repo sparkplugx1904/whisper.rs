@@ -36,11 +36,17 @@ struct Args {
     /// Translate from source language to English
     #[arg(long = "translate", default_value_t = false)]
     translate: bool,
+    /// Beam size for beam search (1 = greedy, >1 = beam search)
+    #[arg(short = 'b', long = "beam-size", default_value_t = 1)]
+    beam_size: usize,
+
+    /// Initial prompt for context conditioning
+    #[arg(long = "prompt")]
+    prompt: Option<String>,
 
     /// Disable timestamp tokens
     #[arg(long = "no-timestamps", default_value_t = false)]
     no_timestamps: bool,
-
     /// Print model information and exit
     #[arg(long = "info", default_value_t = false)]
     info: bool,
@@ -135,6 +141,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let params = WhisperParams {
         language: args.language.clone(),
         translate: args.translate,
+        beam_size: args.beam_size,
+        initial_prompt: args.prompt,
         no_timestamps: args.no_timestamps,
         n_threads: args.threads,
         ..Default::default()

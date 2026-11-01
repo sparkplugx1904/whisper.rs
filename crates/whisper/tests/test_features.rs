@@ -9,11 +9,18 @@ fn workspace_path(rel: &str) -> PathBuf {
     ws_root.join(rel)
 }
 
+fn resolve_model_path(name: &str) -> PathBuf {
+    let p = workspace_path(&format!("models/{}", name));
+    if p.exists() {
+        return p;
+    }
+    PathBuf::from(format!("/tmp/models/{}", name))
+}
+
 #[test]
 fn test_language_detection() {
     let wav_path = workspace_path("samples/jfk.wav");
-    let model_path = Path::new("/tmp/models/ggml-tiny.bin"); // multilingual model
-
+    let model_path = resolve_model_path("ggml-tiny.bin");
     if !model_path.exists() {
         eprintln!("Multilingual model not found, skipping language detection test");
         return;
@@ -45,7 +52,7 @@ fn test_language_detection() {
 #[test]
 fn test_transcribe_with_timestamps_and_srt() {
     let wav_path = workspace_path("samples/jfk.wav");
-    let model_path = Path::new("/tmp/models/ggml-tiny.en.bin");
+    let model_path = resolve_model_path("ggml-tiny.en.bin");
 
     if !model_path.exists() {
         eprintln!("Model not found, skipping timestamp transcription test");

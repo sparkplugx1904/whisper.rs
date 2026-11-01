@@ -102,6 +102,7 @@ impl DecoderWeights {
     }
 }
 
+#[derive(Clone)]
 pub struct DecoderKvCache {
     /// Layer index -> self-attention key cache: [T_past, d_model]
     pub k_self: Vec<Vec<f32>>,

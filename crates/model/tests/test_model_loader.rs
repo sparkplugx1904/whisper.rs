@@ -1,9 +1,22 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use whisper_model::{ModelType, WhisperModel};
+
+fn resolve_model_path(name: &str) -> PathBuf {
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("models/{}", name));
+    if ws.exists() {
+        return ws;
+    }
+    PathBuf::from(format!("/tmp/models/{}", name))
+}
 
 #[test]
 fn test_load_tiny_en() {
-    let path = Path::new("/tmp/models/ggml-tiny.en.bin");
+    let path = resolve_model_path("ggml-tiny.en.bin");
     if !path.exists() {
         eprintln!("Model file {:?} not found, skipping integration test", path);
         return;
@@ -56,7 +69,7 @@ fn test_load_tiny_en() {
 
 #[test]
 fn test_load_tiny_multilingual() {
-    let path = Path::new("/tmp/models/ggml-tiny.bin");
+    let path = resolve_model_path("ggml-tiny.bin");
     if !path.exists() {
         eprintln!("Model file {:?} not found, skipping integration test", path);
         return;

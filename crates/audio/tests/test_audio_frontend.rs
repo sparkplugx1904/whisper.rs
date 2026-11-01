@@ -10,6 +10,14 @@ fn workspace_path(rel: &str) -> std::path::PathBuf {
     ws_root.join(rel)
 }
 
+fn resolve_model_path(name: &str) -> std::path::PathBuf {
+    let p = workspace_path(&format!("models/{}", name));
+    if p.exists() {
+        return p;
+    }
+    std::path::PathBuf::from(format!("/tmp/models/{}", name))
+}
+
 #[test]
 fn test_wav_loader() {
     let wav_path = workspace_path("samples/jfk.wav");
@@ -31,7 +39,7 @@ fn test_wav_loader() {
 #[test]
 fn test_mel_spectrogram_vs_reference() {
     let wav_path = workspace_path("samples/jfk.wav");
-    let model_path = Path::new("/tmp/models/ggml-tiny.en.bin");
+    let model_path = resolve_model_path("ggml-tiny.en.bin");
     let ref_path = workspace_path("tests/fixtures/jfk_mel_reference.bin");
 
     if !model_path.exists() || !ref_path.exists() {

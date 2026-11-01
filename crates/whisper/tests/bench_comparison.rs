@@ -10,10 +10,18 @@ fn workspace_path(rel: &str) -> PathBuf {
     ws_root.join(rel)
 }
 
+fn resolve_model_path(name: &str) -> PathBuf {
+    let p = workspace_path(&format!("models/{}", name));
+    if p.exists() {
+        return p;
+    }
+    PathBuf::from(format!("/tmp/models/{}", name))
+}
+
 #[test]
 fn bench_whisper_pure_vs_cpp() {
     let wav_path = workspace_path("samples/jfk.wav");
-    let model_path = Path::new("/tmp/models/ggml-tiny.en.bin");
+    let model_path = resolve_model_path("ggml-tiny.en.bin");
 
     if !model_path.exists() {
         eprintln!("Model not found, skipping benchmark");

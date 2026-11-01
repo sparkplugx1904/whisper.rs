@@ -12,10 +12,18 @@ fn workspace_path(rel: &str) -> PathBuf {
     ws_root.join(rel)
 }
 
+fn resolve_model_path(name: &str) -> PathBuf {
+    let p = workspace_path(&format!("models/{}", name));
+    if p.exists() {
+        return p;
+    }
+    PathBuf::from(format!("/tmp/models/{}", name))
+}
+
 #[test]
 fn test_decoder_first_logits_vs_reference() {
     let wav_path = workspace_path("samples/jfk.wav");
-    let model_path = Path::new("/tmp/models/ggml-tiny.en.bin");
+    let model_path = resolve_model_path("ggml-tiny.en.bin");
     let ref_path = workspace_path("tests/fixtures/jfk_first_logits.bin");
 
     if !model_path.exists() || !ref_path.exists() {
@@ -105,7 +113,7 @@ fn test_decoder_first_logits_vs_reference() {
 #[test]
 fn test_greedy_transcription_jfk() {
     let wav_path = workspace_path("samples/jfk.wav");
-    let model_path = Path::new("/tmp/models/ggml-tiny.en.bin");
+    let model_path = resolve_model_path("ggml-tiny.en.bin");
 
     if !model_path.exists() {
         eprintln!("Missing model, skipping greedy transcription test");
