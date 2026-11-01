@@ -17,6 +17,22 @@ impl MelSpectrogram {
     pub fn get(&self, m: usize, t: usize) -> f32 {
         self.data[m * self.n_len + t]
     }
+
+    /// Extract a [n_mel, 2 * n_ctx] chunk at a given frame offset for encoder consumption.
+    pub fn get_chunk(&self, offset: usize, n_ctx: usize) -> Vec<f32> {
+        let chunk_len = 2 * n_ctx;
+        let mut dst = vec![0.0f32; self.n_mel * chunk_len];
+        let i0 = offset.min(self.n_len);
+        let i1 = (offset + chunk_len).min(self.n_len);
+        let valid_len = i1.saturating_sub(i0);
+
+        for j in 0..self.n_mel {
+            let src_row = &self.data[j * self.n_len + i0..j * self.n_len + i0 + valid_len];
+            let dst_row = &mut dst[j * chunk_len..j * chunk_len + valid_len];
+            dst_row.copy_from_slice(src_row);
+        }
+        dst
+    }
 }
 
 pub fn hann_window(length: usize) -> Vec<f32> {

@@ -10,3 +10,4 @@ whisper-audio = { path = "../audio" }
 whisper-model = { path = "../model" }
 whisper-tokenizer = { path = "../tokenizer" }
 thiserror = { workspace = true }
+byteorder = { workspace = true }
