@@ -290,6 +290,7 @@ name = "whisper-tokenizer"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+ "whisper-model",
 ]
 
 [[package]]

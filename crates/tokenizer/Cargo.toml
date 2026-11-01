@@ -3,6 +3,6 @@ name = "whisper-tokenizer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
 [dependencies]
+whisper-model = { path = "../model" }
 thiserror = { workspace = true }

@@ -1,7 +1,9 @@
 //! whisper-rs-pure: 100% Pure Rust implementation of OpenAI Whisper inference (whisper.cpp port).
 
+pub mod decoder;
 pub mod encoder;
 
+pub use decoder::{DecoderBlockWeights, DecoderKvCache, DecoderWeights, WhisperDecoder};
 pub use encoder::{EncoderBlockWeights, EncoderWeights, WhisperEncoder};
 pub use whisper_audio as audio;
 pub use whisper_model as model;
