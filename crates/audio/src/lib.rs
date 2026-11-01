@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Audio loading, resampling, and log-mel spectrogram extraction for whisper.rs.
 
 pub mod fft;

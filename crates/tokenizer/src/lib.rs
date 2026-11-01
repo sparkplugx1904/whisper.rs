@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Tokenizer (GPT-2 BPE & multilingual special tokens) for whisper.rs.
 
 use thiserror::Error;

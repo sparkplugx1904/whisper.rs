@@ -28,6 +28,38 @@ impl WhisperContext {
         })
     }
 
+    /// Load context directly from model file.
+    pub fn load_model(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, whisper_model::ModelError> {
+        let model = WhisperModel::load_from_file(path)?;
+        Self::new(model)
+    }
+
+    /// Transcribe raw PCM float samples (16,000 Hz mono in range [-1.0, 1.0]).
+    pub fn transcribe_pcm(&self, samples: &[f32], params: &WhisperParams) -> Vec<Segment> {
+        let mel = whisper_audio::compute_log_mel_spectrogram(
+            samples,
+            &self.model.filters.data,
+            self.model.filters.n_mel,
+        );
+        self.transcribe(&mel, params)
+    }
+
+    /// Transcribe a WAV audio file directly from disk.
+    pub fn transcribe_file(
+        &self,
+        wav_path: impl AsRef<std::path::Path>,
+        params: &WhisperParams,
+    ) -> Result<Vec<Segment>, Box<dyn std::error::Error>> {
+        let audio = whisper_audio::WavAudio::load_from_file(wav_path)?;
+        let samples = if audio.sample_rate != 16000 {
+            whisper_audio::resample_to_16k(&audio.samples, audio.sample_rate)
+        } else {
+            audio.samples
+        };
+        Ok(self.transcribe_pcm(&samples, params))
+    }
     /// Auto-detect the spoken language from the first 30 seconds of audio.
     /// Returns (language_code, probability).
     pub fn detect_language(&self, mel: &MelSpectrogram) -> (String, f32) {
