@@ -1,0 +1,13 @@
+[package]
+name = "whisper-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "whisper-cli"
+path = "src/main.rs"
+
+[dependencies]
+whisper-rs-pure = { path = "../whisper" }
+clap = { workspace = true }

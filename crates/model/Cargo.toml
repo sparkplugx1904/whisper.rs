@@ -1,0 +1,11 @@
+[package]
+name = "whisper-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+whisper-tensor = { path = "../tensor" }
+byteorder = { workspace = true }
+memmap2 = { workspace = true }
+thiserror = { workspace = true }

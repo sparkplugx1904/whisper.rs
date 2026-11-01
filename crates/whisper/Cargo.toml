@@ -1,0 +1,12 @@
+[package]
+name = "whisper-rs-pure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+whisper-tensor = { path = "../tensor" }
+whisper-audio = { path = "../audio" }
+whisper-model = { path = "../model" }
+whisper-tokenizer = { path = "../tokenizer" }
+thiserror = { workspace = true }
