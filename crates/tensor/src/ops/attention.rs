@@ -1,4 +1,5 @@
 use crate::ops::softmax::softmax_inplace;
+use crate::simd::dot_f32;
 
 #[allow(clippy::too_many_arguments)]
 pub fn multi_head_attention(
@@ -34,11 +35,7 @@ pub fn multi_head_attention(
             // 1. Compute attention scores for row i
             for j in 0..max_j {
                 let k_vec = &k[j * d_model + head_offset..j * d_model + head_offset + d_head];
-                let mut dot = 0.0f32;
-                for d in 0..d_head {
-                    dot += q_vec[d] * k_vec[d];
-                }
-                scores[j] = dot * scale;
+                scores[j] = dot_f32(q_vec, k_vec) * scale;
             }
 
             // 2. Softmax

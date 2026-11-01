@@ -3,8 +3,8 @@
 pub mod dtype;
 pub mod error;
 pub mod ops;
+pub mod simd;
 pub mod tensor;
-
 pub use dtype::DType;
 pub use error::TensorError;
 pub use ops::*;
