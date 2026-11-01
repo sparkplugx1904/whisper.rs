@@ -139,30 +139,31 @@ impl WhisperContext {
                 max_steps = 224;
             }
 
+            let n_vocab = self.decoder.n_vocab;
             for step in 0..max_steps {
-                assert_eq!(logits.len(), self.decoder.n_vocab);
-
+                let start_idx = logits.len() - n_vocab;
+                let step_logits = &mut logits[start_idx..];
                 // Filter / suppress
                 if params.suppress_blank && step == 0 {
                     // Suppress space token (220) and EOT at start
-                    logits[220] = f32::NEG_INFINITY;
-                    logits[eot as usize] = f32::NEG_INFINITY;
+                    step_logits[220] = f32::NEG_INFINITY;
+                    step_logits[eot as usize] = f32::NEG_INFINITY;
                 }
 
                 if params.no_timestamps {
                     // Suppress all timestamp tokens
-                    logits[(beg as usize)..self.decoder.n_vocab].fill(f32::NEG_INFINITY);
+                    step_logits[(beg as usize)..n_vocab].fill(f32::NEG_INFINITY);
                 } else if let Some(last_ts) = last_timestamp_token {
                     // Timestamps must not go backwards
                     if (last_ts as usize) > (beg as usize) {
-                        logits[(beg as usize)..(last_ts as usize)].fill(f32::NEG_INFINITY);
+                        step_logits[(beg as usize)..(last_ts as usize)].fill(f32::NEG_INFINITY);
                     }
                 }
 
                 // Greedy argmax
                 let mut best_id = 0;
                 let mut best_logit = f32::NEG_INFINITY;
-                for (i, &l) in logits.iter().enumerate() {
+                for (i, &l) in step_logits.iter().enumerate() {
                     if l > best_logit {
                         best_logit = l;
                         best_id = i as i32;
