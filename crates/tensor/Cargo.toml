@@ -3,6 +3,6 @@ name = "whisper-tensor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
 [dependencies]
 thiserror = { workspace = true }
+half = { workspace = true }

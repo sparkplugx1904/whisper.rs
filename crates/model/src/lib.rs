@@ -1,5 +1,17 @@
 //! Model loader for whisper.rs supporting whisper.cpp ggml format (.bin).
 
+pub mod filters;
+pub mod header;
+pub mod loader;
+pub mod tensor_info;
+pub mod vocab;
+
+pub use filters::MelFilters;
+pub use header::{Hyperparameters, ModelType, GGML_FILE_MAGIC};
+pub use loader::WhisperModel;
+pub use tensor_info::TensorInfo;
+pub use vocab::{lang_id, lang_str, lang_str_full, Vocab, LANGUAGES};
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
