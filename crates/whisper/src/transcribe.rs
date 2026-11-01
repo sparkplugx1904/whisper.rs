@@ -52,13 +52,16 @@ impl WhisperContext {
         params: &WhisperParams,
         samples: &[f32],
     ) -> Result<(), AudioError> {
+        state.clear();
+        if samples.len() < 1600 {
+            return Ok(());
+        }
         let mel = whisper_audio::compute_log_mel_spectrogram(
             samples,
             &self.model.filters.data,
             self.model.filters.n_mel,
         );
 
-        state.clear();
         state.segments = self.transcribe_internal(&mel, params, state);
         Ok(())
     }
@@ -205,11 +208,9 @@ impl WhisperContext {
         let total_audio_sec = mel.n_len_org as f64 * 0.01;
 
         while seek_frame < mel.n_len_org {
-            // Stop if less than 100 ms left
             if seek_frame + 10 >= mel.n_len_org {
                 break;
             }
-
             let seek_time = seek_frame as f64 * 0.01;
             let mel_chunk = mel.get_chunk(seek_frame, n_audio_ctx);
             let enc_out = self.encoder.forward(&mel_chunk);
@@ -217,6 +218,11 @@ impl WhisperContext {
 
             let mut temperature = params.temperature;
             let mut tokens_cur = Vec::new();
+
+            let gbnf_grammar = params
+                .grammar
+                .as_deref()
+                .and_then(|g| whisper_grammar::GbnfGrammar::parse(g).ok());
 
             // Temperature fallback loop (e.g. 0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
             while temperature <= 1.0 {
@@ -261,11 +267,7 @@ impl WhisperContext {
                         })
                         .collect();
 
-                    let max_steps = if params.max_tokens == 0 {
-                        224
-                    } else {
-                        params.max_tokens
-                    };
+                    let max_steps = 224;
                     for step in 1..max_steps {
                         if beam.is_all_completed() {
                             break;
@@ -289,11 +291,7 @@ impl WhisperContext {
                     let mut logits = self.decoder.decode(&prompt_base, &enc_out, &mut cache);
                     tokens_cur.clear();
                     let mut last_timestamp_token: Option<i32> = None;
-                    let max_steps = if params.max_tokens == 0 {
-                        224
-                    } else {
-                        params.max_tokens
-                    };
+                    let max_steps = 224;
                     let n_vocab = self.decoder.n_vocab;
 
                     for step in 0..max_steps {
@@ -313,6 +311,11 @@ impl WhisperContext {
                                 step_logits[(beg as usize)..(last_ts as usize)]
                                     .fill(f32::NEG_INFINITY);
                             }
+                        }
+
+                        if let Some(gbnf) = &gbnf_grammar {
+                            let cur_txt = self.tokenizer.decode(&tokens_cur, true);
+                            gbnf.filter_logits(&cur_txt, step_logits, &self.model.vocab);
                         }
 
                         // Greedy argmax
@@ -353,16 +356,23 @@ impl WhisperContext {
 
             // Extract segments from tokens_cur
             if params.no_timestamps || tokens_cur.is_empty() {
-                let text = self.tokenizer.decode(&tokens_cur, true);
-                let t1 = (seek_time + 30.0).min(total_audio_sec);
-                if !text.trim().is_empty() {
-                    segments.push(Segment::new(seek_time, t1, text, tokens_cur.clone()));
+                let max_tok = if params.max_tokens > 0 {
+                    params.max_tokens
+                } else {
+                    tokens_cur.len().max(1)
+                };
+                for chunk in tokens_cur.chunks(max_tok) {
+                    let text = self.tokenizer.decode(chunk, true);
+                    let t1 = (seek_time + 30.0).min(total_audio_sec);
+                    if !text.trim().is_empty() {
+                        segments.push(Segment::new(seek_time, t1, text, chunk.to_vec()));
+                    }
                 }
                 seek_frame += chunk_frames;
             } else {
                 let mut seg_tokens = Vec::new();
                 let mut seg_t0 = seek_time;
-                let mut advanced_seek = false;
+                let mut last_end_time = seek_time;
 
                 for &tok in &tokens_cur {
                     if tok >= beg {
@@ -383,27 +393,40 @@ impl WhisperContext {
                             }
                             seg_tokens.clear();
                             seg_t0 = abs_sec;
-
-                            let frame_offset = (rel_sec / 0.01).round() as usize;
-                            if frame_offset > 0 {
-                                seek_frame += frame_offset;
-                                advanced_seek = true;
-                            }
+                            last_end_time = abs_sec;
                         }
                     } else {
                         seg_tokens.push(tok);
+                        if params.max_tokens > 0 && seg_tokens.len() >= params.max_tokens {
+                            let text = self.tokenizer.decode(&seg_tokens, true);
+                            let t_mid =
+                                (seg_t0 + (seg_tokens.len() as f64 * 0.2)).min(total_audio_sec);
+                            if !text.trim().is_empty() {
+                                segments.push(Segment::new(
+                                    seg_t0,
+                                    t_mid,
+                                    text,
+                                    seg_tokens.clone(),
+                                ));
+                            }
+                            seg_tokens.clear();
+                            seg_t0 = t_mid;
+                        }
                     }
                 }
-
                 if !seg_tokens.is_empty() {
                     let text = self.tokenizer.decode(&seg_tokens, true);
                     let t1 = (seek_time + 30.0).min(total_audio_sec);
                     if !text.trim().is_empty() {
                         segments.push(Segment::new(seg_t0, t1, text, seg_tokens));
                     }
+                    last_end_time = t1;
                 }
 
-                if !advanced_seek {
+                let advanced_frames = ((last_end_time - seek_time) / 0.01).round() as usize;
+                if advanced_frames >= 100 {
+                    seek_frame += advanced_frames;
+                } else {
                     seek_frame += chunk_frames;
                 }
             }

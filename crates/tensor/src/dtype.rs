@@ -234,4 +234,172 @@ impl DType {
             }
         }
     }
+
+    /// Quantize a slice of float32 values into raw bytes for this DType.
+    pub fn quantize_from_f32(self, src: &[f32]) -> Result<Vec<u8>, TensorError> {
+        let num_elements = src.len();
+        let expected_bytes = self.byte_size_for(num_elements);
+        let mut out = Vec::with_capacity(expected_bytes);
+
+        match self {
+            DType::F32 => {
+                for &val in src {
+                    out.extend_from_slice(&val.to_le_bytes());
+                }
+                Ok(out)
+            }
+            DType::F16 => {
+                for &val in src {
+                    let bits = f16::from_f32(val).to_bits();
+                    out.extend_from_slice(&bits.to_le_bytes());
+                }
+                Ok(out)
+            }
+            DType::Q8_0 => {
+                for chunk in src.chunks(32) {
+                    let mut block = [0.0f32; 32];
+                    block[..chunk.len()].copy_from_slice(chunk);
+                    let amax = block.iter().fold(0.0f32, |acc, &v| acc.max(v.abs()));
+                    let d = amax / 127.0;
+                    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                    let d_bits = f16::from_f32(d).to_bits();
+                    out.extend_from_slice(&d_bits.to_le_bytes());
+                    for &v in &block {
+                        let q = ((v * id).round() as i32).clamp(-127, 127) as i8;
+                        out.push(q as u8);
+                    }
+                }
+                Ok(out)
+            }
+            DType::Q4_0 => {
+                for chunk in src.chunks(32) {
+                    let mut block = [0.0f32; 32];
+                    block[..chunk.len()].copy_from_slice(chunk);
+                    let mut amax = 0.0f32;
+                    let mut max_val = 0.0f32;
+                    for &v in &block {
+                        if v.abs() > amax {
+                            amax = v.abs();
+                            max_val = v;
+                        }
+                    }
+                    let d = max_val / -8.0;
+                    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                    let d_bits = f16::from_f32(d).to_bits();
+                    out.extend_from_slice(&d_bits.to_le_bytes());
+                    for j in 0..16 {
+                        let v0 = block[j];
+                        let v1 = block[j + 16];
+                        let xi0 = (((v0 * id) + 8.5).floor() as i32).clamp(0, 15) as u8;
+                        let xi1 = (((v1 * id) + 8.5).floor() as i32).clamp(0, 15) as u8;
+                        out.push(xi0 | (xi1 << 4));
+                    }
+                }
+                Ok(out)
+            }
+            DType::Q4_1 => {
+                for chunk in src.chunks(32) {
+                    let mut block = [0.0f32; 32];
+                    block[..chunk.len()].copy_from_slice(chunk);
+                    let mut min_val = f32::INFINITY;
+                    let mut max_val = f32::NEG_INFINITY;
+                    for &v in &block {
+                        if v < min_val {
+                            min_val = v;
+                        }
+                        if v > max_val {
+                            max_val = v;
+                        }
+                    }
+                    let d = (max_val - min_val) / 15.0;
+                    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                    let d_bits = f16::from_f32(d).to_bits();
+                    let m_bits = f16::from_f32(min_val).to_bits();
+                    out.extend_from_slice(&d_bits.to_le_bytes());
+                    out.extend_from_slice(&m_bits.to_le_bytes());
+                    for j in 0..16 {
+                        let v0 = block[j];
+                        let v1 = block[j + 16];
+                        let xi0 = ((((v0 - min_val) * id) + 0.5).floor() as i32).clamp(0, 15) as u8;
+                        let xi1 = ((((v1 - min_val) * id) + 0.5).floor() as i32).clamp(0, 15) as u8;
+                        out.push(xi0 | (xi1 << 4));
+                    }
+                }
+                Ok(out)
+            }
+            DType::Q5_0 => {
+                for chunk in src.chunks(32) {
+                    let mut block = [0.0f32; 32];
+                    block[..chunk.len()].copy_from_slice(chunk);
+                    let mut amax = 0.0f32;
+                    let mut max_val = 0.0f32;
+                    for &v in &block {
+                        if v.abs() > amax {
+                            amax = v.abs();
+                            max_val = v;
+                        }
+                    }
+                    let d = max_val / -16.0;
+                    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                    let d_bits = f16::from_f32(d).to_bits();
+                    out.extend_from_slice(&d_bits.to_le_bytes());
+
+                    let mut qh = 0u32;
+                    let mut qs = [0u8; 16];
+                    for j in 0..16 {
+                        let v0 = block[j];
+                        let v1 = block[j + 16];
+                        let xi0 = (((v0 * id) + 16.5).floor() as i32).clamp(0, 31) as u8;
+                        let xi1 = (((v1 * id) + 16.5).floor() as i32).clamp(0, 31) as u8;
+                        qs[j] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
+                        qh |= (((xi0 & 0x10) >> 4) as u32) << j;
+                        qh |= (((xi1 & 0x10) >> 4) as u32) << (j + 16);
+                    }
+                    out.extend_from_slice(&qh.to_le_bytes());
+                    out.extend_from_slice(&qs);
+                }
+                Ok(out)
+            }
+            DType::Q5_1 => {
+                for chunk in src.chunks(32) {
+                    let mut block = [0.0f32; 32];
+                    block[..chunk.len()].copy_from_slice(chunk);
+                    let mut min_val = f32::INFINITY;
+                    let mut max_val = f32::NEG_INFINITY;
+                    for &v in &block {
+                        if v < min_val {
+                            min_val = v;
+                        }
+                        if v > max_val {
+                            max_val = v;
+                        }
+                    }
+                    let d = (max_val - min_val) / 31.0;
+                    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                    let d_bits = f16::from_f32(d).to_bits();
+                    let m_bits = f16::from_f32(min_val).to_bits();
+                    out.extend_from_slice(&d_bits.to_le_bytes());
+                    out.extend_from_slice(&m_bits.to_le_bytes());
+
+                    let mut qh = 0u32;
+                    let mut qs = [0u8; 16];
+                    for j in 0..16 {
+                        let v0 = block[j];
+                        let v1 = block[j + 16];
+                        let xi0 = ((((v0 - min_val) * id) + 0.5).floor() as i32).clamp(0, 31) as u8;
+                        let xi1 = ((((v1 - min_val) * id) + 0.5).floor() as i32).clamp(0, 31) as u8;
+                        qs[j] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
+                        qh |= (((xi0 & 0x10) >> 4) as u32) << j;
+                        qh |= (((xi1 & 0x10) >> 4) as u32) << (j + 16);
+                    }
+                    out.extend_from_slice(&qh.to_le_bytes());
+                    out.extend_from_slice(&qs);
+                }
+                Ok(out)
+            }
+            _ => Err(TensorError::InvalidOperation {
+                message: format!("Quantization for {:?} not supported", self),
+            }),
+        }
+    }
 }

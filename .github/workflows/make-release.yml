@@ -1,0 +1,30 @@
+name: Package Release Artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ "v*" ]
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Release Binaries
+        run: cargo build --workspace --release
+
+      - name: Create Tarball
+        run: |
+          mkdir -p release-pkg/bin
+          cp target/release/whisper-cli release-pkg/bin/
+          cd release-pkg && tar -czvf ../whisper-rs-x86_64-linux.tar.gz bin/
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-rs-release
+          path: whisper-rs-*.tar.gz

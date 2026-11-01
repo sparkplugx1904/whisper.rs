@@ -1,0 +1,15 @@
+[package]
+name = "whisper-quantize"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "whisper-quantize"
+path = "src/main.rs"
+
+[dependencies]
+whisper-tensor = { path = "../tensor" }
+whisper-model = { path = "../model" }
+clap = { workspace = true }
+byteorder = { workspace = true }

@@ -1,0 +1,21 @@
+name: Build FreeBSD
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-freebsd
+
+      - name: Build FreeBSD Target
+        run: cargo check --workspace --target x86_64-unknown-freebsd --verbose

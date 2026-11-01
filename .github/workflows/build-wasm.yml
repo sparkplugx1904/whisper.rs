@@ -1,0 +1,29 @@
+name: Build WASM
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  wasm-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - wasm32-unknown-unknown
+          - wasm32-wasip1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build WASM target
+        run: cargo build --package whisper-rs-pure --target ${{ matrix.target }} --release

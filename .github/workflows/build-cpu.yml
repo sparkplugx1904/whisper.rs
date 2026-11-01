@@ -1,0 +1,42 @@
+name: Build CPU
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  cpu-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Gate Check
+        run: ./scripts/check_pure_rust.sh
+
+      - name: Install Cross for non-host target
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build Host
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --workspace --release --verbose
+
+      - name: Test Host
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --workspace --release --verbose
+
+      - name: Cross Build aarch64
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cross build --workspace --target ${{ matrix.target }} --release

@@ -1,0 +1,30 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - x86_64-pc-windows-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build Windows
+        run: cargo build --workspace --target ${{ matrix.target }} --release --verbose
+
+      - name: Test Windows MSVC
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo test --workspace --target ${{ matrix.target }} --release --verbose

@@ -24,6 +24,8 @@ pub struct WhisperParams {
     pub no_speech_threshold: f64,
     /// Initial prompt text
     pub initial_prompt: Option<String>,
+    /// Optional GBNF grammar specification for constrained decoding
+    pub grammar: Option<String>,
     /// Maximum number of tokens to generate per 30s chunk (0 = default 224)
     pub max_tokens: usize,
     /// Number of threads for computation
@@ -45,6 +47,7 @@ impl Default for WhisperParams {
             logprob_threshold: -1.0,
             no_speech_threshold: 0.6,
             initial_prompt: None,
+            grammar: None,
             max_tokens: 224,
             n_threads: 4,
         }

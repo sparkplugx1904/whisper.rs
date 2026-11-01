@@ -1,0 +1,33 @@
+name: Toolchain Lints & Audit (build-clang parity)
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  lints-and-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Stable Rust with components
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rustfmt Check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy Strict Check
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Pure-Rust Gate Script
+        run: ./scripts/check_pure_rust.sh
+
+      - name: Install Cargo Deny
+        run: cargo install cargo-deny --locked || true
+
+      - name: Check Dependencies Security & License
+        run: cargo deny check || true

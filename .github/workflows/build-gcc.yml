@@ -1,0 +1,27 @@
+name: Compiler Channels (build-gcc parity)
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  channels:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        channel: [stable, beta, nightly]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ matrix.channel }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.channel }}
+
+      - name: Build Workspace
+        run: cargo build --workspace --verbose
+
+      - name: Test Workspace
+        run: cargo test --workspace --verbose

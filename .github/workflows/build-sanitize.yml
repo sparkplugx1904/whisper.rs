@@ -1,0 +1,35 @@
+name: Build Sanitizers
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: AddressSanitizer Test
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+          RUSTDOCFLAGS: "-Zsanitizer=address"
+        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu -p whisper-tensor -p whisper-audio
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nightly with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Run Miri on Tensor Operations
+        run: cargo miri test -p whisper-tensor

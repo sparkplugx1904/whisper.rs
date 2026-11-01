@@ -11,3 +11,7 @@ whisper-model = { path = "../model" }
 whisper-tokenizer = { path = "../tokenizer" }
 thiserror = { workspace = true }
 byteorder = { workspace = true }
+whisper-grammar = { path = "../grammar" }
+
+[dev-dependencies]
+whisper-vad = { path = "../vad" }

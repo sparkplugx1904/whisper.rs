@@ -1,0 +1,22 @@
+name: Build Quantize
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test-quantize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Quantizer
+        run: cargo build --package whisper-tensor --package whisper-cli --release
+
+      - name: Test Quant Kernels
+        run: cargo test --package whisper-tensor --test test_quant_kernels --release

@@ -1,0 +1,11 @@
+[package]
+name = "whisper-vad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+whisper-audio = { path = "../audio" }
+whisper-model = { path = "../model" }
+byteorder = { workspace = true }
+thiserror = { workspace = true }

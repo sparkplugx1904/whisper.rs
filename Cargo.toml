@@ -6,6 +6,14 @@ members = [
     "crates/tokenizer",
     "crates/whisper",
     "crates/cli",
+    "crates/quantize",
+    "crates/bench",
+    "examples/server",
+    "examples/command",
+    "examples/stream",
+    "crates/grammar",
+    "crates/vad",
+    "crates/ffi",
 ]
 resolver = "2"
 
@@ -22,6 +30,7 @@ byteorder = "1.5"
 memmap2 = "0.9"
 clap = { version = "4.5", features = ["derive"] }
 half = { version = "2.4", default-features = false }
+rayon = "1.10"
 
 [profile.release]
 opt-level = 3

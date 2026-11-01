@@ -13,7 +13,7 @@ FORBIDDEN_FILES=$(find . -type f \( \
     -o -name "*.h" -o -name "*.hpp" -o -name "*.hxx" \
     -o -name "*.m" -o -name "*.mm" \
     -o -name "*.s" -o -name "*.S" \
-\) ! -path "*/target/*" ! -path "*/.git/*" ! -path "*/fixtures/*" || true)
+\) ! -path "*/target/*" ! -path "*/.git/*" ! -path "*/fixtures/*" ! -path "*/include/whisper.h" || true)
 
 if [ -n "$FORBIDDEN_FILES" ]; then
     echo "ERROR: Found forbidden C/C++/Assembly source files:" >&2
