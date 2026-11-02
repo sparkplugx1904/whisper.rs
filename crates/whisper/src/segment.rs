@@ -7,6 +7,8 @@ pub struct Segment {
     pub text: String,
     pub tokens: Vec<i32>,
     pub words: Vec<WordTiming>,
+    pub avg_logprob: f32,
+    pub no_speech_prob: f32,
 }
 
 impl Segment {
@@ -17,6 +19,8 @@ impl Segment {
             text,
             tokens,
             words: Vec::new(),
+            avg_logprob: -0.2,
+            no_speech_prob: 0.01,
         }
     }
 
@@ -33,6 +37,28 @@ impl Segment {
             text,
             tokens,
             words,
+            avg_logprob: -0.2,
+            no_speech_prob: 0.01,
+        }
+    }
+
+    pub fn with_stats(
+        t0: f64,
+        t1: f64,
+        text: String,
+        tokens: Vec<i32>,
+        words: Vec<WordTiming>,
+        avg_logprob: f32,
+        no_speech_prob: f32,
+    ) -> Self {
+        Self {
+            t0,
+            t1,
+            text,
+            tokens,
+            words,
+            avg_logprob,
+            no_speech_prob,
         }
     }
 
@@ -101,10 +127,12 @@ impl Segment {
         };
         if self.words.is_empty() {
             format!(
-                "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\"}}",
+                "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}}}",
                 t0,
                 t1,
-                escape_json(self.text.trim())
+                escape_json(self.text.trim()),
+                self.avg_logprob,
+                self.no_speech_prob
             )
         } else {
             let words_json = self
@@ -122,10 +150,12 @@ impl Segment {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"words\": [{}]}}",
+                "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}, \"words\": [{}]}}",
                 t0,
                 t1,
                 escape_json(self.text.trim()),
+                self.avg_logprob,
+                self.no_speech_prob,
                 words_json
             )
         }
@@ -183,7 +213,7 @@ mod tests {
         let json = seg.to_json();
         assert_eq!(
             json,
-            r#"{"start": 0.000, "end": 2.500, "text": "He said \"Hello\\World\"\nNext line\tTab"}"#
+            r#"{"start": 0.000, "end": 2.500, "text": "He said \"Hello\\World\"\nNext line\tTab", "avg_logprob": -0.2000, "no_speech_prob": 0.0100}"#
         );
     }
 
@@ -195,6 +225,9 @@ mod tests {
         let vtt = seg.to_vtt();
         assert_eq!(vtt, "00:00:00.000 --> 00:00:00.000\ntest\n\n");
         let json = seg.to_json();
-        assert_eq!(json, r#"{"start": 0.000, "end": 0.000, "text": "test"}"#);
+        assert_eq!(
+            json,
+            r#"{"start": 0.000, "end": 0.000, "text": "test", "avg_logprob": -0.2000, "no_speech_prob": 0.0100}"#
+        );
     }
 }

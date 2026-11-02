@@ -9,7 +9,10 @@ pub mod wav;
 
 pub use decode::{load_audio_from_bytes, load_audio_from_file};
 pub use fft::Fft400;
-pub use mel::{compute_log_mel_spectrogram, hann_window, MelSpectrogram, HOP_LENGTH, N_MELS};
+pub use mel::{
+    compute_log_mel_spectrogram, generate_slaney_mel_filters, hann_window, MelSpectrogram,
+    HOP_LENGTH, N_MELS,
+};
 pub use resample::resample_to_16k;
 use thiserror::Error;
 pub use wav::{WavAudio, WHISPER_SAMPLE_RATE};

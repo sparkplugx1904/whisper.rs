@@ -35,6 +35,66 @@ impl MelSpectrogram {
     }
 }
 
+/// Generate Slaney triangular mel filterbank matrix of shape [n_mel, (n_fft / 2) + 1].
+/// Implements standard Slaney scale with linear mapping under 1000 Hz and logarithmic mapping above,
+/// with triangular area normalization.
+pub fn generate_slaney_mel_filters(n_mel: usize, n_fft: usize, sample_rate: usize) -> Vec<f32> {
+    let fmin = 0.0f32;
+    let fmax = (sample_rate as f32) / 2.0;
+    let n_bins = (n_fft / 2) + 1;
+
+    let hz_to_mel = |f: f32| -> f32 {
+        if f < 1000.0 {
+            f / (200.0 / 3.0)
+        } else {
+            15.0 + (f / 1000.0).ln() / (6.4f32.ln() / 27.0)
+        }
+    };
+
+    let mel_to_hz = |m: f32| -> f32 {
+        if m < 15.0 {
+            m * (200.0 / 3.0)
+        } else {
+            1000.0 * ((m - 15.0) * (6.4f32.ln() / 27.0)).exp()
+        }
+    };
+
+    let min_mel = hz_to_mel(fmin);
+    let max_mel = hz_to_mel(fmax);
+
+    let mut mel_f = Vec::with_capacity(n_mel + 2);
+    for i in 0..(n_mel + 2) {
+        let m = min_mel + (i as f32) * (max_mel - min_mel) / ((n_mel + 1) as f32);
+        mel_f.push(mel_to_hz(m));
+    }
+
+    let mut fdiff = Vec::with_capacity(n_mel + 1);
+    for i in 0..(n_mel + 1) {
+        fdiff.push(mel_f[i + 1] - mel_f[i]);
+    }
+
+    let mut fftfreqs = Vec::with_capacity(n_bins);
+    for i in 0..n_bins {
+        fftfreqs.push((i as f32) * fmax / ((n_bins - 1) as f32));
+    }
+
+    let mut weights = vec![0.0f32; n_mel * n_bins];
+    for i in 0..n_mel {
+        let enorm = 2.0 / (mel_f[i + 2] - mel_f[i]);
+        let d_lower = fdiff[i];
+        let d_upper = fdiff[i + 1];
+
+        for (j, &f) in fftfreqs.iter().enumerate() {
+            let lower = (f - mel_f[i]) / d_lower;
+            let upper = (mel_f[i + 2] - f) / d_upper;
+            let w = lower.min(upper).max(0.0) * enorm;
+            weights[i * n_bins + j] = w;
+        }
+    }
+
+    weights
+}
+
 pub fn hann_window(length: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; length];
     for (i, val) in out.iter_mut().enumerate() {
@@ -53,14 +113,22 @@ pub fn compute_log_mel_spectrogram(
     let frame_step = HOP_LENGTH; // 160
     let n_fft_bins = 1 + frame_size / 2; // 201
 
-    assert_eq!(
-        mel_filters.len(),
-        n_mel * n_fft_bins,
-        "Filter data size {} does not match n_mel ({}) * n_fft ({})",
-        mel_filters.len(),
-        n_mel,
-        n_fft_bins
-    );
+    let generated_filters;
+    let filters = if mel_filters.is_empty() {
+        generated_filters =
+            generate_slaney_mel_filters(n_mel, frame_size, WHISPER_SAMPLE_RATE as usize);
+        &generated_filters[..]
+    } else {
+        assert_eq!(
+            mel_filters.len(),
+            n_mel * n_fft_bins,
+            "Filter data size {} does not match n_mel ({}) * n_fft ({})",
+            mel_filters.len(),
+            n_mel,
+            n_fft_bins
+        );
+        mel_filters
+    };
 
     let hann = hann_window(frame_size);
     let fft = Fft400::new();
@@ -120,7 +188,7 @@ pub fn compute_log_mel_spectrogram(
         }
 
         for j in 0..n_mel {
-            let filter_row = &mel_filters[j * n_fft_bins..(j + 1) * n_fft_bins];
+            let filter_row = &filters[j * n_fft_bins..(j + 1) * n_fft_bins];
             let mut sum = 0.0f32;
             for k in 0..n_fft_bins {
                 sum += power[k] * filter_row[k];

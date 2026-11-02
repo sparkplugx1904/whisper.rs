@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "whisper_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "whisper-cli"
 path = "src/main.rs"

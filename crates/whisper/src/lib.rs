@@ -12,7 +12,9 @@ pub mod state;
 pub mod transcribe;
 pub use beam::{BeamCandidate, BeamSearch};
 pub use decoder::{DecoderBlockWeights, DecoderKvCache, DecoderWeights, WhisperDecoder};
-pub use dtw::{align_dtw, merge_tokens_to_words, WordTiming};
+pub use dtw::{
+    align_dtw, get_alignment_heads, merge_tokens_to_words, AlignmentHeadsPreset, WordTiming,
+};
 pub use encoder::{EncoderBlockWeights, EncoderWeights, WhisperEncoder};
 pub use filter::{compression_ratio, compute_token_logprob};
 pub use params::{FullParamsBuilder, SamplingStrategy, WhisperParams};

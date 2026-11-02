@@ -5,7 +5,8 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
-
+pub mod download;
+pub use download::{download_model, get_model_download_url};
 use whisper_rs::model::WhisperModel;
 use whisper_rs::{WhisperContext, WhisperParams};
 
@@ -18,9 +19,12 @@ use whisper_rs::{WhisperContext, WhisperParams};
 )]
 pub struct Args {
     /// Path to model file (.bin)
-    #[arg(short = 'm', long = "model")]
+    #[arg(short = 'm', long = "model", default_value = "")]
     pub model: String,
 
+    /// Download official GGML model by name (e.g. tiny.en, base, large-v3-turbo)
+    #[arg(long = "download")]
+    pub download: Option<String>,
     /// Path to input audio WAV file
     #[arg(short = 'f', long = "file", default_value = "")]
     pub file: String,
@@ -174,7 +178,25 @@ pub fn write_output_files(
     Ok(())
 }
 
-pub fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(ref dl_name) = args.download {
+        let dest = download_model(dl_name, Path::new("models"))?;
+        if args.model.is_empty() {
+            args.model = dest.to_string_lossy().into_owned();
+        }
+        if args.file.is_empty() {
+            println!("Download complete. To transcribe audio with this model, run:");
+            println!("  whisper-cli -m {} -f <audio_file>", dest.display());
+            return Ok(());
+        }
+    }
+
+    if args.model.is_empty() {
+        return Err(
+            "missing model path (specify with -m <model.bin> or --download <model_name>)".into(),
+        );
+    }
+
     let t0 = Instant::now();
     println!(
         "whisper_init_from_file: loading model from '{}'...",
@@ -468,6 +490,7 @@ mod tests {
             output_file: Some(base_str.to_string()),
             word_timestamps: false,
             tinydiarize: false,
+            download: None,
         };
 
         let segments = vec![
@@ -504,7 +527,7 @@ mod tests {
 
         // Verify JSON
         let json_content = fs::read_to_string(format!("{}.json", base_str)).expect("Read json");
-        let expected_json = "[\n  {\"start\": 0.000, \"end\": 2.500, \"text\": \"Hello world!\"},\n  {\"start\": 2.500, \"end\": 65.123, \"text\": \"Line 2 with \\\"quotes\\\" and \\\\slash\"}\n]\n";
+        let expected_json = "[\n  {\"start\": 0.000, \"end\": 2.500, \"text\": \"Hello world!\", \"avg_logprob\": -0.2000, \"no_speech_prob\": 0.0100},\n  {\"start\": 2.500, \"end\": 65.123, \"text\": \"Line 2 with \\\"quotes\\\" and \\\\slash\", \"avg_logprob\": -0.2000, \"no_speech_prob\": 0.0100}\n]\n";
         assert_eq!(json_content, expected_json);
 
         // Clean up temp dir
@@ -530,6 +553,7 @@ mod tests {
             output_file: None,
             word_timestamps: false,
             tinydiarize: false,
+            download: None,
         };
         let res = run(args);
         assert!(res.is_err());
@@ -556,6 +580,7 @@ mod tests {
             output_file: None,
             word_timestamps: false,
             tinydiarize: false,
+            download: None,
         };
         let res = run(args);
         assert!(res.is_err());

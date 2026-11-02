@@ -43,6 +43,8 @@ pub struct WhisperParams {
     pub on_new_segment: Option<NewSegmentCallback>,
     /// Native Rust closure callback invoked on transcription progress (0-100 percentage)
     pub on_progress: Option<ProgressCallback>,
+    /// Pre-calibrated alignment heads preset for DTW word-level timestamps
+    pub dtw_aheads_preset: crate::dtw::AlignmentHeadsPreset,
 }
 
 impl std::fmt::Debug for WhisperParams {
@@ -79,6 +81,7 @@ impl Default for WhisperParams {
             n_threads: 4,
             flash_attn: false,
             tdrz_enable: false,
+            dtw_aheads_preset: crate::dtw::AlignmentHeadsPreset::TinyEn,
             on_new_segment: None,
             on_progress: None,
         }
@@ -169,6 +172,11 @@ impl FullParamsBuilder {
         F: Fn(i32) + Send + Sync + 'static,
     {
         self.params.on_progress = Some(Arc::new(cb));
+        self
+    }
+
+    pub fn dtw_aheads_preset(mut self, preset: crate::dtw::AlignmentHeadsPreset) -> Self {
+        self.params.dtw_aheads_preset = preset;
         self
     }
 

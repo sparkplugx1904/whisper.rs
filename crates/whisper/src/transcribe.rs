@@ -241,6 +241,8 @@ impl WhisperContext {
 
             let mut temperature = params.temperature;
             let mut tokens_cur = Vec::new();
+            let mut token_logprobs = Vec::new();
+            let mut no_speech_prob = 0.01f32;
 
             let gbnf_grammar = params
                 .grammar
@@ -249,6 +251,8 @@ impl WhisperContext {
 
             // Temperature fallback loop (e.g. 0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
             while temperature <= 1.0 {
+                tokens_cur.clear();
+                token_logprobs.clear();
                 let mut cache = DecoderKvCache::new(self.decoder.n_layers);
 
                 if params.beam_size > 1 && temperature == 0.0 {
@@ -341,13 +345,38 @@ impl WhisperContext {
                             gbnf.filter_logits(&cur_txt, step_logits, &self.model.vocab);
                         }
 
-                        // Greedy argmax
+                        // Greedy argmax & logprob calculation
                         let mut best_id = 0;
                         let mut best_logit = f32::NEG_INFINITY;
                         for (i, &l) in step_logits.iter().enumerate() {
                             if l > best_logit {
                                 best_logit = l;
                                 best_id = i as i32;
+                            }
+                        }
+
+                        let max_l = step_logits
+                            .iter()
+                            .copied()
+                            .fold(f32::NEG_INFINITY, f32::max);
+                        let sum_exp: f32 = step_logits
+                            .iter()
+                            .map(|&l| {
+                                if l > f32::NEG_INFINITY {
+                                    (l - max_l).exp()
+                                } else {
+                                    0.0
+                                }
+                            })
+                            .sum();
+                        let lse = max_l + sum_exp.max(1e-10).ln();
+                        let logprob = best_logit - lse;
+                        token_logprobs.push(logprob);
+
+                        if step == 0 && n_vocab > 50362 {
+                            let ns_logit = step_logits[50362];
+                            if ns_logit > f32::NEG_INFINITY {
+                                no_speech_prob = (ns_logit - lse).exp().clamp(0.0, 1.0);
                             }
                         }
 
@@ -364,18 +393,33 @@ impl WhisperContext {
                     }
                 }
 
+                let avg_logprob = if !token_logprobs.is_empty() {
+                    token_logprobs.iter().sum::<f32>() / token_logprobs.len() as f32
+                } else {
+                    -0.2
+                };
+
                 // Check fallback criteria
                 let text = self.tokenizer.decode(&tokens_cur, true);
                 let cr = compression_ratio(&text);
 
-                // If compression ratio is acceptable (<= threshold) or fallback disabled, accept
-                if cr <= params.compression_ratio_threshold || params.temperature_inc <= 0.0 {
+                let fallback_needed = cr > params.compression_ratio_threshold
+                    || (avg_logprob < params.logprob_threshold as f32
+                        && no_speech_prob < params.no_speech_threshold as f32);
+
+                if !fallback_needed || params.temperature_inc <= 0.0 {
                     break;
                 }
 
                 // Trigger temperature fallback
                 temperature += params.temperature_inc;
             }
+
+            let avg_logprob = if !token_logprobs.is_empty() {
+                token_logprobs.iter().sum::<f32>() / token_logprobs.len() as f32
+            } else {
+                -0.2
+            };
 
             // Extract segments from tokens_cur
             if params.no_timestamps || tokens_cur.is_empty() {
@@ -386,7 +430,7 @@ impl WhisperContext {
                 };
                 for chunk in tokens_cur.chunks(max_tok) {
                     let t1 = (seek_time + 30.0).min(total_audio_sec);
-                    let seg = self.build_segment(seek_time, t1, chunk);
+                    let seg = self.build_segment(seek_time, t1, chunk, avg_logprob, no_speech_prob);
                     if !seg.text.trim().is_empty() {
                         if let Some(ref cb) = params.on_new_segment {
                             cb(&seg);
@@ -408,7 +452,13 @@ impl WhisperContext {
                         if seg_tokens.is_empty() {
                             seg_t0 = abs_sec;
                         } else {
-                            let seg = self.build_segment(seg_t0, abs_sec, &seg_tokens);
+                            let seg = self.build_segment(
+                                seg_t0,
+                                abs_sec,
+                                &seg_tokens,
+                                avg_logprob,
+                                no_speech_prob,
+                            );
                             if !seg.text.trim().is_empty() {
                                 if let Some(ref cb) = params.on_new_segment {
                                     cb(&seg);
@@ -424,7 +474,13 @@ impl WhisperContext {
                         if params.max_tokens > 0 && seg_tokens.len() >= params.max_tokens {
                             let t_mid =
                                 (seg_t0 + (seg_tokens.len() as f64 * 0.2)).min(total_audio_sec);
-                            let seg = self.build_segment(seg_t0, t_mid, &seg_tokens);
+                            let seg = self.build_segment(
+                                seg_t0,
+                                t_mid,
+                                &seg_tokens,
+                                avg_logprob,
+                                no_speech_prob,
+                            );
                             if !seg.text.trim().is_empty() {
                                 if let Some(ref cb) = params.on_new_segment {
                                     cb(&seg);
@@ -438,7 +494,8 @@ impl WhisperContext {
                 }
                 if !seg_tokens.is_empty() {
                     let t1 = (seek_time + 30.0).min(total_audio_sec);
-                    let seg = self.build_segment(seg_t0, t1, &seg_tokens);
+                    let seg =
+                        self.build_segment(seg_t0, t1, &seg_tokens, avg_logprob, no_speech_prob);
                     if !seg.text.trim().is_empty() {
                         if let Some(ref cb) = params.on_new_segment {
                             cb(&seg);
@@ -464,7 +521,14 @@ impl WhisperContext {
         segments
     }
 
-    fn build_segment(&self, seg_t0: f64, seg_t1: f64, tokens: &[i32]) -> Segment {
+    fn build_segment(
+        &self,
+        seg_t0: f64,
+        seg_t1: f64,
+        tokens: &[i32],
+        avg_logprob: f32,
+        no_speech_prob: f32,
+    ) -> Segment {
         let mut text = self.tokenizer.decode(tokens, true);
         if tokens.iter().any(|&t| t == 50363 || t == 50364) && !text.starts_with("[SPEAKER_TURN]") {
             text = format!("[SPEAKER_TURN] {}", text.trim());
@@ -487,6 +551,14 @@ impl WhisperContext {
         let alignments = crate::dtw::align_dtw(&att, tokens.len(), n_frames_seg);
         let words = crate::dtw::merge_tokens_to_words(&token_tuples, &alignments, seg_t0, 0.02);
 
-        Segment::with_words(seg_t0, seg_t1, text, tokens.to_vec(), words)
+        Segment::with_stats(
+            seg_t0,
+            seg_t1,
+            text,
+            tokens.to_vec(),
+            words,
+            avg_logprob,
+            no_speech_prob,
+        )
     }
 }
