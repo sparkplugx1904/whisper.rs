@@ -1,5 +1,6 @@
 use crate::ops::softmax::softmax_inplace;
 use crate::simd::dot_f32;
+use rayon::prelude::*;
 
 #[allow(clippy::too_many_arguments)]
 pub fn multi_head_attention(
@@ -21,38 +22,70 @@ pub fn multi_head_attention(
 
     let scale = 1.0f32 / (d_head as f32).sqrt();
 
-    // Reusable scores buffer for one row of attention
-    let mut scores = vec![0.0f32; t_kv];
+    // Use Rayon parallel iterator across heads for multi-token / encoder passes
+    if t_q * t_kv >= 4096 {
+        let out_ptr = output.as_mut_ptr() as usize;
 
-    for h in 0..n_heads {
-        let head_offset = h * d_head;
+        (0..n_heads).into_par_iter().for_each(|h| {
+            let head_offset = h * d_head;
+            let mut scores = vec![0.0f32; t_kv];
 
-        for i in 0..t_q {
-            let q_vec = &q[i * d_model + head_offset..i * d_model + head_offset + d_head];
+            for i in 0..t_q {
+                let q_vec = &q[i * d_model + head_offset..i * d_model + head_offset + d_head];
+                let max_j = if causal { i + 1 } else { t_kv };
 
-            let max_j = if causal { i + 1 } else { t_kv };
+                // 1. Compute attention scores for row i
+                for (j, score_entry) in scores[..max_j].iter_mut().enumerate() {
+                    let k_vec = &k[j * d_model + head_offset..j * d_model + head_offset + d_head];
+                    *score_entry = dot_f32(q_vec, k_vec) * scale;
+                }
 
-            // 1. Compute attention scores for row i
-            for j in 0..max_j {
-                let k_vec = &k[j * d_model + head_offset..j * d_model + head_offset + d_head];
-                scores[j] = dot_f32(q_vec, k_vec) * scale;
+                // 2. Softmax
+                softmax_inplace(&mut scores[0..max_j]);
+
+                // 3. Compute weighted sum of values into disjoint head slice
+                unsafe {
+                    let head_out_ptr = (out_ptr as *mut f32).add(i * d_model + head_offset);
+                    let out_vec = std::slice::from_raw_parts_mut(head_out_ptr, d_head);
+                    out_vec.fill(0.0);
+
+                    for (j, &weight) in scores[..max_j].iter().enumerate() {
+                        let v_vec =
+                            &v[j * d_model + head_offset..j * d_model + head_offset + d_head];
+                        for d in 0..d_head {
+                            out_vec[d] += weight * v_vec[d];
+                        }
+                    }
+                }
             }
+        });
+    } else {
+        // Fast sequential path for single-token decode
+        let mut scores = vec![0.0f32; t_kv];
 
-            // 2. Softmax
-            softmax_inplace(&mut scores[0..max_j]);
+        for h in 0..n_heads {
+            let head_offset = h * d_head;
 
-            // 3. Compute weighted sum of values
-            let out_vec =
-                &mut output[i * d_model + head_offset..i * d_model + head_offset + d_head];
+            for i in 0..t_q {
+                let q_vec = &q[i * d_model + head_offset..i * d_model + head_offset + d_head];
+                let max_j = if causal { i + 1 } else { t_kv };
 
-            // Initialize or clear for this head
-            out_vec.fill(0.0);
+                for (j, score_entry) in scores[..max_j].iter_mut().enumerate() {
+                    let k_vec = &k[j * d_model + head_offset..j * d_model + head_offset + d_head];
+                    *score_entry = dot_f32(q_vec, k_vec) * scale;
+                }
 
-            for j in 0..max_j {
-                let weight = scores[j];
-                let v_vec = &v[j * d_model + head_offset..j * d_model + head_offset + d_head];
-                for d in 0..d_head {
-                    out_vec[d] += weight * v_vec[d];
+                softmax_inplace(&mut scores[0..max_j]);
+
+                let out_vec =
+                    &mut output[i * d_model + head_offset..i * d_model + head_offset + d_head];
+                out_vec.fill(0.0);
+
+                for (j, &weight) in scores[..max_j].iter().enumerate() {
+                    let v_vec = &v[j * d_model + head_offset..j * d_model + head_offset + d_head];
+                    for d in 0..d_head {
+                        out_vec[d] += weight * v_vec[d];
+                    }
                 }
             }
         }

@@ -688,12 +688,63 @@ pub unsafe extern "C" fn whisper_full_get_token_text(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn whisper_full_get_token_p(
-    _ctx: *mut whisper_context,
-    _i_segment: c_int,
-    _i_token: c_int,
-) -> f32 {
-    1.0f32
+pub unsafe extern "C" fn whisper_full_get_token_data_from_state(
+    state: *mut whisper_state,
+    i_segment: c_int,
+    i_token: c_int,
+) -> whisper_token_data {
+    let empty = whisper_token_data {
+        id: 0,
+        tid: 0,
+        p: 0.0,
+        plog: 0.0,
+        pt: 0.0,
+        ptsum: 0.0,
+        t0: 0,
+        t1: 0,
+        t_dtw: 0,
+        vlen: 0.0,
+    };
+    if state.is_null() || i_segment < 0 || i_token < 0 {
+        return empty;
+    }
+    let state_ref = &*state;
+    if let Some(seg) = state_ref.inner.segments.get(i_segment as usize) {
+        if let Some(&tok_id) = seg.tokens.get(i_token as usize) {
+            let n_toks = seg.tokens.len().max(1);
+            let seg_dur = (seg.t1 - seg.t0).max(0.0);
+            let tok_step = seg_dur / (n_toks as f64);
+            let mut t0 = seg.t0 + (i_token as f64) * tok_step;
+            let mut t1 = t0 + tok_step;
+            let mut prob = 0.95f32;
+
+            if !seg.words.is_empty() {
+                let word_idx = (i_token as usize * seg.words.len()) / n_toks;
+                if let Some(w) = seg.words.get(word_idx) {
+                    t0 = w.t0;
+                    t1 = w.t1;
+                    prob = w.probability;
+                }
+            }
+
+            let t0_cs = (t0 * 100.0).round() as i64;
+            let t1_cs = (t1 * 100.0).round() as i64;
+
+            return whisper_token_data {
+                id: tok_id,
+                tid: 0,
+                p: prob,
+                plog: prob.max(1e-6).ln(),
+                pt: 1.0,
+                ptsum: 1.0,
+                t0: t0_cs,
+                t1: t1_cs,
+                t_dtw: t0_cs,
+                vlen: (t1 - t0) as f32,
+            };
+        }
+    }
+    empty
 }
 
 #[no_mangle]
@@ -702,19 +753,76 @@ pub unsafe extern "C" fn whisper_full_get_token_data(
     i_segment: c_int,
     i_token: c_int,
 ) -> whisper_token_data {
-    let tok_id = whisper_full_get_token_id(ctx, i_segment, i_token);
-    whisper_token_data {
-        id: tok_id,
-        tid: 0,
-        p: 1.0,
-        plog: 0.0,
-        pt: 1.0,
-        ptsum: 1.0,
-        t0: 0,
-        t1: 0,
-        t_dtw: 0,
-        vlen: 0.0,
+    if ctx.is_null() {
+        return whisper_token_data {
+            id: 0,
+            tid: 0,
+            p: 0.0,
+            plog: 0.0,
+            pt: 0.0,
+            ptsum: 0.0,
+            t0: 0,
+            t1: 0,
+            t_dtw: 0,
+            vlen: 0.0,
+        };
     }
+    let state_ptr = (*ctx).default_state.as_mut() as *mut whisper_state;
+    whisper_full_get_token_data_from_state(state_ptr, i_segment, i_token)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_token_p_from_state(
+    state: *mut whisper_state,
+    i_segment: c_int,
+    i_token: c_int,
+) -> f32 {
+    whisper_full_get_token_data_from_state(state, i_segment, i_token).p
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_token_p(
+    ctx: *mut whisper_context,
+    i_segment: c_int,
+    i_token: c_int,
+) -> f32 {
+    whisper_full_get_token_data(ctx, i_segment, i_token).p
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_token_t0_from_state(
+    state: *mut whisper_state,
+    i_segment: c_int,
+    i_token: c_int,
+) -> i64 {
+    whisper_full_get_token_data_from_state(state, i_segment, i_token).t0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_token_t0(
+    ctx: *mut whisper_context,
+    i_segment: c_int,
+    i_token: c_int,
+) -> i64 {
+    whisper_full_get_token_data(ctx, i_segment, i_token).t0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_token_t1_from_state(
+    state: *mut whisper_state,
+    i_segment: c_int,
+    i_token: c_int,
+) -> i64 {
+    whisper_full_get_token_data_from_state(state, i_segment, i_token).t1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_token_t1(
+    ctx: *mut whisper_context,
+    i_segment: c_int,
+    i_token: c_int,
+) -> i64 {
+    whisper_full_get_token_data(ctx, i_segment, i_token).t1
 }
 
 #[no_mangle]

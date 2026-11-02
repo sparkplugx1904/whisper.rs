@@ -45,10 +45,18 @@ fn test_c_abi_end_to_end() {
 
         let n_segments = whisper_full_n_segments(ctx);
         assert!(n_segments >= 1);
-
         let seg_text_ptr = whisper_full_get_segment_text(ctx, 0);
         let text = CStr::from_ptr(seg_text_ptr).to_str().unwrap();
         assert!(text.contains("And so my fellow Americans"));
+
+        let n_tokens = whisper_full_n_tokens(ctx, 0);
+        assert!(n_tokens > 0, "Segment must have tokens");
+
+        let tok_data = whisper_full_get_token_data(ctx, 0, 0);
+        assert!(tok_data.id > 0);
+        assert!(tok_data.p > 0.0);
+        assert!(tok_data.t1 > tok_data.t0);
+        assert!(tok_data.t1 > 0);
 
         whisper_free(ctx);
     }

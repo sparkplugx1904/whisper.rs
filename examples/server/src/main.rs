@@ -175,6 +175,66 @@ fn handle_client(mut stream: TcpStream, ctx: Arc<WhisperContext>) {
                         }
                         ("text/vtt", vtt_out)
                     }
+                    "verbose_json" => {
+                        let full_text: String = segments
+                            .iter()
+                            .map(|s| s.text.trim())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let escaped_full = full_text.replace('\\', "\\\\").replace('"', "\\\"");
+
+                        let mut all_words = Vec::new();
+                        for seg in &segments {
+                            for w in &seg.words {
+                                all_words.push(format!(
+                                    "{{\"word\":\"{}\",\"start\":{:.3},\"end\":{:.3},\"probability\":{:.4}}}",
+                                    w.word.replace('\\', "\\\\").replace('"', "\\\""),
+                                    w.t0,
+                                    w.t1,
+                                    w.probability
+                                ));
+                            }
+                        }
+
+                        let segs_json: Vec<String> = segments
+                            .iter()
+                            .enumerate()
+                            .map(|(i, seg)| {
+                                let toks_str = seg
+                                    .tokens
+                                    .iter()
+                                    .map(|t| t.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                format!(
+                                    "{{\"id\":{},\"start\":{:.3},\"end\":{:.3},\"text\":\"{}\",\"tokens\":[{}]}}",
+                                    i,
+                                    seg.t0,
+                                    seg.t1,
+                                    seg.text.trim().replace('\\', "\\\\").replace('"', "\\\""),
+                                    toks_str
+                                )
+                            })
+                            .collect();
+
+                        let duration = audio.samples.len() as f64 / audio.sample_rate as f64;
+                        let task_str = if is_translation {
+                            "translate"
+                        } else {
+                            "transcribe"
+                        };
+
+                        let vjson = format!(
+                            "{{\"task\":\"{}\",\"language\":\"{}\",\"duration\":{:.2},\"text\":\"{}\",\"words\":[{}],\"segments\":[{}]}}\n",
+                            task_str,
+                            params.language,
+                            duration,
+                            escaped_full,
+                            all_words.join(","),
+                            segs_json.join(",")
+                        );
+                        ("application/json", vjson)
+                    }
                     _ => {
                         let full_text: String = segments
                             .iter()
