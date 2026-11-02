@@ -2,3 +2,5 @@ target/
 models/*.bin
 !tests/fixtures/*.bin
 whisper.cpp
+.*
+*.local

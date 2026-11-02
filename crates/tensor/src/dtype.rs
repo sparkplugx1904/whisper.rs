@@ -2,6 +2,7 @@ use crate::error::TensorError;
 use half::f16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(non_camel_case_types)]
 pub enum DType {
     F32 = 0,
     F16 = 1,
@@ -11,6 +12,9 @@ pub enum DType {
     Q5_1 = 7,
     Q8_0 = 8,
     Q8_1 = 9,
+    Q4_K = 12,
+    Q5_K = 13,
+    Q6_K = 14,
 }
 
 impl DType {
@@ -24,6 +28,9 @@ impl DType {
             7 => Ok(DType::Q5_1),
             8 => Ok(DType::Q8_0),
             9 => Ok(DType::Q8_1),
+            12 => Ok(DType::Q4_K),
+            13 => Ok(DType::Q5_K),
+            14 => Ok(DType::Q6_K),
             _ => Err(TensorError::InvalidOperation {
                 message: format!("Unsupported GGML tensor type: {}", val),
             }),
@@ -35,6 +42,7 @@ impl DType {
         match self {
             DType::F32 | DType::F16 => 1,
             DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q8_1 | DType::Q5_0 | DType::Q5_1 => 32,
+            DType::Q4_K | DType::Q5_K | DType::Q6_K => 256,
         }
     }
 
@@ -49,6 +57,9 @@ impl DType {
             DType::Q8_1 => 2 + 2 + 32,     // d(f16) + s(f16) + 32 bytes of int8
             DType::Q5_0 => 2 + 4 + 16,     // d(f16) + 4 bytes qh + 16 bytes qs
             DType::Q5_1 => 2 + 2 + 4 + 16, // d(f16) + m(f16) + 4 bytes qh + 16 bytes qs
+            DType::Q4_K => 144, // Super-block 256: d(f16) + dmin(f16) + 12 scales + 128 qs
+            DType::Q5_K => 176, // Super-block 256: d(f16) + dmin(f16) + 12 scales + 32 qh + 128 qs
+            DType::Q6_K => 210, // Super-block 256: 128 ql + 64 qh + 16 scales + d(f16)
         }
     }
 
@@ -225,6 +236,142 @@ impl DType {
                     let count = (num_elements - out.len()).min(32);
                     for &q in &qs[..count] {
                         out.push((q as i8 as f32) * d);
+                    }
+                    if out.len() == num_elements {
+                        break;
+                    }
+                }
+                Ok(out)
+            }
+            DType::Q4_K => {
+                let mut out = Vec::with_capacity(num_elements);
+                let block_bytes = self.type_size();
+                for chunk in bytes.chunks_exact(block_bytes) {
+                    let d_bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    let dmin_bits = u16::from_le_bytes([chunk[2], chunk[3]]);
+                    let d = f16::from_bits(d_bits).to_f32();
+                    let dmin = f16::from_bits(dmin_bits).to_f32();
+
+                    let scales = &chunk[4..16];
+                    let qs = &chunk[16..144];
+
+                    for sb in 0..8 {
+                        let sc = if sb < 4 {
+                            (scales[sb] & 63) as f32
+                        } else {
+                            ((scales[sb + 4] & 0x0F) | ((scales[sb - 4] >> 6) << 4)) as f32
+                        };
+                        let m = if sb < 4 {
+                            (scales[sb + 4] & 63) as f32
+                        } else {
+                            (((scales[sb + 4] >> 4) & 0x0F) | ((scales[sb] >> 6) << 4)) as f32
+                        };
+
+                        let d1 = d * sc;
+                        let m1 = dmin * m;
+                        let qs_sub = &qs[sb * 16..(sb + 1) * 16];
+
+                        for &q_byte in qs_sub.iter().take(16) {
+                            if out.len() == num_elements {
+                                break;
+                            }
+                            let q0 = (q_byte & 0x0F) as f32;
+                            out.push(d1 * q0 - m1);
+                            if out.len() == num_elements {
+                                break;
+                            }
+                            let q1 = ((q_byte >> 4) & 0x0F) as f32;
+                            out.push(d1 * q1 - m1);
+                        }
+                    }
+                    if out.len() == num_elements {
+                        break;
+                    }
+                }
+                Ok(out)
+            }
+            DType::Q5_K => {
+                let mut out = Vec::with_capacity(num_elements);
+                let block_bytes = self.type_size();
+                for chunk in bytes.chunks_exact(block_bytes) {
+                    let d_bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    let dmin_bits = u16::from_le_bytes([chunk[2], chunk[3]]);
+                    let d = f16::from_bits(d_bits).to_f32();
+                    let dmin = f16::from_bits(dmin_bits).to_f32();
+
+                    let scales = &chunk[4..16];
+                    let qh = &chunk[16..48];
+                    let qs = &chunk[48..176];
+
+                    for sb in 0..8 {
+                        let sc = if sb < 4 {
+                            (scales[sb] & 63) as f32
+                        } else {
+                            ((scales[sb + 4] & 0x0F) | ((scales[sb - 4] >> 6) << 4)) as f32
+                        };
+                        let m = if sb < 4 {
+                            (scales[sb + 4] & 63) as f32
+                        } else {
+                            (((scales[sb + 4] >> 4) & 0x0F) | ((scales[sb] >> 6) << 4)) as f32
+                        };
+
+                        let d1 = d * sc;
+                        let m1 = dmin * m;
+                        let qs_sub = &qs[sb * 16..(sb + 1) * 16];
+                        let qh_sub = &qh[sb * 4..(sb + 1) * 4];
+
+                        for j in 0..16 {
+                            if out.len() == num_elements {
+                                break;
+                            }
+                            let h0 = ((qh_sub[j / 4] >> ((j % 4) * 2)) & 1) as f32;
+                            let q0 = ((qs_sub[j] & 0x0F) as f32) + h0 * 16.0;
+                            out.push(d1 * q0 - m1);
+
+                            if out.len() == num_elements {
+                                break;
+                            }
+                            let h1 = ((qh_sub[j / 4] >> ((j % 4) * 2 + 1)) & 1) as f32;
+                            let q1 = (((qs_sub[j] >> 4) & 0x0F) as f32) + h1 * 16.0;
+                            out.push(d1 * q1 - m1);
+                        }
+                    }
+                    if out.len() == num_elements {
+                        break;
+                    }
+                }
+                Ok(out)
+            }
+            DType::Q6_K => {
+                let mut out = Vec::with_capacity(num_elements);
+                let block_bytes = self.type_size();
+                for chunk in bytes.chunks_exact(block_bytes) {
+                    let ql = &chunk[0..128];
+                    let qh = &chunk[128..192];
+                    let scales = &chunk[192..208];
+                    let d_bits = u16::from_le_bytes([chunk[208], chunk[209]]);
+                    let d = f16::from_bits(d_bits).to_f32();
+
+                    for sb in 0..16 {
+                        let sc = (scales[sb] as i8 as f32) * d;
+                        let ql_sub = &ql[sb * 8..(sb + 1) * 8];
+                        let qh_sub = &qh[sb * 4..(sb + 1) * 4];
+
+                        for j in 0..8 {
+                            if out.len() == num_elements {
+                                break;
+                            }
+                            let h0 = ((qh_sub[j / 2] >> ((j % 2) * 4)) & 3) as i8;
+                            let q0 = ((ql_sub[j] & 0x0F) as i8 | (h0 << 4)) - 32;
+                            out.push(sc * (q0 as f32));
+
+                            if out.len() == num_elements {
+                                break;
+                            }
+                            let h1 = ((qh_sub[j / 2] >> ((j % 2) * 4 + 2)) & 3) as i8;
+                            let q1 = (((ql_sub[j] >> 4) & 0x0F) as i8 | (h1 << 4)) - 32;
+                            out.push(sc * (q1 as f32));
+                        }
                     }
                     if out.len() == num_elements {
                         break;

@@ -1,5 +1,5 @@
 use wasm_bindgen::prelude::*;
-use whisper_rs::audio::WavAudio;
+use whisper_rs::audio::{resample_to_16k, WavAudio, WHISPER_SAMPLE_RATE};
 use whisper_rs::model::WhisperModel;
 use whisper_rs::{WhisperContext, WhisperParams};
 
@@ -22,8 +22,13 @@ impl WhisperWasm {
     pub fn transcribe(&self, wav_bytes: &[u8]) -> Result<String, JsValue> {
         let audio =
             WavAudio::load_from_bytes(wav_bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let samples = if audio.sample_rate != WHISPER_SAMPLE_RATE {
+            resample_to_16k(&audio.samples, audio.sample_rate)
+        } else {
+            audio.samples
+        };
         let params = WhisperParams::default();
-        let segments = self.ctx.transcribe_pcm(&audio.samples, &params);
+        let segments = self.ctx.transcribe_pcm(&samples, &params);
         let text = segments
             .iter()
             .map(|s| s.text.trim())

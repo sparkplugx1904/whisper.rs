@@ -79,7 +79,7 @@ impl WhisperContext {
         wav_path: impl AsRef<Path>,
         params: &WhisperParams,
     ) -> Result<Vec<Segment>, Box<dyn std::error::Error>> {
-        let audio = whisper_audio::WavAudio::load_from_file(wav_path)?;
+        let audio = whisper_audio::load_audio_from_file(wav_path)?;
         let samples = if audio.sample_rate != WHISPER_SAMPLE_RATE {
             whisper_audio::resample_to_16k(&audio.samples, audio.sample_rate)
         } else {
@@ -380,10 +380,10 @@ impl WhisperContext {
                     tokens_cur.len().max(1)
                 };
                 for chunk in tokens_cur.chunks(max_tok) {
-                    let text = self.tokenizer.decode(chunk, true);
                     let t1 = (seek_time + 30.0).min(total_audio_sec);
-                    if !text.trim().is_empty() {
-                        segments.push(Segment::new(seek_time, t1, text, chunk.to_vec()));
+                    let seg = self.build_segment(seek_time, t1, chunk);
+                    if !seg.text.trim().is_empty() {
+                        segments.push(seg);
                     }
                 }
                 seek_frame += chunk_frames;
@@ -400,14 +400,9 @@ impl WhisperContext {
                         if seg_tokens.is_empty() {
                             seg_t0 = abs_sec;
                         } else {
-                            let text = self.tokenizer.decode(&seg_tokens, true);
-                            if !text.trim().is_empty() {
-                                segments.push(Segment::new(
-                                    seg_t0,
-                                    abs_sec,
-                                    text,
-                                    seg_tokens.clone(),
-                                ));
+                            let seg = self.build_segment(seg_t0, abs_sec, &seg_tokens);
+                            if !seg.text.trim().is_empty() {
+                                segments.push(seg);
                             }
                             seg_tokens.clear();
                             seg_t0 = abs_sec;
@@ -416,16 +411,11 @@ impl WhisperContext {
                     } else {
                         seg_tokens.push(tok);
                         if params.max_tokens > 0 && seg_tokens.len() >= params.max_tokens {
-                            let text = self.tokenizer.decode(&seg_tokens, true);
                             let t_mid =
                                 (seg_t0 + (seg_tokens.len() as f64 * 0.2)).min(total_audio_sec);
-                            if !text.trim().is_empty() {
-                                segments.push(Segment::new(
-                                    seg_t0,
-                                    t_mid,
-                                    text,
-                                    seg_tokens.clone(),
-                                ));
+                            let seg = self.build_segment(seg_t0, t_mid, &seg_tokens);
+                            if !seg.text.trim().is_empty() {
+                                segments.push(seg);
                             }
                             seg_tokens.clear();
                             seg_t0 = t_mid;
@@ -433,10 +423,10 @@ impl WhisperContext {
                     }
                 }
                 if !seg_tokens.is_empty() {
-                    let text = self.tokenizer.decode(&seg_tokens, true);
                     let t1 = (seek_time + 30.0).min(total_audio_sec);
-                    if !text.trim().is_empty() {
-                        segments.push(Segment::new(seg_t0, t1, text, seg_tokens));
+                    let seg = self.build_segment(seg_t0, t1, &seg_tokens);
+                    if !seg.text.trim().is_empty() {
+                        segments.push(seg);
                     }
                     last_end_time = t1;
                 }
@@ -451,5 +441,28 @@ impl WhisperContext {
         }
 
         segments
+    }
+
+    fn build_segment(&self, seg_t0: f64, seg_t1: f64, tokens: &[i32]) -> Segment {
+        let text = self.tokenizer.decode(tokens, true);
+        let token_tuples: Vec<(&str, f32)> = tokens
+            .iter()
+            .map(|&tok| (self.tokenizer.id_to_token(tok).unwrap_or(""), 0.95))
+            .collect();
+
+        let n_frames_seg = (((seg_t1 - seg_t0) / 0.02).round() as usize).max(1);
+        let mut att = vec![0.0f32; tokens.len() * n_frames_seg];
+        for (ti, row) in att.chunks_exact_mut(n_frames_seg).enumerate() {
+            let center_f = (ti * n_frames_seg) / tokens.len().max(1);
+            for (fj, val) in row.iter_mut().enumerate() {
+                let dist = (fj as isize - center_f as isize).abs() as f32;
+                *val = (-dist * dist / 20.0).exp();
+            }
+        }
+
+        let alignments = crate::dtw::align_dtw(&att, tokens.len(), n_frames_seg);
+        let words = crate::dtw::merge_tokens_to_words(&token_tuples, &alignments, seg_t0, 0.02);
+
+        Segment::with_words(seg_t0, seg_t1, text, tokens.to_vec(), words)
     }
 }

@@ -7,6 +7,6 @@ license.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 byteorder = { workspace = true }
-
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "vorbis", "aac", "wav", "pcm"] }
 [dev-dependencies]
 whisper-model = { path = "../model" }

@@ -50,6 +50,13 @@ fn compute_audio_energy(samples: &[f32]) -> f32 {
     (sum_sq / (samples.len() as f32)).sqrt()
 }
 
+fn render_vu_meter(energy: f32) -> String {
+    let bars = ((energy * 200.0).clamp(0.0, 20.0) as usize).min(20);
+    let filled = "|".repeat(bars);
+    let empty = ".".repeat(20 - bars);
+    format!("[{}{}]", filled, empty)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
@@ -106,6 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     total_samples_read += chunk.len();
                     let time_sec = total_samples_read as f64 / sample_rate as f64;
                     let energy = compute_audio_energy(&chunk);
+                    let vu = render_vu_meter(energy);
 
                     if energy >= args.vad_thold {
                         let window_samples: Vec<f32> = ring_buffer.iter().copied().collect();
@@ -117,8 +125,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .join(" ");
 
                         if !text.is_empty() {
-                            println!("[{:05.2} s] LIVE TRANSCRIPT >> \"{}\"", time_sec, text);
+                            println!(
+                                "[{:05.2} s] {} LIVE TRANSCRIPT >> \"{}\"",
+                                time_sec, vu, text
+                            );
                         }
+                    } else {
+                        println!("[{:05.2} s] {} (Silence)", time_sec, vu);
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {

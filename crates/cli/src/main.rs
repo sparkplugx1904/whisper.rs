@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
-use whisper_rs::audio::WavAudio;
+
 use whisper_rs::model::WhisperModel;
 use whisper_rs::{WhisperContext, WhisperParams};
 
@@ -72,6 +72,10 @@ pub struct Args {
     /// Output file path base (without extension)
     #[arg(short = 'o', long = "output-file", alias = "of")]
     pub output_file: Option<String>,
+
+    /// Enable word-level timestamps in transcription output
+    #[arg(long = "word-timestamps", default_value_t = false)]
+    pub word_timestamps: bool,
 }
 
 /// Preprocess command-line arguments to support whisper.cpp style flags such as
@@ -98,6 +102,7 @@ where
             "-nt" => out.push("--no-timestamps".to_string()),
             "-tr" => out.push("--translate".to_string()),
             "-bs" => out.push("--beam-size".to_string()),
+            "-wt" => out.push("--word-timestamps".to_string()),
             s if s.starts_with("-of=") => out.push(format!("--output-file={}", &s[4..])),
             s if s.starts_with("-bs=") => out.push(format!("--beam-size={}", &s[4..])),
             _ => out.push(arg),
@@ -216,7 +221,7 @@ pub fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\nLoading audio from '{}'...", args.file);
-    let audio = WavAudio::load_from_file(&args.file)
+    let audio = whisper_rs::audio::load_audio_from_file(&args.file)
         .map_err(|e| format!("failed to load audio from '{}': {}", args.file, e))?;
     let audio_dur = audio.samples.len() as f64 / audio.sample_rate as f64;
     println!(
@@ -260,6 +265,14 @@ pub fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let proc_dur = t_trans.elapsed();
 
     for seg in &segments {
+        if args.word_timestamps && !seg.words.is_empty() {
+            for w in &seg.words {
+                println!(
+                    "  [word {:05.2}s --> {:05.2}s] \"{}\" (p={:.2})",
+                    w.t0, w.t1, w.word, w.probability
+                );
+            }
+        }
         if args.no_timestamps {
             println!("{}", seg.text.trim());
         } else {
@@ -447,6 +460,7 @@ mod tests {
             output_vtt: true,
             output_json: true,
             output_file: Some(base_str.to_string()),
+            word_timestamps: false,
         };
 
         let segments = vec![
@@ -507,6 +521,7 @@ mod tests {
             output_vtt: false,
             output_json: false,
             output_file: None,
+            word_timestamps: false,
         };
         let res = run(args);
         assert!(res.is_err());
@@ -531,6 +546,7 @@ mod tests {
             output_vtt: false,
             output_json: false,
             output_file: None,
+            word_timestamps: false,
         };
         let res = run(args);
         assert!(res.is_err());

@@ -1,9 +1,12 @@
+use crate::dtw::WordTiming;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Segment {
     pub t0: f64,
     pub t1: f64,
     pub text: String,
     pub tokens: Vec<i32>,
+    pub words: Vec<WordTiming>,
 }
 
 impl Segment {
@@ -13,6 +16,23 @@ impl Segment {
             t1,
             text,
             tokens,
+            words: Vec::new(),
+        }
+    }
+
+    pub fn with_words(
+        t0: f64,
+        t1: f64,
+        text: String,
+        tokens: Vec<i32>,
+        words: Vec<WordTiming>,
+    ) -> Self {
+        Self {
+            t0,
+            t1,
+            text,
+            tokens,
+            words,
         }
     }
 
@@ -79,12 +99,36 @@ impl Segment {
         } else {
             0.0
         };
-        format!(
-            "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\"}}",
-            t0,
-            t1,
-            escape_json(self.text.trim())
-        )
+        if self.words.is_empty() {
+            format!(
+                "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\"}}",
+                t0,
+                t1,
+                escape_json(self.text.trim())
+            )
+        } else {
+            let words_json = self
+                .words
+                .iter()
+                .map(|w| {
+                    format!(
+                        "{{\"word\": \"{}\", \"start\": {:.3}, \"end\": {:.3}, \"probability\": {:.4}}}",
+                        escape_json(&w.word),
+                        w.t0,
+                        w.t1,
+                        w.probability
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"words\": [{}]}}",
+                t0,
+                t1,
+                escape_json(self.text.trim()),
+                words_json
+            )
+        }
     }
 }
 

@@ -147,3 +147,191 @@ unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
 
     result
 }
+
+#[inline(always)]
+pub fn dot_q8_0_f32(raw_blocks: &[u8], x: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { vec_dot_q8_0_f32_avx2(raw_blocks, x) };
+        }
+    }
+    dot_q8_0_f32_scalar(raw_blocks, x)
+}
+
+#[inline(always)]
+#[allow(clippy::chunks_exact_to_as_chunks)]
+pub fn dot_q8_0_f32_scalar(raw_blocks: &[u8], x: &[f32]) -> f32 {
+    use half::f16;
+
+    let mut sum = 0.0f32;
+    for (i, chunk) in raw_blocks.chunks_exact(34).enumerate() {
+        let d_bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let d = f16::from_bits(d_bits).to_f32();
+        let qs = &chunk[2..34];
+        let x_block = &x[i * 32..(i + 1) * 32];
+
+        let mut block_sum = 0.0f32;
+        for j in 0..32 {
+            block_sum += (qs[j] as i8 as f32) * x_block[j];
+        }
+        sum += d * block_sum;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn vec_dot_q8_0_f32_avx2(raw_blocks: &[u8], x: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    use half::f16;
+
+    let n_blocks = x.len() / 32;
+    let mut total_sum = 0.0f32;
+
+    for i in 0..n_blocks {
+        let chunk = raw_blocks.get_unchecked(i * 34..(i + 1) * 34);
+        let d_bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let d = f16::from_bits(d_bits).to_f32();
+
+        let qs_ptr = chunk.as_ptr().add(2);
+        let x_ptr = x.as_ptr().add(i * 32);
+
+        let q16_lo = _mm_loadu_si128(qs_ptr as *const __m128i);
+        let q16_hi = _mm_loadu_si128(qs_ptr.add(16) as *const __m128i);
+
+        let q_lo16 = _mm256_cvtepi8_epi16(q16_lo);
+        let q_hi16 = _mm256_cvtepi8_epi16(q16_hi);
+
+        let lo8_i32 = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(q_lo16));
+        let lo8_f32 = _mm256_cvtepi32_ps(lo8_i32);
+        let x0 = _mm256_loadu_ps(x_ptr);
+        let mut acc = _mm256_mul_ps(lo8_f32, x0);
+
+        let hi8_i32 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(q_lo16, 1));
+        let hi8_f32 = _mm256_cvtepi32_ps(hi8_i32);
+        let x1 = _mm256_loadu_ps(x_ptr.add(8));
+        acc = _mm256_fmadd_ps(hi8_f32, x1, acc);
+
+        let lo8_hi_i32 = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(q_hi16));
+        let lo8_hi_f32 = _mm256_cvtepi32_ps(lo8_hi_i32);
+        let x2 = _mm256_loadu_ps(x_ptr.add(16));
+        acc = _mm256_fmadd_ps(lo8_hi_f32, x2, acc);
+
+        let hi8_hi_i32 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(q_hi16, 1));
+        let hi8_hi_f32 = _mm256_cvtepi32_ps(hi8_hi_i32);
+        let x3 = _mm256_loadu_ps(x_ptr.add(24));
+        acc = _mm256_fmadd_ps(hi8_hi_f32, x3, acc);
+
+        let hi_128 = _mm256_extractf128_ps(acc, 1);
+        let lo_128 = _mm256_castps256_ps128(acc);
+        let sum128 = _mm_add_ps(lo_128, hi_128);
+        let shuf = _mm_movehl_ps(sum128, sum128);
+        let sum64 = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_shuffle_ps(sum64, sum64, 1);
+        let sum32 = _mm_add_ss(sum64, shuf2);
+        let block_sum = _mm_cvtss_f32(sum32);
+
+        total_sum += d * block_sum;
+    }
+
+    total_sum
+}
+
+#[inline(always)]
+pub fn dot_q4_0_f32(raw_blocks: &[u8], x: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { vec_dot_q4_0_f32_avx2(raw_blocks, x) };
+        }
+    }
+    dot_q4_0_f32_scalar(raw_blocks, x)
+}
+
+#[inline(always)]
+#[allow(clippy::chunks_exact_to_as_chunks)]
+pub fn dot_q4_0_f32_scalar(raw_blocks: &[u8], x: &[f32]) -> f32 {
+    use half::f16;
+
+    let mut sum = 0.0f32;
+    for (i, chunk) in raw_blocks.chunks_exact(18).enumerate() {
+        let d_bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let d = f16::from_bits(d_bits).to_f32();
+        let qs = &chunk[2..18];
+        let x_block = &x[i * 32..(i + 1) * 32];
+
+        let mut block_sum = 0.0f32;
+        for j in 0..16 {
+            let x0 = (qs[j] & 0x0F) as i8 - 8;
+            let x1 = ((qs[j] >> 4) & 0x0F) as i8 - 8;
+            block_sum += (x0 as f32) * x_block[j] + (x1 as f32) * x_block[j + 16];
+        }
+        sum += d * block_sum;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn vec_dot_q4_0_f32_avx2(raw_blocks: &[u8], x: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    use half::f16;
+
+    let n_blocks = x.len() / 32;
+    let mut total_sum = 0.0f32;
+
+    let mask_low = _mm_set1_epi8(0x0F);
+    let eight = _mm_set1_epi8(8);
+
+    for i in 0..n_blocks {
+        let chunk = raw_blocks.get_unchecked(i * 18..(i + 1) * 18);
+        let d_bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let d = f16::from_bits(d_bits).to_f32();
+
+        let qs_ptr = chunk.as_ptr().add(2);
+        let x_ptr = x.as_ptr().add(i * 32);
+
+        let q16 = _mm_loadu_si128(qs_ptr as *const __m128i);
+
+        let q_lo = _mm_sub_epi8(_mm_and_si128(q16, mask_low), eight);
+        let q_hi_shift = _mm_srli_epi16(q16, 4);
+        let q_hi = _mm_sub_epi8(_mm_and_si128(q_hi_shift, mask_low), eight);
+
+        let q_lo16 = _mm256_cvtepi8_epi16(q_lo);
+        let q_hi16 = _mm256_cvtepi8_epi16(q_hi);
+
+        let lo8_i32 = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(q_lo16));
+        let lo8_f32 = _mm256_cvtepi32_ps(lo8_i32);
+        let x0 = _mm256_loadu_ps(x_ptr);
+        let mut acc = _mm256_mul_ps(lo8_f32, x0);
+
+        let hi8_i32 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(q_lo16, 1));
+        let hi8_f32 = _mm256_cvtepi32_ps(hi8_i32);
+        let x1 = _mm256_loadu_ps(x_ptr.add(8));
+        acc = _mm256_fmadd_ps(hi8_f32, x1, acc);
+
+        let lo8_hi_i32 = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(q_hi16));
+        let lo8_hi_f32 = _mm256_cvtepi32_ps(lo8_hi_i32);
+        let x2 = _mm256_loadu_ps(x_ptr.add(16));
+        acc = _mm256_fmadd_ps(lo8_hi_f32, x2, acc);
+
+        let hi8_hi_i32 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(q_hi16, 1));
+        let hi8_hi_f32 = _mm256_cvtepi32_ps(hi8_hi_i32);
+        let x3 = _mm256_loadu_ps(x_ptr.add(24));
+        acc = _mm256_fmadd_ps(hi8_hi_f32, x3, acc);
+
+        let hi_128 = _mm256_extractf128_ps(acc, 1);
+        let lo_128 = _mm256_castps256_ps128(acc);
+        let sum128 = _mm_add_ps(lo_128, hi_128);
+        let shuf = _mm_movehl_ps(sum128, sum128);
+        let sum64 = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_shuffle_ps(sum64, sum64, 1);
+        let sum32 = _mm_add_ss(sum64, shuf2);
+        let block_sum = _mm_cvtss_f32(sum32);
+
+        total_sum += d * block_sum;
+    }
+
+    total_sum
+}

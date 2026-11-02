@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
-use whisper_rs::audio::WavAudio;
+
 use whisper_rs::model::WhisperModel;
 use whisper_rs::{WhisperContext, WhisperParams};
 
@@ -139,7 +139,7 @@ fn handle_client(mut stream: TcpStream, ctx: Arc<WhisperContext>) {
         let response_format =
             extract_field_from_multipart(&body, "response_format").unwrap_or("json");
 
-        match WavAudio::load_from_bytes(wav_data) {
+        match whisper_rs::audio::load_audio_from_bytes(wav_data) {
             Ok(audio) => {
                 let params = WhisperParams {
                     translate: is_translation,

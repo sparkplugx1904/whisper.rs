@@ -3,15 +3,16 @@
 
 pub mod beam;
 pub mod decoder;
+pub mod dtw;
 pub mod encoder;
 pub mod filter;
 pub mod params;
 pub mod segment;
 pub mod state;
 pub mod transcribe;
-
 pub use beam::{BeamCandidate, BeamSearch};
 pub use decoder::{DecoderBlockWeights, DecoderKvCache, DecoderWeights, WhisperDecoder};
+pub use dtw::{align_dtw, merge_tokens_to_words, WordTiming};
 pub use encoder::{EncoderBlockWeights, EncoderWeights, WhisperEncoder};
 pub use filter::{compression_ratio, compute_token_logprob};
 pub use params::{FullParamsBuilder, SamplingStrategy, WhisperParams};
