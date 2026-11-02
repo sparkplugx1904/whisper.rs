@@ -325,10 +325,21 @@ impl WhisperContext {
                         let start_idx = logits.len() - n_vocab;
                         let step_logits = &mut logits[start_idx..];
 
-                        // Suppress blank at start
                         if params.suppress_blank && step == 0 {
-                            step_logits[220] = f32::NEG_INFINITY;
-                            step_logits[eot as usize] = f32::NEG_INFINITY;
+                            crate::filter::apply_suppress_blank(step_logits, 220, eot);
+                        }
+                        if params.suppress_nst {
+                            crate::filter::apply_suppress_non_speech(
+                                step_logits,
+                                &self.model.vocab,
+                            );
+                        }
+                        if params.repetition_penalty > 1.0 {
+                            crate::filter::apply_repetition_penalty(
+                                step_logits,
+                                &tokens_cur,
+                                params.repetition_penalty,
+                            );
                         }
 
                         if params.no_timestamps {
@@ -518,6 +529,10 @@ impl WhisperContext {
             cb(100);
         }
 
+        if params.max_len > 0 {
+            segments = split_segments_by_max_len(segments, params.max_len, params.split_on_word);
+        }
+
         segments
     }
 
@@ -561,4 +576,72 @@ impl WhisperContext {
             no_speech_prob,
         )
     }
+}
+
+fn split_segments_by_max_len(
+    segments: Vec<Segment>,
+    max_len: usize,
+    _split_on_word: bool,
+) -> Vec<Segment> {
+    if max_len == 0 {
+        return segments;
+    }
+
+    let mut out = Vec::new();
+    for seg in segments {
+        if seg.text.trim().len() <= max_len || seg.words.is_empty() {
+            out.push(seg);
+            continue;
+        }
+
+        let mut cur_words: Vec<crate::dtw::WordTiming> = Vec::new();
+        let mut cur_len = 0;
+
+        for w in seg.words {
+            let w_len = w.word.len() + if cur_len > 0 { 1 } else { 0 };
+            if cur_len + w_len > max_len && !cur_words.is_empty() {
+                let t0 = cur_words.first().unwrap().t0;
+                let t1 = cur_words.last().unwrap().t1;
+                let text = cur_words
+                    .iter()
+                    .map(|cw| cw.word.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                out.push(Segment::with_stats(
+                    t0,
+                    t1,
+                    text,
+                    Vec::new(),
+                    cur_words,
+                    seg.avg_logprob,
+                    seg.no_speech_prob,
+                ));
+                cur_words = Vec::new();
+                cur_len = 0;
+            }
+            cur_len += w.word.len() + if cur_len > 0 { 1 } else { 0 };
+            cur_words.push(w);
+        }
+
+        if !cur_words.is_empty() {
+            let t0 = cur_words.first().unwrap().t0;
+            let t1 = cur_words.last().unwrap().t1;
+            let text = cur_words
+                .iter()
+                .map(|cw| cw.word.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push(Segment::with_stats(
+                t0,
+                t1,
+                text,
+                Vec::new(),
+                cur_words,
+                seg.avg_logprob,
+                seg.no_speech_prob,
+            ));
+        }
+    }
+
+    out
 }

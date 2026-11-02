@@ -84,6 +84,10 @@ pub struct Args {
     /// Enable tinydiarize speaker turn detection
     #[arg(long = "tinydiarize", alias = "tdrz", default_value_t = false)]
     pub tinydiarize: bool,
+
+    /// Export karaoke subtitle format with word-level timing tags (.karaoke.vtt / .karaoke.srt)
+    #[arg(long = "karaoke", alias = "ok", default_value_t = false)]
+    pub karaoke: bool,
 }
 
 /// Preprocess command-line arguments to support whisper.cpp style flags such as
@@ -112,6 +116,7 @@ where
             "-bs" => out.push("--beam-size".to_string()),
             "-wt" => out.push("--word-timestamps".to_string()),
             "-tdrz" => out.push("--tinydiarize".to_string()),
+            "-ok" => out.push("--karaoke".to_string()),
             s if s.starts_with("-of=") => out.push(format!("--output-file={}", &s[4..])),
             s if s.starts_with("-bs=") => out.push(format!("--beam-size={}", &s[4..])),
             _ => out.push(arg),
@@ -173,6 +178,19 @@ pub fn write_output_files(
         }
         writeln!(f, "]").map_err(|e| format!("failed to close JSON array in '{}': {}", path, e))?;
         println!("Saved JSON output to '{}'", path);
+    }
+
+    if args.karaoke {
+        let vtt_path = format!("{}.karaoke.vtt", base_name);
+        let mut f = File::create(&vtt_path)
+            .map_err(|e| format!("failed to create Karaoke VTT file '{}': {}", vtt_path, e))?;
+        writeln!(f, "WEBVTT\n")
+            .map_err(|e| format!("failed to write header in '{}': {}", vtt_path, e))?;
+        for s in segments {
+            write!(f, "{}", s.to_karaoke_vtt())
+                .map_err(|e| format!("failed to write segment in '{}': {}", vtt_path, e))?;
+        }
+        println!("Saved Karaoke VTT output to '{}'", vtt_path);
     }
 
     Ok(())
@@ -490,6 +508,7 @@ mod tests {
             output_file: Some(base_str.to_string()),
             word_timestamps: false,
             tinydiarize: false,
+            karaoke: false,
             download: None,
         };
 
@@ -553,6 +572,7 @@ mod tests {
             output_file: None,
             word_timestamps: false,
             tinydiarize: false,
+            karaoke: false,
             download: None,
         };
         let res = run(args);
@@ -580,6 +600,7 @@ mod tests {
             output_file: None,
             word_timestamps: false,
             tinydiarize: false,
+            karaoke: false,
             download: None,
         };
         let res = run(args);

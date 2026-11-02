@@ -69,3 +69,48 @@ pub fn compute_token_logprob(logits: &[f32], token: i32) -> f32 {
     let tok_l = logits[token as usize];
     (tok_l - max_l) - sum_exp.ln()
 }
+
+/// Suppress blank/space token at step 0 so the model does not generate leading whitespace or early EOT.
+pub fn apply_suppress_blank(logits: &mut [f32], blank_token_id: i32, eot_token_id: i32) {
+    if blank_token_id >= 0 && (blank_token_id as usize) < logits.len() {
+        logits[blank_token_id as usize] = f32::NEG_INFINITY;
+    }
+    if eot_token_id >= 0 && (eot_token_id as usize) < logits.len() {
+        logits[eot_token_id as usize] = f32::NEG_INFINITY;
+    }
+}
+
+/// Suppress non-speech symbols (e.g. music, laughter, background noise tokens).
+pub fn apply_suppress_non_speech(logits: &mut [f32], vocab: &whisper_model::Vocab) {
+    for (i, val) in logits.iter_mut().enumerate() {
+        if let Some(tok_str) = vocab.id_to_token(i as i32) {
+            if tok_str.starts_with("[*")
+                || tok_str.starts_with("[#")
+                || tok_str.contains("music")
+                || tok_str.contains("laughter")
+                || tok_str.contains("applause")
+            {
+                *val = f32::NEG_INFINITY;
+            }
+        }
+    }
+}
+
+/// Apply repetition penalty discount to tokens already generated in the current segment.
+/// For positive logits: logit /= penalty
+/// For negative logits: logit *= penalty
+pub fn apply_repetition_penalty(logits: &mut [f32], history_tokens: &[i32], penalty: f32) {
+    if penalty <= 1.0 || penalty.is_nan() {
+        return;
+    }
+    for &tok in history_tokens {
+        if tok >= 0 && (tok as usize) < logits.len() {
+            let val = &mut logits[tok as usize];
+            if *val > 0.0 {
+                *val /= penalty;
+            } else if *val < 0.0 && *val > f32::NEG_INFINITY {
+                *val *= penalty;
+            }
+        }
+    }
+}

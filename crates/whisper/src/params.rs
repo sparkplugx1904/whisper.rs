@@ -45,6 +45,12 @@ pub struct WhisperParams {
     pub on_progress: Option<ProgressCallback>,
     /// Pre-calibrated alignment heads preset for DTW word-level timestamps
     pub dtw_aheads_preset: crate::dtw::AlignmentHeadsPreset,
+    /// Repetition penalty (> 1.0 penalizes already generated tokens, default 1.0)
+    pub repetition_penalty: f32,
+    /// Maximum character length per subtitle segment (0 = disabled)
+    pub max_len: usize,
+    /// Split long segments on word boundaries when exceeding max_len
+    pub split_on_word: bool,
 }
 
 impl std::fmt::Debug for WhisperParams {
@@ -82,6 +88,9 @@ impl Default for WhisperParams {
             flash_attn: false,
             tdrz_enable: false,
             dtw_aheads_preset: crate::dtw::AlignmentHeadsPreset::TinyEn,
+            repetition_penalty: 1.0,
+            max_len: 0,
+            split_on_word: false,
             on_new_segment: None,
             on_progress: None,
         }
@@ -177,6 +186,21 @@ impl FullParamsBuilder {
 
     pub fn dtw_aheads_preset(mut self, preset: crate::dtw::AlignmentHeadsPreset) -> Self {
         self.params.dtw_aheads_preset = preset;
+        self
+    }
+
+    pub fn repetition_penalty(mut self, penalty: f32) -> Self {
+        self.params.repetition_penalty = penalty;
+        self
+    }
+
+    pub fn max_len(mut self, max_len: usize) -> Self {
+        self.params.max_len = max_len;
+        self
+    }
+
+    pub fn split_on_word(mut self, split: bool) -> Self {
+        self.params.split_on_word = split;
         self
     }
 

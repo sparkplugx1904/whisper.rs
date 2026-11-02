@@ -126,49 +126,42 @@ pub fn quantized_linear_vector(
     let bytes_per_row = dtype.byte_size_for(cols);
     assert_eq!(weight_bytes.len(), rows * bytes_per_row);
 
+    use rayon::prelude::*;
+
     let n_threads = n_threads.clamp(1, 16);
     let chunk_size = rows.div_ceil(n_threads);
 
-    std::thread::scope(|s| {
-        for (r_start, _) in (0..rows).step_by(chunk_size).map(|r| (r, ())) {
-            let r_end = (r_start + chunk_size).min(rows);
-            let w_sub = &weight_bytes[r_start * bytes_per_row..r_end * bytes_per_row];
-            let b_sub = bias.map(|b| &b[r_start..r_end]);
-            let out_ptr = output.as_mut_ptr() as usize;
+    output
+        .par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(chunk_idx, out_chunk)| {
+            let r_start = chunk_idx * chunk_size;
 
-            s.spawn(move || {
-                let out_slice_ptr = out_ptr as *mut f32;
-                let r_count = r_end - r_start;
+            for (r_rel, out_val) in out_chunk.iter_mut().enumerate() {
+                let r_abs = r_start + r_rel;
+                let row_bytes = &weight_bytes[r_abs * bytes_per_row..(r_abs + 1) * bytes_per_row];
 
-                for r_rel in 0..r_count {
-                    let r_abs = r_start + r_rel;
-                    let row_bytes = &w_sub[r_rel * bytes_per_row..(r_rel + 1) * bytes_per_row];
+                let dot = match dtype {
+                    DType::Q8_0 => vec_dot_q8_0_f32(row_bytes, x),
+                    DType::Q4_0 => vec_dot_q4_0_f32(row_bytes, x),
+                    DType::Q4_1 => vec_dot_q4_1_f32(row_bytes, x),
+                    DType::Q5_0 => vec_dot_q5_0_f32(row_bytes, x),
+                    DType::Q5_1 => vec_dot_q5_1_f32(row_bytes, x),
+                    DType::Q4_K => vec_dot_q4_k_f32(row_bytes, x),
+                    DType::Q5_K => vec_dot_q5_k_f32(row_bytes, x),
+                    DType::Q6_K => vec_dot_q6_k_f32(row_bytes, x),
+                    _ => panic!("Unsupported quantized linear type {:?}", dtype),
+                };
 
-                    let dot = match dtype {
-                        DType::Q8_0 => vec_dot_q8_0_f32(row_bytes, x),
-                        DType::Q4_0 => vec_dot_q4_0_f32(row_bytes, x),
-                        DType::Q4_1 => vec_dot_q4_1_f32(row_bytes, x),
-                        DType::Q5_0 => vec_dot_q5_0_f32(row_bytes, x),
-                        DType::Q5_1 => vec_dot_q5_1_f32(row_bytes, x),
-                        DType::Q4_K => vec_dot_q4_k_f32(row_bytes, x),
-                        DType::Q5_K => vec_dot_q5_k_f32(row_bytes, x),
-                        DType::Q6_K => vec_dot_q6_k_f32(row_bytes, x),
-                        _ => panic!("Unsupported quantized linear type {:?}", dtype),
-                    };
+                let val = if let Some(b) = bias {
+                    dot + b[r_abs]
+                } else {
+                    dot
+                };
 
-                    let val = if let Some(b) = b_sub {
-                        dot + b[r_rel]
-                    } else {
-                        dot
-                    };
-
-                    unsafe {
-                        *out_slice_ptr.add(r_abs) = val;
-                    }
-                }
-            });
-        }
-    });
+                *out_val = val;
+            }
+        });
 }
 
 /// Direct dot product between Q4_K super-blocks (256 elements, 144 bytes each) and f32 slice.

@@ -113,6 +113,83 @@ impl Segment {
         )
     }
 
+    /// Format as Karaoke WebVTT subtitle entry with word-level timing tags `<HH:MM:SS.mmm>word`.
+    pub fn to_karaoke_vtt(&self) -> String {
+        let fmt_vtt = |secs: f64| {
+            let s_clamped = if secs.is_finite() && secs >= 0.0 {
+                secs
+            } else {
+                0.0
+            };
+            let total_ms = (s_clamped * 1000.0).round() as u64;
+            let ms = total_ms % 1000;
+            let total_s = total_ms / 1000;
+            let s = total_s % 60;
+            let total_m = total_s / 60;
+            let m = total_m % 60;
+            let h = total_m / 60;
+            format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+        };
+
+        let mut body = String::new();
+        if self.words.is_empty() {
+            body.push_str(self.text.trim());
+        } else {
+            for (i, w) in self.words.iter().enumerate() {
+                if i > 0 {
+                    body.push(' ');
+                }
+                body.push_str(&format!("<{}>{}", fmt_vtt(w.t0), w.word));
+            }
+        }
+
+        format!(
+            "{} --> {}\n{}\n\n",
+            fmt_vtt(self.t0),
+            fmt_vtt(self.t1),
+            body
+        )
+    }
+
+    /// Format as Karaoke SubRip subtitle entry with word-level timing tags `<HH:MM:SS,mmm>word`.
+    pub fn to_karaoke_srt(&self, index: usize) -> String {
+        let fmt_srt = |secs: f64| {
+            let s_clamped = if secs.is_finite() && secs >= 0.0 {
+                secs
+            } else {
+                0.0
+            };
+            let total_ms = (s_clamped * 1000.0).round() as u64;
+            let ms = total_ms % 1000;
+            let total_s = total_ms / 1000;
+            let s = total_s % 60;
+            let total_m = total_s / 60;
+            let m = total_m % 60;
+            let h = total_m / 60;
+            format!("{:02}:{:02}:{:02},{:03}", h, m, s, ms)
+        };
+
+        let mut body = String::new();
+        if self.words.is_empty() {
+            body.push_str(self.text.trim());
+        } else {
+            for (i, w) in self.words.iter().enumerate() {
+                if i > 0 {
+                    body.push(' ');
+                }
+                body.push_str(&format!("<{}>{}", fmt_srt(w.t0), w.word));
+            }
+        }
+
+        format!(
+            "{}\n{} --> {}\n{}\n\n",
+            index,
+            fmt_srt(self.t0),
+            fmt_srt(self.t1),
+            body
+        )
+    }
+
     /// Format as JSON segment object with `start`, `end`, and `text`
     pub fn to_json(&self) -> String {
         let t0 = if self.t0.is_finite() && self.t0 >= 0.0 {

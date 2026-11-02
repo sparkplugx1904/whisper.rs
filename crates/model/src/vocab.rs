@@ -141,6 +141,40 @@ pub struct Vocab {
     pub token_beg: i32,
 }
 
+impl Default for Vocab {
+    fn default() -> Self {
+        Self {
+            n_vocab: 0,
+            token_to_id: HashMap::new(),
+            id_to_token: Vec::new(),
+            token_eot: 50256,
+            token_sot: 50257,
+            token_translate: 50358,
+            token_transcribe: 50359,
+            token_solm: 50360,
+            token_prev: 50361,
+            token_nosp: 50362,
+            token_not: 50363,
+            token_beg: 50364,
+        }
+    }
+}
+
+impl Vocab {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_token(&mut self, token: impl Into<String>) -> i32 {
+        let tok = token.into();
+        let id = self.id_to_token.len() as i32;
+        self.token_to_id.insert(tok.clone(), id);
+        self.id_to_token.push(tok);
+        self.n_vocab = self.id_to_token.len();
+        id
+    }
+}
+
 impl Vocab {
     pub fn read<R: Read>(reader: &mut R, hparams: &Hyperparameters) -> Result<Self, ModelError> {
         let n_vocab_file = reader.read_i32::<LittleEndian>()? as usize;
