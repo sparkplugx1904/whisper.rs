@@ -13,6 +13,7 @@ pub enum ModelType {
     Medium,
     Large,
     LargeV3,
+    LargeV3Turbo,
     Unknown,
 }
 
@@ -25,6 +26,7 @@ impl std::fmt::Display for ModelType {
             ModelType::Medium => write!(f, "medium"),
             ModelType::Large => write!(f, "large"),
             ModelType::LargeV3 => write!(f, "large-v3"),
+            ModelType::LargeV3Turbo => write!(f, "large-v3-turbo"),
             ModelType::Unknown => write!(f, "unknown"),
         }
     }
@@ -91,7 +93,11 @@ impl Hyperparameters {
             24 => ModelType::Medium,
             32 => {
                 if n_vocab == 51866 {
-                    ModelType::LargeV3
+                    if n_text_layer == 4 {
+                        ModelType::LargeV3Turbo
+                    } else {
+                        ModelType::LargeV3
+                    }
                 } else {
                     ModelType::Large
                 }

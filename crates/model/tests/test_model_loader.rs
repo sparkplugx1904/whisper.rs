@@ -68,6 +68,34 @@ fn test_load_tiny_en() {
 }
 
 #[test]
+fn test_large_v3_turbo_header_detection() {
+    use byteorder::{LittleEndian, WriteBytesExt};
+    use std::io::Cursor;
+    use whisper_model::header::{Hyperparameters, ModelType, GGML_FILE_MAGIC};
+
+    let mut buf = Vec::new();
+    buf.write_u32::<LittleEndian>(GGML_FILE_MAGIC).unwrap();
+    buf.write_i32::<LittleEndian>(51866).unwrap(); // n_vocab
+    buf.write_i32::<LittleEndian>(1500).unwrap(); // n_audio_ctx
+    buf.write_i32::<LittleEndian>(1280).unwrap(); // n_audio_state
+    buf.write_i32::<LittleEndian>(20).unwrap(); // n_audio_head
+    buf.write_i32::<LittleEndian>(32).unwrap(); // n_audio_layer (32 encoder layers)
+    buf.write_i32::<LittleEndian>(448).unwrap(); // n_text_ctx
+    buf.write_i32::<LittleEndian>(1280).unwrap(); // n_text_state
+    buf.write_i32::<LittleEndian>(20).unwrap(); // n_text_head
+    buf.write_i32::<LittleEndian>(4).unwrap(); // n_text_layer (4 decoder layers!)
+    buf.write_i32::<LittleEndian>(128).unwrap(); // n_mels (128 mel filters)
+    buf.write_i32::<LittleEndian>(1).unwrap(); // raw_ftype
+
+    let mut cursor = Cursor::new(buf);
+    let hparams = Hyperparameters::read(&mut cursor).expect("read turbo header");
+    assert_eq!(hparams.model_type, ModelType::LargeV3Turbo);
+    assert_eq!(hparams.model_type.to_string(), "large-v3-turbo");
+    assert_eq!(hparams.n_mels, 128);
+    assert_eq!(hparams.n_text_layer, 4);
+    assert_eq!(hparams.n_audio_layer, 32);
+}
+#[test]
 fn test_load_tiny_multilingual() {
     let path = resolve_model_path("ggml-tiny.bin");
     if !path.exists() {

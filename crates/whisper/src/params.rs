@@ -1,4 +1,9 @@
-#[derive(Debug, Clone)]
+use std::sync::Arc;
+
+pub type NewSegmentCallback = Arc<dyn Fn(&crate::segment::Segment) + Send + Sync>;
+pub type ProgressCallback = Arc<dyn Fn(i32) + Send + Sync>;
+
+#[derive(Clone)]
 pub struct WhisperParams {
     /// Language code (e.g. "en", "id") or "auto" for auto-detection
     pub language: String,
@@ -30,6 +35,28 @@ pub struct WhisperParams {
     pub max_tokens: usize,
     /// Number of threads for computation
     pub n_threads: usize,
+    /// Enable Flash Attention 2 (Tiled Online Softmax)
+    pub flash_attn: bool,
+    /// Enable speaker diarization turn token detection (tinydiarize)
+    pub tdrz_enable: bool,
+    /// Native Rust closure callback invoked whenever a new segment is decoded
+    pub on_new_segment: Option<NewSegmentCallback>,
+    /// Native Rust closure callback invoked on transcription progress (0-100 percentage)
+    pub on_progress: Option<ProgressCallback>,
+}
+
+impl std::fmt::Debug for WhisperParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WhisperParams")
+            .field("language", &self.language)
+            .field("translate", &self.translate)
+            .field("temperature", &self.temperature)
+            .field("beam_size", &self.beam_size)
+            .field("no_timestamps", &self.no_timestamps)
+            .field("flash_attn", &self.flash_attn)
+            .field("tdrz_enable", &self.tdrz_enable)
+            .finish()
+    }
 }
 
 impl Default for WhisperParams {
@@ -50,6 +77,10 @@ impl Default for WhisperParams {
             grammar: None,
             max_tokens: 224,
             n_threads: 4,
+            flash_attn: false,
+            tdrz_enable: false,
+            on_new_segment: None,
+            on_progress: None,
         }
     }
 }
@@ -61,7 +92,7 @@ pub enum SamplingStrategy {
 }
 
 /// Type-safe fluent builder for transcription parameters.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FullParamsBuilder {
     params: WhisperParams,
 }
@@ -112,6 +143,32 @@ impl FullParamsBuilder {
 
     pub fn n_threads(mut self, n_threads: usize) -> Self {
         self.params.n_threads = n_threads;
+        self
+    }
+
+    pub fn flash_attn(mut self, flash: bool) -> Self {
+        self.params.flash_attn = flash;
+        self
+    }
+
+    pub fn tdrz_enable(mut self, tdrz: bool) -> Self {
+        self.params.tdrz_enable = tdrz;
+        self
+    }
+
+    pub fn on_new_segment<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(&crate::segment::Segment) + Send + Sync + 'static,
+    {
+        self.params.on_new_segment = Some(Arc::new(cb));
+        self
+    }
+
+    pub fn on_progress<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(i32) + Send + Sync + 'static,
+    {
+        self.params.on_progress = Some(Arc::new(cb));
         self
     }
 

@@ -76,6 +76,10 @@ pub struct Args {
     /// Enable word-level timestamps in transcription output
     #[arg(long = "word-timestamps", default_value_t = false)]
     pub word_timestamps: bool,
+
+    /// Enable tinydiarize speaker turn detection
+    #[arg(long = "tinydiarize", alias = "tdrz", default_value_t = false)]
+    pub tinydiarize: bool,
 }
 
 /// Preprocess command-line arguments to support whisper.cpp style flags such as
@@ -103,6 +107,7 @@ where
             "-tr" => out.push("--translate".to_string()),
             "-bs" => out.push("--beam-size".to_string()),
             "-wt" => out.push("--word-timestamps".to_string()),
+            "-tdrz" => out.push("--tinydiarize".to_string()),
             s if s.starts_with("-of=") => out.push(format!("--output-file={}", &s[4..])),
             s if s.starts_with("-bs=") => out.push(format!("--beam-size={}", &s[4..])),
             _ => out.push(arg),
@@ -242,6 +247,7 @@ pub fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         initial_prompt: args.prompt.clone(),
         no_timestamps: args.no_timestamps,
         n_threads: args.threads,
+        tdrz_enable: args.tinydiarize,
         ..Default::default()
     };
 
@@ -461,6 +467,7 @@ mod tests {
             output_json: true,
             output_file: Some(base_str.to_string()),
             word_timestamps: false,
+            tinydiarize: false,
         };
 
         let segments = vec![
@@ -522,6 +529,7 @@ mod tests {
             output_json: false,
             output_file: None,
             word_timestamps: false,
+            tinydiarize: false,
         };
         let res = run(args);
         assert!(res.is_err());
@@ -547,6 +555,7 @@ mod tests {
             output_json: false,
             output_file: None,
             word_timestamps: false,
+            tinydiarize: false,
         };
         let res = run(args);
         assert!(res.is_err());

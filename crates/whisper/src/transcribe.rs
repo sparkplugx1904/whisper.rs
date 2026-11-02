@@ -226,6 +226,11 @@ impl WhisperContext {
         let total_audio_sec = mel.n_len_org as f64 * 0.01;
 
         while seek_frame < mel.n_len_org {
+            if let Some(ref cb) = params.on_progress {
+                let pct = ((seek_frame as f64 / mel.n_len_org.max(1) as f64) * 100.0)
+                    .clamp(0.0, 100.0) as i32;
+                cb(pct);
+            }
             if seek_frame + 10 >= mel.n_len_org {
                 break;
             }
@@ -383,6 +388,9 @@ impl WhisperContext {
                     let t1 = (seek_time + 30.0).min(total_audio_sec);
                     let seg = self.build_segment(seek_time, t1, chunk);
                     if !seg.text.trim().is_empty() {
+                        if let Some(ref cb) = params.on_new_segment {
+                            cb(&seg);
+                        }
                         segments.push(seg);
                     }
                 }
@@ -402,6 +410,9 @@ impl WhisperContext {
                         } else {
                             let seg = self.build_segment(seg_t0, abs_sec, &seg_tokens);
                             if !seg.text.trim().is_empty() {
+                                if let Some(ref cb) = params.on_new_segment {
+                                    cb(&seg);
+                                }
                                 segments.push(seg);
                             }
                             seg_tokens.clear();
@@ -415,6 +426,9 @@ impl WhisperContext {
                                 (seg_t0 + (seg_tokens.len() as f64 * 0.2)).min(total_audio_sec);
                             let seg = self.build_segment(seg_t0, t_mid, &seg_tokens);
                             if !seg.text.trim().is_empty() {
+                                if let Some(ref cb) = params.on_new_segment {
+                                    cb(&seg);
+                                }
                                 segments.push(seg);
                             }
                             seg_tokens.clear();
@@ -426,6 +440,9 @@ impl WhisperContext {
                     let t1 = (seek_time + 30.0).min(total_audio_sec);
                     let seg = self.build_segment(seg_t0, t1, &seg_tokens);
                     if !seg.text.trim().is_empty() {
+                        if let Some(ref cb) = params.on_new_segment {
+                            cb(&seg);
+                        }
                         segments.push(seg);
                     }
                     last_end_time = t1;
@@ -440,11 +457,18 @@ impl WhisperContext {
             }
         }
 
+        if let Some(ref cb) = params.on_progress {
+            cb(100);
+        }
+
         segments
     }
 
     fn build_segment(&self, seg_t0: f64, seg_t1: f64, tokens: &[i32]) -> Segment {
-        let text = self.tokenizer.decode(tokens, true);
+        let mut text = self.tokenizer.decode(tokens, true);
+        if tokens.iter().any(|&t| t == 50363 || t == 50364) && !text.starts_with("[SPEAKER_TURN]") {
+            text = format!("[SPEAKER_TURN] {}", text.trim());
+        }
         let token_tuples: Vec<(&str, f32)> = tokens
             .iter()
             .map(|&tok| (self.tokenizer.id_to_token(tok).unwrap_or(""), 0.95))
