@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use whisper_audio::WavAudio;
-use whisper_vad::{detect_speech_segments, SileroVadModel, VadParams};
+use whisper_vad::{detect_speech_segments, VadParams};
 
 fn workspace_path(rel: &str) -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -31,16 +31,23 @@ fn test_detect_speech_jfk() {
 }
 
 #[test]
-fn test_load_silero_vad_model() {
-    let path = Path::new("/tmp/whisper_ref/models/for-tests-silero-v6.2.0-ggml.bin");
-    if !path.exists() {
-        eprintln!("Silero test model not found, skipping");
-        return;
-    }
+fn test_detect_silence_returns_empty() {
+    let silence = vec![0.0f32; 16000 * 5]; // 5 seconds of absolute silence
+    let params = VadParams::default();
+    let segments = detect_speech_segments(&silence, &params);
+    assert!(
+        segments.is_empty(),
+        "Pure silence must produce zero speech segments"
+    );
+}
 
-    let model = SileroVadModel::load_from_file(path).expect("load silero model");
-    assert_eq!(model.model_type, "silero-16k");
-    assert_eq!(model.major_version, 6);
-    assert_eq!(model.minor_version, 2);
-    assert_eq!(model.patch_version, 0);
+#[test]
+fn test_detect_short_audio() {
+    let short_audio = vec![0.1f32; 100]; // Shorter than frame length (480 samples)
+    let params = VadParams::default();
+    let segments = detect_speech_segments(&short_audio, &params);
+    assert!(
+        segments.is_empty(),
+        "Audio shorter than window must return empty segments"
+    );
 }

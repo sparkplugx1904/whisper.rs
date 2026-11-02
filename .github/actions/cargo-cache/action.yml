@@ -1,0 +1,22 @@
+name: "Cargo Cache"
+description: "Caches cargo registry, index, and target directories"
+inputs:
+  key-prefix:
+    description: "Cache key prefix"
+    required: false
+    default: "whisper-rs"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Cache Cargo Dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-${{ inputs.key-prefix }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ inputs.key-prefix }}-

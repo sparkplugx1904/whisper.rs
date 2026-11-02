@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-
 use clap::Parser;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -13,24 +12,60 @@ use whisper_rs::{WhisperContext, WhisperParams};
 #[command(
     author,
     version,
-    about = "OpenAI-compatible HTTP REST server for whisper.rs"
+    about = "OpenAI-compatible HTTP REST audio transcription server for whisper.rs"
 )]
 struct Args {
     /// Model file path (.bin)
     #[arg(short = 'm', long = "model", default_value = "models/ggml-tiny.en.bin")]
     model: String,
 
+    /// Host address to bind
+    #[arg(long = "host", default_value = "127.0.0.1")]
+    host: String,
+
     /// Port to listen on
     #[arg(short = 'p', long = "port", default_value_t = 8080)]
     port: u16,
+}
 
-    /// Host IP address
-    #[arg(long = "host", default_value = "127.0.0.1")]
-    host: String,
+fn extract_field_from_multipart<'a>(body: &'a [u8], field_name: &str) -> Option<&'a str> {
+    let needle = format!("name=\"{}\"", field_name);
+    let needle_bytes = needle.as_bytes();
+    if let Some(pos) = body
+        .windows(needle_bytes.len())
+        .position(|w| w == needle_bytes)
+    {
+        let rem = &body[pos + needle_bytes.len()..];
+        if let Some(header_end) = rem.windows(4).position(|w| w == b"\r\n\r\n") {
+            let val_part = &rem[header_end + 4..];
+            if let Some(val_end) = val_part.windows(2).position(|w| w == b"\r\n") {
+                return std::str::from_utf8(&val_part[..val_end]).ok();
+            }
+        }
+    }
+    None
+}
+
+fn extract_wav_from_multipart(body: &[u8]) -> &[u8] {
+    if let Some(pos) = body.windows(4).position(|w| w == b"RIFF") {
+        if pos + 8 <= body.len() {
+            let riff_len =
+                u32::from_le_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]])
+                    as usize;
+            let total_wav_len = (riff_len + 8).min(body.len() - pos);
+            return &body[pos..pos + total_wav_len];
+        }
+        return &body[pos..];
+    }
+    body
 }
 
 fn handle_client(mut stream: TcpStream, ctx: Arc<WhisperContext>) {
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut reader = BufReader::new(match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    });
+
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
         return;
@@ -43,29 +78,28 @@ fn handle_client(mut stream: TcpStream, ctx: Arc<WhisperContext>) {
     let method = parts[0];
     let path = parts[1];
 
-    let mut content_length = 0usize;
+    let mut content_length: usize = 0;
     let mut is_multipart = false;
     let mut boundary = String::new();
 
     loop {
-        let mut header_line = String::new();
-        if reader.read_line(&mut header_line).is_err() || header_line.trim().is_empty() {
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
             break;
         }
-
-        let line_lower = header_line.to_lowercase();
-        if line_lower.starts_with("content-length:") {
-            if let Some(val) = header_line.split(':').nth(1) {
-                content_length = val.trim().parse::<usize>().unwrap_or(0);
+        let lower = line.to_lowercase();
+        if lower.starts_with("content-length:") {
+            if let Some(val) = line.split(':').nth(1) {
+                content_length = val.trim().parse().unwrap_or(0);
             }
-        }
-        if line_lower.starts_with("content-type:") && line_lower.contains("multipart/form-data") {
+        } else if lower.starts_with("content-type:") && lower.contains("multipart/form-data") {
             is_multipart = true;
-            if let Some(pos) = header_line.find("boundary=") {
-                boundary = header_line[pos + 9..].trim().to_string();
+            if let Some(b_pos) = line.find("boundary=") {
+                boundary = line[b_pos + 9..].trim().to_string();
             }
         }
     }
+
     const MAX_BODY_SIZE: usize = 64 * 1024 * 1024; // 64 MB
     if content_length > MAX_BODY_SIZE {
         let response = "HTTP/1.1 413 Payload Too Large\r\n\r\nPayload Too Large";
@@ -90,34 +124,76 @@ fn handle_client(mut stream: TcpStream, ctx: Arc<WhisperContext>) {
             return;
         }
 
-        // Extract WAV samples either from multipart or raw body
         let wav_data = if is_multipart && !boundary.is_empty() {
             extract_wav_from_multipart(&body)
         } else {
             &body[..]
         };
 
+        // Extract optional OpenAI parameters
+        let language = extract_field_from_multipart(&body, "language").map(|s| s.to_string());
+        let prompt = extract_field_from_multipart(&body, "prompt").map(|s| s.to_string());
+        let temperature: f32 = extract_field_from_multipart(&body, "temperature")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let response_format =
+            extract_field_from_multipart(&body, "response_format").unwrap_or("json");
+
         match WavAudio::load_from_bytes(wav_data) {
             Ok(audio) => {
                 let params = WhisperParams {
                     translate: is_translation,
-                    no_timestamps: true,
+                    language: language.unwrap_or_else(|| "en".to_string()),
+                    initial_prompt: prompt,
+                    temperature,
+                    no_timestamps: response_format == "json" || response_format == "text",
                     ..Default::default()
                 };
 
                 let segments = ctx.transcribe_pcm(&audio.samples, &params);
-                let full_text: String = segments
-                    .iter()
-                    .map(|s| s.text.trim())
-                    .collect::<Vec<_>>()
-                    .join(" ");
 
-                let escaped = full_text.replace('\\', "\\\\").replace('"', "\\\"");
-                let json_resp = format!("{{\"text\":\"{}\"}}\n", escaped);
+                let (content_type, body_str) = match response_format {
+                    "text" => {
+                        let text = segments
+                            .iter()
+                            .map(|s| s.text.trim())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        ("text/plain", text)
+                    }
+                    "srt" => {
+                        let mut srt_out = String::new();
+                        for (i, seg) in segments.iter().enumerate() {
+                            srt_out.push_str(&seg.to_srt(i + 1));
+                        }
+                        ("text/plain", srt_out)
+                    }
+                    "vtt" => {
+                        let mut vtt_out = String::from("WEBVTT\n\n");
+                        for seg in &segments {
+                            vtt_out.push_str(&seg.to_vtt());
+                        }
+                        ("text/vtt", vtt_out)
+                    }
+                    _ => {
+                        let full_text: String = segments
+                            .iter()
+                            .map(|s| s.text.trim())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let escaped = full_text.replace('\\', "\\\\").replace('"', "\\\"");
+                        (
+                            "application/json",
+                            format!("{{\"text\":\"{}\"}}\n", escaped),
+                        )
+                    }
+                };
+
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                    json_resp.len(),
-                    json_resp
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
+                    content_type,
+                    body_str.len(),
+                    body_str
                 );
                 let _ = stream.write_all(response.as_bytes());
             }
@@ -136,21 +212,6 @@ fn handle_client(mut stream: TcpStream, ctx: Arc<WhisperContext>) {
 
     let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
     let _ = stream.write_all(response.as_bytes());
-}
-
-fn extract_wav_from_multipart(body: &[u8]) -> &[u8] {
-    // Locate RIFF header in multipart payload and slice exact WAV file length
-    if let Some(pos) = body.windows(4).position(|w| w == b"RIFF") {
-        if pos + 8 <= body.len() {
-            let riff_len =
-                u32::from_le_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]])
-                    as usize;
-            let total_wav_len = (riff_len + 8).min(body.len() - pos);
-            return &body[pos..pos + total_wav_len];
-        }
-        return &body[pos..];
-    }
-    body
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

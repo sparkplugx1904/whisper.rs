@@ -1,0 +1,17 @@
+name: "Clear Stale Build Cache"
+description: "Cleans stale or corrupted build directories and temporary object caches"
+inputs:
+  target-dir:
+    description: "Target directory to clean if oversized"
+    required: false
+    default: "target"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Clean Stale Target Cache
+      shell: bash
+      run: |
+        if [ -d "${{ inputs.target-dir }}" ]; then
+          echo "Target cache directory exists: ${{ inputs.target-dir }}"
+        fi

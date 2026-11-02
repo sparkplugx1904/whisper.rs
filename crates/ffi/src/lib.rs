@@ -35,6 +35,22 @@ pub enum whisper_sampling_strategy {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 #[allow(non_camel_case_types)]
+pub struct whisper_ahead {
+    pub n_text_layer: c_int,
+    pub n_head: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[allow(non_camel_case_types)]
+pub struct whisper_aheads {
+    pub n_heads: usize,
+    pub heads: *const whisper_ahead,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[allow(non_camel_case_types)]
 pub struct whisper_context_params {
     pub use_gpu: bool,
     pub flash_attn: bool,
@@ -42,6 +58,8 @@ pub struct whisper_context_params {
     pub dtw_token_timestamps: bool,
     pub dtw_aheads_preset: c_int,
     pub dtw_n_top: c_int,
+    pub dtw_aheads: whisper_aheads,
+    pub dtw_mem_size: usize,
 }
 
 #[repr(C)]
@@ -167,6 +185,11 @@ pub extern "C" fn whisper_context_default_params() -> whisper_context_params {
         dtw_token_timestamps: false,
         dtw_aheads_preset: 0,
         dtw_n_top: 0,
+        dtw_aheads: whisper_aheads {
+            n_heads: 0,
+            heads: ptr::null(),
+        },
+        dtw_mem_size: 0,
     }
 }
 
@@ -970,6 +993,16 @@ pub unsafe extern "C" fn whisper_set_mel(
 
 #[no_mangle]
 pub unsafe extern "C" fn whisper_lang_auto_detect(
+    ctx: *mut whisper_context,
+    offset_ms: c_int,
+    n_threads: c_int,
+    lang_probs: *mut f32,
+) -> c_int {
+    whisper_lang_auto_detect_with_state(ctx, ptr::null_mut(), offset_ms, n_threads, lang_probs)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_lang_auto_detect_with_state(
     ctx: *mut whisper_context,
     state: *mut whisper_state,
     _offset_ms: c_int,

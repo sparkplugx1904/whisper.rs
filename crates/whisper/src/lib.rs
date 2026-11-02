@@ -14,7 +14,7 @@ pub use beam::{BeamCandidate, BeamSearch};
 pub use decoder::{DecoderBlockWeights, DecoderKvCache, DecoderWeights, WhisperDecoder};
 pub use encoder::{EncoderBlockWeights, EncoderWeights, WhisperEncoder};
 pub use filter::{compression_ratio, compute_token_logprob};
-pub use params::WhisperParams;
+pub use params::{FullParamsBuilder, SamplingStrategy, WhisperParams};
 pub use segment::Segment;
 pub use state::WhisperState;
 pub use transcribe::WhisperContext;

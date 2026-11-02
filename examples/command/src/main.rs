@@ -68,11 +68,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "\n>>> MATCH! Keyword '{}' detected in speech.",
             args.command
         );
-        println!(">>> Executing subprocess: `{}`...", args.exec);
-
-        let status = Command::new("sh").arg("-c").arg(&args.exec).status()?;
-
-        println!(">>> Subprocess finished with exit status: {}", status);
+        println!(">>> Executing command: `{}`...", args.exec);
+        let parts: Vec<&str> = args.exec.split_whitespace().collect();
+        if let Some((bin, cmd_args)) = parts.split_first() {
+            let status = Command::new(bin).args(cmd_args).status()?;
+            println!(">>> Subprocess finished with exit status: {}", status);
+        } else {
+            println!(">>> Empty command, nothing to execute.");
+        }
     } else {
         println!(
             "\n>>> NO MATCH: Target keyword '{}' not found in recognized speech.",

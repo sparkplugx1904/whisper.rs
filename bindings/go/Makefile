@@ -10,7 +10,7 @@ whisper: mkdir
 	cargo build --manifest-path ../../Cargo.toml --package whisper-ffi --release
 
 test: whisper modtidy
-	@C_INCLUDE_PATH=${INCLUDE_PATH} LIBRARY_PATH=${LIBRARY_PATH} LD_LIBRARY_PATH=${LIBRARY_PATH} go test -v .
+	@C_INCLUDE_PATH=${INCLUDE_PATH} LIBRARY_PATH=${LIBRARY_PATH} LD_LIBRARY_PATH=${LIBRARY_PATH} go test -v ./...
 
 examples: $(EXAMPLES_DIR)
 

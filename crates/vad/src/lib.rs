@@ -1,19 +1,9 @@
 #![forbid(unsafe_code)]
 //! Voice Activity Detection (VAD) for whisper.rs.
-
-use byteorder::{LittleEndian, ReadBytesExt};
-use std::fs::File;
-use std::io::{BufReader, Read};
-use std::path::Path;
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum VadError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Invalid VAD model format: {0}")]
-    FormatError(String),
-}
+//!
+//! Implementation: Adaptive Energy-based Voice Activity Detection with Dynamic Noise Floor Tracking.
+//! Analyzes short-time frame root-mean-square (RMS) energy, applies noise floor percentile estimation,
+//! and performs temporal smoothing with speech/silence duration constraints and padding.
 
 #[derive(Debug, Clone)]
 pub struct VadParams {
@@ -48,31 +38,27 @@ impl SpeechSegment {
     }
 }
 
-/// Detect active speech segments from raw PCM samples (16,000 Hz).
+/// Detect speech segments in 16 kHz mono float PCM samples using adaptive energy thresholding.
+/// If no speech is present (pure silence), returns an empty vector (`Vec::new()`).
 pub fn detect_speech_segments(samples: &[f32], params: &VadParams) -> Vec<SpeechSegment> {
     if samples.is_empty() {
         return Vec::new();
     }
 
-    let frame_len = (params.sample_rate * 30) / 1000; // 30ms = 480 samples
-    let frame_hop = (params.sample_rate * 10) / 1000; // 10ms = 160 samples
+    let frame_len = (params.sample_rate * 30) / 1000; // 30ms window
+    let frame_hop = (params.sample_rate * 10) / 1000; // 10ms hop
+    let total_sec = samples.len() as f64 / params.sample_rate as f64;
 
     if samples.len() < frame_len {
-        return vec![SpeechSegment::new(
-            0.0,
-            samples.len() as f64 / params.sample_rate as f64,
-        )];
+        return Vec::new();
     }
 
-    // 1. Calculate short-time RMS energy per frame
     let n_frames = (samples.len() - frame_len) / frame_hop + 1;
-    let mut is_speech = vec![false; n_frames];
-
-    // Compute noise floor
     let mut energies = Vec::with_capacity(n_frames);
+
     for i in 0..n_frames {
-        let offset = i * frame_hop;
-        let frame = &samples[offset..offset + frame_len];
+        let start = i * frame_hop;
+        let frame = &samples[start..start + frame_len];
         let mut sum_sq = 0.0f32;
         for &s in frame {
             sum_sq += s * s;
@@ -81,40 +67,36 @@ pub fn detect_speech_segments(samples: &[f32], params: &VadParams) -> Vec<Speech
         energies.push(rms);
     }
 
+    // Adaptive noise floor: median energy of all frames
     let mut sorted_energies = energies.clone();
     sorted_energies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median_energy = sorted_energies[sorted_energies.len() / 2];
     let dyn_threshold = (params.threshold * 0.02).max(median_energy * 2.0);
 
+    let mut is_speech = vec![false; n_frames];
     for (i, &e) in energies.iter().enumerate() {
         if e > dyn_threshold {
             is_speech[i] = true;
         }
     }
 
-    // 2. Merge silent frames shorter than min_silence_duration_ms
-    let min_silence_frames = params.min_silence_duration_ms / 10;
-    let mut i = 0;
-    while i < n_frames {
+    // 1. Merge short silence gaps (< min_silence_duration_ms)
+    let min_silence_frames = (params.min_silence_duration_ms * 1000) / (params.sample_rate * 10);
+    let mut silence_len = 0;
+    for i in 0..n_frames {
         if !is_speech[i] {
-            let start = i;
-            while i < n_frames && !is_speech[i] {
-                i += 1;
-            }
-            let silence_len = i - start;
-            if silence_len < min_silence_frames && start > 0 && i < n_frames {
-                is_speech[start..i].fill(true);
-            }
+            silence_len += 1;
         } else {
-            i += 1;
+            if silence_len < min_silence_frames && silence_len > 0 && i >= silence_len {
+                is_speech[(i - silence_len)..i].fill(true);
+            }
+            silence_len = 0;
         }
     }
 
-    // 3. Extract continuous speech segments
-    let min_speech_frames = params.min_speech_duration_ms / 10;
-    let pad_sec = (params.speech_pad_ms as f64) / 1000.0;
-    let total_sec = samples.len() as f64 / params.sample_rate as f64;
-
+    // 2. Extract speech segments with min duration filter
+    let min_speech_frames = (params.min_speech_duration_ms * 1000) / (params.sample_rate * 10);
+    let pad_sec = params.speech_pad_ms as f64 / 1000.0;
     let mut segments = Vec::new();
     let mut in_speech = false;
     let mut seg_start = 0;
@@ -146,43 +128,6 @@ pub fn detect_speech_segments(samples: &[f32], params: &VadParams) -> Vec<Speech
         }
     }
 
-    // If no voice segment was detected, return empty (clean silence)
-
+    // If no voice segment was detected (pure silence), returns empty list
     segments
-}
-
-/// Loader for Silero VAD GGML format model.
-pub struct SileroVadModel {
-    pub model_type: String,
-    pub major_version: i32,
-    pub minor_version: i32,
-    pub patch_version: i32,
-}
-
-impl SileroVadModel {
-    pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, VadError> {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-
-        let magic = reader.read_u32::<LittleEndian>()?;
-        if magic != 0x67676d6c {
-            return Err(VadError::FormatError(format!("Invalid magic {:#x}", magic)));
-        }
-
-        let str_len = reader.read_i32::<LittleEndian>()? as usize;
-        let mut type_buf = vec![0u8; str_len];
-        reader.read_exact(&mut type_buf)?;
-        let model_type = String::from_utf8_lossy(&type_buf).into_owned();
-
-        let major = reader.read_i32::<LittleEndian>()?;
-        let minor = reader.read_i32::<LittleEndian>()?;
-        let patch = reader.read_i32::<LittleEndian>()?;
-
-        Ok(Self {
-            model_type,
-            major_version: major,
-            minor_version: minor,
-            patch_version: patch,
-        })
-    }
 }

@@ -1,2 +1,6 @@
 build
 models
+
+*.test
+go.test
+

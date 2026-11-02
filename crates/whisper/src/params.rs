@@ -53,3 +53,69 @@ impl Default for WhisperParams {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplingStrategy {
+    Greedy { best_of: usize },
+    BeamSearch { beam_size: usize },
+}
+
+/// Type-safe fluent builder for transcription parameters.
+#[derive(Debug, Clone)]
+pub struct FullParamsBuilder {
+    params: WhisperParams,
+}
+
+impl FullParamsBuilder {
+    pub fn new(strategy: SamplingStrategy) -> Self {
+        let mut params = WhisperParams::default();
+        match strategy {
+            SamplingStrategy::Greedy { .. } => {
+                params.beam_size = 1;
+            }
+            SamplingStrategy::BeamSearch { beam_size } => {
+                params.beam_size = beam_size.max(1);
+            }
+        }
+        Self { params }
+    }
+
+    pub fn language(mut self, lang: impl Into<String>) -> Self {
+        self.params.language = lang.into();
+        self
+    }
+
+    pub fn translate(mut self, translate: bool) -> Self {
+        self.params.translate = translate;
+        self
+    }
+
+    pub fn temperature(mut self, temp: f32) -> Self {
+        self.params.temperature = temp;
+        self
+    }
+
+    pub fn no_timestamps(mut self, no_ts: bool) -> Self {
+        self.params.no_timestamps = no_ts;
+        self
+    }
+
+    pub fn initial_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.params.initial_prompt = Some(prompt.into());
+        self
+    }
+
+    pub fn grammar(mut self, grammar: impl Into<String>) -> Self {
+        self.params.grammar = Some(grammar.into());
+        self
+    }
+
+    pub fn n_threads(mut self, n_threads: usize) -> Self {
+        self.params.n_threads = n_threads;
+        self
+    }
+
+    pub fn build(self) -> WhisperParams {
+        self.params
+    }
+}

@@ -183,15 +183,21 @@ impl GbnfGrammar {
         }
     }
 
-    /// Mask invalid token logits with -INFINITY without excessive string allocation.
+    /// Mask invalid token logits with -INFINITY using a single reusable buffer for zero per-token allocations.
     pub fn filter_logits(&self, current_text: &str, logits: &mut [f32], vocab: &Vocab) {
+        let mut combined = String::with_capacity(current_text.len() + 64);
+        combined.push_str(current_text);
+        let base_len = combined.len();
+
         for (tok_id, val) in logits.iter_mut().enumerate() {
             if *val == f32::NEG_INFINITY {
                 continue;
             }
 
             if let Some(tok_str) = vocab.id_to_token(tok_id as i32) {
-                if !self.accepts_prefix_extended(current_text, tok_str) {
+                combined.truncate(base_len);
+                combined.push_str(tok_str);
+                if !self.accepts_prefix(&combined) {
                     *val = f32::NEG_INFINITY;
                 }
             }

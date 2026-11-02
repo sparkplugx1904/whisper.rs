@@ -14,15 +14,14 @@ impl WhisperWasm {
     pub fn new(model_bytes: &[u8]) -> Result<WhisperWasm, JsValue> {
         let model = WhisperModel::load_from_bytes(model_bytes.to_vec())
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let ctx = WhisperContext::new(model)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let ctx = WhisperContext::new(model).map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(Self { ctx })
     }
 
     #[wasm_bindgen]
     pub fn transcribe(&self, wav_bytes: &[u8]) -> Result<String, JsValue> {
-        let audio = WavAudio::load_from_bytes(wav_bytes)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let audio =
+            WavAudio::load_from_bytes(wav_bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
         let params = WhisperParams::default();
         let segments = self.ctx.transcribe_pcm(&audio.samples, &params);
         let text = segments

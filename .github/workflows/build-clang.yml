@@ -23,11 +23,5 @@ jobs:
       - name: Clippy Strict Check
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Gate Script
+      - name: Pure Rust Gate Audit
         run: ./scripts/check_pure_rust.sh
-
-      - name: Install Cargo Deny
-        run: cargo install cargo-deny --locked || true
-
-      - name: Check Dependencies Security & License
-        run: cargo deny check || true

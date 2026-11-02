@@ -198,14 +198,8 @@ impl WhisperContext {
         if let Some(prompt_text) = &params.initial_prompt {
             if !prompt_text.trim().is_empty() {
                 prompt_base.push(self.model.vocab.token_prev);
-                for word in prompt_text.split_whitespace() {
-                    let word_with_space = format!(" {}", word);
-                    if let Some(id) = self.tokenizer.token_to_id(&word_with_space) {
-                        prompt_base.push(id);
-                    } else if let Some(id) = self.tokenizer.token_to_id(word) {
-                        prompt_base.push(id);
-                    }
-                }
+                let encoded_prompt = self.tokenizer.encode(prompt_text);
+                prompt_base.extend(encoded_prompt);
             }
         }
 

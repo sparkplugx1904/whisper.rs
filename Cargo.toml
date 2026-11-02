@@ -14,6 +14,7 @@ members = [
     "crates/grammar",
     "crates/vad",
     "crates/ffi",
+    "bindings/javascript",
 ]
 resolver = "2"
 

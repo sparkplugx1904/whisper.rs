@@ -115,3 +115,45 @@ fn test_vad_full_speech_and_silence() {
         "Pure silence must produce 0 speech segments"
     );
 }
+
+#[test]
+fn test_sliding_window_long_audio() {
+    let model_path = resolve_model_path("ggml-tiny.en.bin");
+    let wav_path = workspace_path("samples/jfk.wav");
+    if !model_path.exists() || !wav_path.exists() {
+        eprintln!("Model or sample not found, skipping sliding window test");
+        return;
+    }
+
+    let audio = WavAudio::load_from_file(&wav_path).expect("load wav");
+    let model = WhisperModel::load_from_file(&model_path).expect("load model");
+    let ctx = WhisperContext::new(model).expect("create context");
+
+    // Concatenate audio to create >30 seconds (3x 11s = 33s)
+    let mut long_samples = Vec::with_capacity(audio.samples.len() * 3);
+    long_samples.extend_from_slice(&audio.samples);
+    long_samples.extend_from_slice(&audio.samples);
+    long_samples.extend_from_slice(&audio.samples);
+
+    let total_duration = long_samples.len() as f64 / 16000.0;
+    assert!(
+        total_duration > 30.0,
+        "Total duration must exceed 30 seconds"
+    );
+
+    let params = WhisperParams {
+        no_timestamps: false,
+        ..Default::default()
+    };
+
+    let segments = ctx.transcribe_pcm(&long_samples, &params);
+    assert!(
+        segments.len() >= 2,
+        "Must produce multiple segments for >30s audio"
+    );
+    let last_t1 = segments.last().unwrap().t1;
+    assert!(
+        last_t1 > 20.0,
+        "Last segment timestamp must advance past 20s"
+    );
+}

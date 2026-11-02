@@ -105,8 +105,15 @@ fn test_c_abi_step_by_step_pipeline() {
         // 2. Language Auto Detect with probabilities array
         let max_langs = whisper_lang_max_id() as usize + 1;
         let mut lang_probs = vec![0.0f32; max_langs];
-        let lang_id =
-            whisper_lang_auto_detect(ctx, std::ptr::null_mut(), 0, 1, lang_probs.as_mut_ptr());
+        let lang_id = whisper_lang_auto_detect(ctx, 0, 1, lang_probs.as_mut_ptr());
+        let lang_id_with_state = whisper_lang_auto_detect_with_state(
+            ctx,
+            std::ptr::null_mut(),
+            0,
+            1,
+            lang_probs.as_mut_ptr(),
+        );
+        assert_eq!(lang_id, lang_id_with_state);
         assert!(
             lang_id >= 0,
             "Language detection must return non-negative ID"
@@ -214,4 +221,13 @@ fn test_c_abi_decode_invalid_token() {
 
         whisper_free(ctx);
     }
+}
+
+#[test]
+fn test_sizeof_whisper_context_params() {
+    assert_eq!(
+        std::mem::size_of::<whisper_context_params>(),
+        48,
+        "whisper_context_params must be exactly 48 bytes matching C-ABI include/whisper.h"
+    );
 }

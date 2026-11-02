@@ -40,7 +40,7 @@ echo "Check 3: Inspecting cargo dependency tree..."
 if [ -f "Cargo.lock" ] || [ -f "Cargo.toml" ]; then
     TREE_OUTPUT=$(cargo tree --prefix none || true)
     # Match crates ending in -sys, or C builders (cc, cmake, bindgen, ggml-rs)
-    FORBIDDEN_DEPS=$(echo "$TREE_OUTPUT" | grep -E '(\b[a-zA-Z0-9_]+-sys\b|\bcc\s+v|\bcmake\s+v|\bbindgen\s+v|\bggml-rs\s+v)' || true)
+    FORBIDDEN_DEPS=$(echo "$TREE_OUTPUT" | grep -E '(\b[a-zA-Z0-9_]+-sys\b|(^|\s)cc\s+v|(^|\s)cmake\s+v|(^|\s)bindgen\s+v|(^|\s)ggml-rs\s+v)' || true)
     if [ -n "$FORBIDDEN_DEPS" ]; then
         echo "ERROR: Found forbidden *-sys or C-builder crate dependencies in cargo tree:" >&2
         echo "$FORBIDDEN_DEPS" >&2
