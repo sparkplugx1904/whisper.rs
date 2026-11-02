@@ -12,10 +12,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Stable Rust with components
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust-env
+
+      - name: Cache Cargo Dependencies
+        uses: ./.github/actions/cargo-cache
 
       - name: Rustfmt Check
         run: cargo fmt --all -- --check

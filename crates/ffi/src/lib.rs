@@ -406,7 +406,7 @@ pub unsafe extern "C" fn whisper_full_with_state(
         return -1;
     }
 
-    let context = &mut *ctx;
+    let context = &*ctx;
     let state_ref = &mut *state;
 
     let sample_slice = std::slice::from_raw_parts(samples, n_samples as usize);
@@ -474,11 +474,6 @@ pub unsafe extern "C" fn whisper_full_with_state(
         }
         state_ref.token_c_strings.push(tok_cstrs);
     }
-
-    // Mirror to context default state for caller compatibility
-    context.default_state.inner.segments = state_ref.inner.segments.clone();
-    context.default_state.segment_c_strings = state_ref.segment_c_strings.clone();
-    context.default_state.token_c_strings = state_ref.token_c_strings.clone();
     // Invoke new_segment_callback if provided
     if !params.new_segment_callback.is_null() {
         type NewSegCb = extern "C" fn(*mut whisper_context, *mut whisper_state, c_int, *mut c_void);
@@ -504,8 +499,7 @@ pub unsafe extern "C" fn whisper_full(
     if ctx.is_null() {
         return -1;
     }
-    let context = &mut *ctx;
-    let state_ptr = &mut *context.default_state as *mut whisper_state;
+    let state_ptr = (*ctx).default_state.as_mut() as *mut whisper_state;
     whisper_full_with_state(ctx, state_ptr, params, samples, n_samples)
 }
 

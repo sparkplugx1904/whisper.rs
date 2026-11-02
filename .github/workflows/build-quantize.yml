@@ -12,8 +12,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust-env
+
+      - name: Cache Cargo Dependencies
+        uses: ./.github/actions/cargo-cache
 
       - name: Build Quantizer Binary
         run: cargo build --package whisper-quantize --release --verbose

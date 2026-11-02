@@ -81,7 +81,8 @@ pub fn detect_speech_segments(samples: &[f32], params: &VadParams) -> Vec<Speech
     }
 
     // 1. Merge short silence gaps (< min_silence_duration_ms)
-    let min_silence_frames = (params.min_silence_duration_ms * 1000) / (params.sample_rate * 10);
+    let frame_hop_ms = ((frame_hop * 1000) / params.sample_rate).max(1);
+    let min_silence_frames = params.min_silence_duration_ms.div_ceil(frame_hop_ms);
     let mut silence_len = 0;
     for i in 0..n_frames {
         if !is_speech[i] {
@@ -95,7 +96,7 @@ pub fn detect_speech_segments(samples: &[f32], params: &VadParams) -> Vec<Speech
     }
 
     // 2. Extract speech segments with min duration filter
-    let min_speech_frames = (params.min_speech_duration_ms * 1000) / (params.sample_rate * 10);
+    let min_speech_frames = params.min_speech_duration_ms.div_ceil(frame_hop_ms);
     let pad_sec = params.speech_pad_ms as f64 / 1000.0;
     let mut segments = Vec::new();
     let mut in_speech = false;

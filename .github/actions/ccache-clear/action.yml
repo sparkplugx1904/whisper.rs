@@ -13,5 +13,7 @@ runs:
       shell: bash
       run: |
         if [ -d "${{ inputs.target-dir }}" ]; then
-          echo "Target cache directory exists: ${{ inputs.target-dir }}"
+          echo "Pruning stale build artifacts in ${{ inputs.target-dir }}..."
+          rm -rf "${{ inputs.target-dir }}/release/incremental"
+          rm -rf "${{ inputs.target-dir }}/debug/incremental"
         fi

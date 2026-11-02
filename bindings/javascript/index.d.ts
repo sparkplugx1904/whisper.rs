@@ -1,11 +1,13 @@
-export interface WhisperSegment {
-  start: number;
-  end: number;
-  text: string;
+export class WhisperWasm {
+  /**
+   * Create a new WhisperWasm instance from model binary buffer (.bin).
+   */
+  constructor(modelBytes: Uint8Array);
+
+  /**
+   * Transcribe speech from WAV audio file bytes (RIFF/WAV container).
+   */
+  transcribe(wavBytes: Uint8Array): string;
 }
 
-export class WhisperContext {
-  static fromBuffer(modelBuffer: Uint8Array): WhisperContext;
-  transcribe(audioPcmFloat32: Float32Array): string;
-  detectLanguage(audioPcmFloat32: Float32Array): string;
-}
+export default function init(): Promise<void>;
