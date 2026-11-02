@@ -404,11 +404,16 @@ pub fn merge_tokens_to_words(
         return Vec::new();
     }
 
-    let mut words = Vec::new();
+    let mut words: Vec<WordTiming> = Vec::new();
     let mut cur_word = String::new();
     let mut cur_t0 = 0.0;
     let mut cur_t1 = 0.0;
     let mut cur_probs = Vec::new();
+
+    let is_pure_punct = |s: &str| -> bool {
+        let trimmed = s.trim();
+        !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_punctuation())
+    };
 
     for (i, &(tok_str, prob)) in tokens.iter().enumerate() {
         // Skip special tokens enclosed in brackets e.g. <|...|> or [_...]
@@ -416,15 +421,29 @@ pub fn merge_tokens_to_words(
             continue;
         }
 
-        let is_new_word = tok_str.starts_with(' ')
-            || tok_str.starts_with('Ġ')
-            || words.is_empty() && cur_word.is_empty();
-
         let (tok_idx, f_start, f_end) = alignments.get(i).copied().unwrap_or((i, 0, 0));
         let _ = tok_idx;
 
         let t0 = time_offset + (f_start as f64) * frame_step_sec;
         let t1 = time_offset + ((f_end + 1) as f64) * frame_step_sec;
+
+        let clean_piece = tok_str
+            .strip_prefix(' ')
+            .or_else(|| tok_str.strip_prefix('Ġ'))
+            .unwrap_or(tok_str);
+
+        // Snap trailing pure punctuation to previous word if idle
+        if is_pure_punct(clean_piece) && cur_word.is_empty() && !words.is_empty() {
+            if let Some(prev) = words.last_mut() {
+                prev.word.push_str(clean_piece);
+                prev.t1 = prev.t1.max(t1);
+                continue;
+            }
+        }
+
+        let is_new_word = tok_str.starts_with(' ')
+            || tok_str.starts_with('Ġ')
+            || words.is_empty() && cur_word.is_empty();
 
         if is_new_word && !cur_word.is_empty() {
             let avg_prob = if !cur_probs.is_empty() {
@@ -436,11 +455,6 @@ pub fn merge_tokens_to_words(
             cur_word.clear();
             cur_probs.clear();
         }
-
-        let clean_piece = tok_str
-            .strip_prefix(' ')
-            .or_else(|| tok_str.strip_prefix('Ġ'))
-            .unwrap_or(tok_str);
 
         if cur_word.is_empty() {
             cur_t0 = t0;
@@ -457,6 +471,18 @@ pub fn merge_tokens_to_words(
             1.0
         };
         words.push(WordTiming::new(cur_word.trim(), cur_t0, cur_t1, avg_prob));
+    }
+
+    // Enforce monotonic timestamp boundaries: t0[k] >= t0[k-1] and t1[k] >= t0[k]
+    let mut last_t0 = time_offset;
+    for w in &mut words {
+        if w.t0 < last_t0 {
+            w.t0 = last_t0;
+        }
+        if w.t1 < w.t0 {
+            w.t1 = w.t0;
+        }
+        last_t0 = w.t0;
     }
 
     words

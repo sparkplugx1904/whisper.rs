@@ -1,5 +1,6 @@
 target/
 models/*.bin
+!models/for-tests-*.bin
 !tests/fixtures/*.bin
 whisper.cpp
 .*

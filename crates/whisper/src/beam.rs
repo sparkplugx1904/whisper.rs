@@ -31,7 +31,8 @@ impl BeamSearch {
     }
 
     /// Step the beam search by decoding the current tokens of each candidate,
-    /// filtering logits, computing log-probs, and retaining the top `beam_size` branches.
+    /// filtering logits (including GBNF grammar constraints), computing log-probs,
+    /// and retaining the top `beam_size` branches according to length penalty.
     #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
@@ -42,6 +43,10 @@ impl BeamSearch {
         beg: i32,
         no_timestamps: bool,
         suppress_blank: bool,
+        grammar: Option<&whisper_grammar::GbnfGrammar>,
+        vocab: &whisper_model::Vocab,
+        tokenizer: &whisper_tokenizer::Tokenizer,
+        length_penalty: f32,
     ) {
         let mut branches = Vec::new();
 
@@ -56,11 +61,10 @@ impl BeamSearch {
 
             let decode_input = match last_token {
                 Some(t) => vec![t],
-                None => Vec::new(), // Root already has prompt processed in cache
+                None => Vec::new(),
             };
 
             let mut logits = if decode_input.is_empty() {
-                // If root with empty tokens, we read logits from initial prompt decoding
                 vec![0.0f32; decoder.n_vocab]
             } else {
                 decoder.decode(&decode_input, encoder_output, &mut cand_cache)
@@ -85,7 +89,13 @@ impl BeamSearch {
                 }
             }
 
-            // 3. Compute log-softmax for top tokens
+            // 3. Grammar filtering if active
+            if let Some(gbnf) = grammar {
+                let cur_text = tokenizer.decode(&cand.tokens, true);
+                gbnf.filter_logits(&cur_text, step_logits, vocab);
+            }
+
+            // 4. Compute log-softmax for top tokens
             let mut max_l = f32::NEG_INFINITY;
             for &l in step_logits.iter() {
                 if l > max_l {
@@ -94,9 +104,11 @@ impl BeamSearch {
             }
             let mut sum_exp = 0.0f32;
             for &l in step_logits.iter() {
-                sum_exp += (l - max_l).exp();
+                if l > f32::NEG_INFINITY {
+                    sum_exp += (l - max_l).exp();
+                }
             }
-            let log_sum_exp = sum_exp.ln();
+            let log_sum_exp = sum_exp.max(1e-10).ln();
 
             // Find top-K tokens for this candidate
             let mut top_tokens: Vec<(i32, f32)> = Vec::new();
@@ -130,10 +142,11 @@ impl BeamSearch {
             }
         }
 
-        // Rank branches by normalized cumulative logprob: score / (len^0.7)
+        // Rank branches by normalized cumulative logprob: score / (len^alpha)
+        let alpha = (length_penalty as f64).clamp(0.0, 2.0);
         branches.sort_by(|a, b| {
-            let len_a = (a.tokens.len().max(1) as f64).powf(0.7);
-            let len_b = (b.tokens.len().max(1) as f64).powf(0.7);
+            let len_a = (a.tokens.len().max(1) as f64).powf(alpha);
+            let len_b = (b.tokens.len().max(1) as f64).powf(alpha);
             let score_a = a.cumulative_logprob / len_a;
             let score_b = b.cumulative_logprob / len_b;
             score_b
@@ -147,6 +160,13 @@ impl BeamSearch {
 
     pub fn is_all_completed(&self) -> bool {
         self.candidates.iter().all(|c| c.completed)
+    }
+
+    pub fn is_completed(&self, patience: f32) -> bool {
+        let target = ((self.beam_size as f32) * patience).round() as usize;
+        let target = target.clamp(1, self.beam_size);
+        let completed_count = self.candidates.iter().filter(|c| c.completed).count();
+        completed_count >= target
     }
 
     pub fn best_candidate(&self) -> Option<&BeamCandidate> {

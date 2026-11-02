@@ -273,6 +273,10 @@ impl WhisperContext {
                         step_logits[(beg as usize)..n_vocab].fill(f32::NEG_INFINITY);
                     }
 
+                    if let Some(gbnf) = &gbnf_grammar {
+                        gbnf.filter_logits("", step_logits, &self.model.vocab);
+                    }
+
                     let mut seed_tokens = Vec::new();
                     for (tok, &l) in step_logits.iter().enumerate() {
                         if l > f32::NEG_INFINITY {
@@ -296,7 +300,7 @@ impl WhisperContext {
 
                     let max_steps = 224;
                     for step in 1..max_steps {
-                        if beam.is_all_completed() {
+                        if beam.is_completed(1.0) {
                             break;
                         }
                         beam.step(
@@ -307,6 +311,14 @@ impl WhisperContext {
                             beg,
                             params.no_timestamps,
                             params.suppress_blank,
+                            gbnf_grammar.as_ref(),
+                            &self.model.vocab,
+                            &self.tokenizer,
+                            if params.length_penalty > 0.0 {
+                                params.length_penalty
+                            } else {
+                                0.7
+                            },
                         );
                     }
 

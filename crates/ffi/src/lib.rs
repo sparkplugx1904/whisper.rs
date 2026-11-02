@@ -509,11 +509,103 @@ pub unsafe extern "C" fn whisper_full_parallel(
     params: whisper_full_params,
     samples: *const f32,
     n_samples: c_int,
-    _n_processors: c_int,
+    n_processors: c_int,
 ) -> c_int {
-    whisper_full(ctx, params, samples, n_samples)
-}
+    if ctx.is_null() || samples.is_null() || n_samples <= 0 {
+        return -1;
+    }
 
+    let n_procs = n_processors.clamp(1, 16) as usize;
+    if n_procs <= 1 {
+        return whisper_full(ctx, params, samples, n_samples);
+    }
+
+    let sample_slice = std::slice::from_raw_parts(samples, n_samples as usize);
+    let context = &*ctx;
+
+    // 30-second audio windows (480,000 samples)
+    let chunk_size = 16000 * 30;
+    let n_chunks = sample_slice.len().div_ceil(chunk_size);
+
+    if n_chunks <= 1 {
+        return whisper_full(ctx, params, samples, n_samples);
+    }
+
+    use rayon::prelude::*;
+
+    let lang_str = if !params.language.is_null() {
+        CStr::from_ptr(params.language)
+            .to_str()
+            .unwrap_or("auto")
+            .to_string()
+    } else {
+        "auto".to_string()
+    };
+    let translate = params.translate;
+    let temperature = params.temperature;
+    let no_timestamps = params.no_timestamps;
+
+    let chunk_results: Vec<Vec<whisper_rs::Segment>> = (0..n_chunks)
+        .into_par_iter()
+        .map(|chunk_idx| {
+            let start = chunk_idx * chunk_size;
+            let end = (start + chunk_size).min(sample_slice.len());
+            let chunk_samples = &sample_slice[start..end];
+            let time_offset = start as f64 / 16000.0;
+
+            let mut state = context.inner.create_state();
+            let rust_params = whisper_rs::WhisperParams {
+                language: lang_str.clone(),
+                translate,
+                temperature,
+                beam_size: 1,
+                no_timestamps,
+                n_threads: 1,
+                ..Default::default()
+            };
+
+            if context
+                .inner
+                .full(&mut state, &rust_params, chunk_samples)
+                .is_ok()
+            {
+                let mut segs = state.segments;
+                for s in &mut segs {
+                    s.t0 += time_offset;
+                    s.t1 += time_offset;
+                    for w in &mut s.words {
+                        w.t0 += time_offset;
+                        w.t1 += time_offset;
+                    }
+                }
+                segs
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+
+    let default_state_ref = &mut (*ctx).default_state;
+    default_state_ref.inner.segments.clear();
+    default_state_ref.segment_c_strings.clear();
+    default_state_ref.token_c_strings.clear();
+
+    for segs in chunk_results {
+        for s in segs {
+            let c_str = CString::new(s.text.clone()).unwrap_or_else(|_| CString::new("").unwrap());
+            default_state_ref.segment_c_strings.push(c_str);
+            let mut tok_cstrs = Vec::new();
+            for &tok_id in &s.tokens {
+                let tok_str = context.inner.tokenizer.id_to_token(tok_id).unwrap_or("");
+                tok_cstrs.push(CString::new(tok_str).unwrap_or_else(|_| CString::new("").unwrap()));
+            }
+            default_state_ref.token_c_strings.push(tok_cstrs);
+            default_state_ref.inner.segments.push(s);
+        }
+    }
+
+    0
+}
 #[no_mangle]
 pub unsafe extern "C" fn whisper_full_n_segments_from_state(state: *mut whisper_state) -> c_int {
     if state.is_null() {

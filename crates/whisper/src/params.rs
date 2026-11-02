@@ -51,6 +51,8 @@ pub struct WhisperParams {
     pub max_len: usize,
     /// Split long segments on word boundaries when exceeding max_len
     pub split_on_word: bool,
+    /// Length penalty exponent for beam search (default: 0.7)
+    pub length_penalty: f32,
 }
 
 impl std::fmt::Debug for WhisperParams {
@@ -91,6 +93,7 @@ impl Default for WhisperParams {
             repetition_penalty: 1.0,
             max_len: 0,
             split_on_word: false,
+            length_penalty: 0.7,
             on_new_segment: None,
             on_progress: None,
         }
@@ -201,6 +204,11 @@ impl FullParamsBuilder {
 
     pub fn split_on_word(mut self, split: bool) -> Self {
         self.params.split_on_word = split;
+        self
+    }
+
+    pub fn length_penalty(mut self, penalty: f32) -> Self {
+        self.params.length_penalty = penalty;
         self
     }
 

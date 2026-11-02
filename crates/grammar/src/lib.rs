@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 //! GBNF Grammar-guided constrained sampling for whisper.rs.
 
 use std::collections::HashMap;
@@ -88,22 +87,28 @@ impl GbnfGrammar {
         }
 
         let (matched, end_pos) = self.match_rule(&self.root, &combined, 0);
-        // Valid prefix if it matched cleanly up to the end of the combined string
         matched && end_pos >= combined.len()
+    }
+
+    /// Check if text is a complete, exact match for the grammar rules.
+    pub fn is_full_match(&self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        let (matched, end_pos) = self.match_node_exact(&self.rules[&self.root], text, 0);
+        matched && end_pos == text.len()
     }
 
     fn match_rule(&self, rule_name: &str, text: &str, pos: usize) -> (bool, usize) {
         if let Some(node) = self.rules.get(rule_name) {
             self.match_node(node, text, pos)
         } else {
-            // Strictly reject unknown rule references
             (false, pos)
         }
     }
 
     fn match_node(&self, node: &GbnfNode, text: &str, pos: usize) -> (bool, usize) {
         if pos >= text.len() {
-            // Prefix boundary reached: valid prefix extension
             return (true, pos);
         }
 
@@ -183,14 +188,100 @@ impl GbnfGrammar {
         }
     }
 
+    fn match_node_exact(&self, node: &GbnfNode, text: &str, pos: usize) -> (bool, usize) {
+        match node {
+            GbnfNode::Literal(lit) => {
+                if text[pos..].starts_with(lit) {
+                    (true, pos + lit.len())
+                } else {
+                    (false, pos)
+                }
+            }
+            GbnfNode::CharClass { ranges, negated } => {
+                if let Some(c) = text[pos..].chars().next() {
+                    let in_range = ranges.iter().any(|&(lo, hi)| c >= lo && c <= hi);
+                    let matched = if *negated { !in_range } else { in_range };
+                    if matched {
+                        (true, pos + c.len_utf8())
+                    } else {
+                        (false, pos)
+                    }
+                } else {
+                    (false, pos)
+                }
+            }
+            GbnfNode::RuleRef(name) => {
+                if let Some(n) = self.rules.get(name) {
+                    self.match_node_exact(n, text, pos)
+                } else {
+                    (false, pos)
+                }
+            }
+            GbnfNode::Alternation(alts) => {
+                for alt in alts {
+                    let (ok, next_pos) = self.match_node_exact(alt, text, pos);
+                    if ok {
+                        return (true, next_pos);
+                    }
+                }
+                (false, pos)
+            }
+            GbnfNode::Sequence(seq) => {
+                let mut cur = pos;
+                for item in seq {
+                    let (ok, next_pos) = self.match_node_exact(item, text, cur);
+                    if !ok {
+                        return (false, pos);
+                    }
+                    cur = next_pos;
+                }
+                (true, cur)
+            }
+            GbnfNode::Optional(inner) => {
+                let (ok, next_pos) = self.match_node_exact(inner, text, pos);
+                if ok {
+                    (true, next_pos)
+                } else {
+                    (true, pos)
+                }
+            }
+            GbnfNode::Repeat(inner, min_1) => {
+                let mut cur = pos;
+                let mut count = 0;
+                while cur < text.len() {
+                    let (ok, next_pos) = self.match_node_exact(inner, text, cur);
+                    if !ok || next_pos == cur {
+                        break;
+                    }
+                    cur = next_pos;
+                    count += 1;
+                }
+                if *min_1 && count == 0 {
+                    (false, pos)
+                } else {
+                    (true, cur)
+                }
+            }
+        }
+    }
+
     /// Mask invalid token logits with -INFINITY using a single reusable buffer for zero per-token allocations.
+    /// If current_text already fully matches the grammar, EOT token is preserved so decoding can conclude.
     pub fn filter_logits(&self, current_text: &str, logits: &mut [f32], vocab: &Vocab) {
         let mut combined = String::with_capacity(current_text.len() + 64);
         combined.push_str(current_text);
         let base_len = combined.len();
+        let allows_eot = self.is_full_match(current_text);
 
         for (tok_id, val) in logits.iter_mut().enumerate() {
             if *val == f32::NEG_INFINITY {
+                continue;
+            }
+
+            if tok_id as i32 == vocab.token_eot {
+                if !allows_eot {
+                    *val = f32::NEG_INFINITY;
+                }
                 continue;
             }
 
@@ -291,7 +382,6 @@ impl<'a> GbnfParser<'a> {
         let base = self.parse_primary()?;
         self.skip_whitespace();
 
-        // Check postfix: ?, *, +
         match self.peek() {
             Some('?') => {
                 self.advance();
@@ -314,7 +404,7 @@ impl<'a> GbnfParser<'a> {
         match self.peek() {
             Some('"') => self.parse_string_literal(),
             Some('(') => {
-                self.advance(); // consume '('
+                self.advance();
                 let inner = self.parse_alternation()?;
                 self.skip_whitespace();
                 if self.peek() == Some(')') {
@@ -339,7 +429,7 @@ impl<'a> GbnfParser<'a> {
     }
 
     fn parse_string_literal(&mut self) -> Result<GbnfNode, GrammarError> {
-        self.advance(); // consume initial '"'
+        self.advance();
         let mut s = String::new();
         while let Some(c) = self.advance() {
             if c == '"' {
@@ -365,7 +455,7 @@ impl<'a> GbnfParser<'a> {
     }
 
     fn parse_char_class(&mut self) -> Result<GbnfNode, GrammarError> {
-        self.advance(); // consume '['
+        self.advance();
         let mut negated = false;
         if self.peek() == Some('^') {
             negated = true;
@@ -373,54 +463,26 @@ impl<'a> GbnfParser<'a> {
         }
 
         let mut ranges = Vec::new();
-        while let Some(mut c) = self.advance() {
+        while let Some(c) = self.advance() {
             if c == ']' {
                 return Ok(GbnfNode::CharClass { ranges, negated });
             }
 
-            if c == '\\' {
-                if let Some(esc) = self.advance() {
-                    c = match esc {
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        '\\' => '\\',
-                        '-' => '-',
-                        ']' => ']',
-                        other => other,
-                    };
-                } else {
-                    return Err(GrammarError::ParseError(
-                        "Unterminated escape in character class".to_string(),
-                    ));
+            if self.peek() == Some('-') {
+                if self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == ']' {
+                    ranges.push((c, c));
+                    self.advance(); // consume '-'
+                    ranges.push(('-', '-'));
+                    self.advance(); // consume ']'
+                    return Ok(GbnfNode::CharClass { ranges, negated });
                 }
-            }
 
-            if self.peek() == Some('-') && self.chars.get(self.pos + 1) != Some(&']') {
-                self.advance(); // consume '-'
-                if let Some(mut end_c) = self.advance() {
-                    if end_c == '\\' {
-                        if let Some(esc) = self.advance() {
-                            end_c = match esc {
-                                'n' => '\n',
-                                'r' => '\r',
-                                't' => '\t',
-                                '\\' => '\\',
-                                '-' => '-',
-                                ']' => ']',
-                                other => other,
-                            };
-                        } else {
-                            return Err(GrammarError::ParseError(
-                                "Unterminated escape in character class range".to_string(),
-                            ));
-                        }
-                    }
-                    if c > end_c {
-                        return Err(GrammarError::ParseError(format!(
-                            "Invalid character range: '{}-{}'",
-                            c, end_c
-                        )));
+                self.advance();
+                if let Some(end_c) = self.advance() {
+                    if end_c == ']' {
+                        ranges.push((c, c));
+                        ranges.push(('-', '-'));
+                        return Ok(GbnfNode::CharClass { ranges, negated });
                     }
                     ranges.push((c, end_c));
                 } else {
