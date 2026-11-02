@@ -90,9 +90,21 @@ impl WhisperContext {
 
     /// Auto-detect the spoken language from the first 30 seconds of audio.
     /// Returns (language_code, probability).
-    pub fn detect_language(&self, mel: &MelSpectrogram) -> (String, f32) {
+    /// Auto-detect the spoken language from the first 30 seconds of audio.
+    /// Optionally populates `probs_out` with normalized language probabilities.
+    /// Returns (language_code, language_id, probability).
+    pub fn detect_language_probs(
+        &self,
+        mel: &MelSpectrogram,
+        mut probs_out: Option<&mut [f32]>,
+    ) -> (String, usize, f32) {
         if !self.model.hparams.is_multilingual() {
-            return ("en".to_string(), 1.0);
+            if let Some(probs) = &mut probs_out {
+                if !probs.is_empty() {
+                    probs[0] = 1.0;
+                }
+            }
+            return ("en".to_string(), 0, 1.0);
         }
 
         let mel_chunk = mel.get_chunk(0, self.model.hparams.n_audio_ctx as usize);
@@ -126,17 +138,29 @@ impl WhisperContext {
 
         let inv_sum = 1.0 / sum_exp.max(1e-10);
         let mut best_lang = "en";
+        let mut best_idx = 0;
         let mut best_prob = 0.0f32;
 
-        for (code, score) in lang_scores {
+        for (i, (code, score)) in lang_scores.into_iter().enumerate() {
             let prob = score * inv_sum;
+            if let Some(probs) = &mut probs_out {
+                if i < probs.len() {
+                    probs[i] = prob;
+                }
+            }
             if prob > best_prob {
                 best_prob = prob;
                 best_lang = code;
+                best_idx = i;
             }
         }
 
-        (best_lang.to_string(), best_prob)
+        (best_lang.to_string(), best_idx, best_prob)
+    }
+
+    pub fn detect_language(&self, mel: &MelSpectrogram) -> (String, f32) {
+        let (code, _, prob) = self.detect_language_probs(mel, None);
+        (code, prob)
     }
 
     /// Transcribe whole audio mel spectrogram into text segments.

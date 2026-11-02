@@ -1,9 +1,9 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use whisper_rs_pure::audio::WavAudio;
-use whisper_rs_pure::model::WhisperModel;
-use whisper_rs_pure::{WhisperContext, WhisperParams};
+use whisper_rs::audio::WavAudio;
+use whisper_rs::model::WhisperModel;
+use whisper_rs::{WhisperContext, WhisperParams};
 
 fn workspace_path(rel: &str) -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -107,8 +107,11 @@ fn test_vad_full_speech_and_silence() {
         "Speech should begin near start of audio"
     );
 
-    // Pure silence test (zeros)
+    // Complete silence test (zeros)
     let silence = vec![0.0f32; 16000 * 5]; // 5 seconds of total silence
     let segments_silence = whisper_vad::detect_speech_segments(&silence, &params);
-    assert!(!segments_silence.is_empty());
+    assert!(
+        segments_silence.is_empty(),
+        "Pure silence must produce 0 speech segments"
+    );
 }

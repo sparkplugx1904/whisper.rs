@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
-use whisper_rs_pure::audio::WavAudio;
-use whisper_rs_pure::filter::compression_ratio;
-use whisper_rs_pure::model::WhisperModel;
-use whisper_rs_pure::{WhisperContext, WhisperParams};
+use whisper_rs::audio::WavAudio;
+use whisper_rs::filter::compression_ratio;
+use whisper_rs::model::WhisperModel;
+use whisper_rs::{WhisperContext, WhisperParams};
 
 fn workspace_path(rel: &str) -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));

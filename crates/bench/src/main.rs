@@ -1,9 +1,11 @@
+#![forbid(unsafe_code)]
+
 use clap::Parser;
 use std::path::Path;
 use std::time::Instant;
-use whisper_rs_pure::audio::compute_log_mel_spectrogram;
-use whisper_rs_pure::model::WhisperModel;
-use whisper_rs_pure::{DecoderKvCache, WhisperDecoder, WhisperEncoder};
+use whisper_rs::audio::compute_log_mel_spectrogram;
+use whisper_rs::model::WhisperModel;
+use whisper_rs::{DecoderKvCache, WhisperDecoder, WhisperEncoder};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -16,17 +18,32 @@ struct Args {
     #[arg(short = 'm', long = "model", default_value = "models/ggml-tiny.en.bin")]
     model: String,
 
+    /// Number of threads for computation
+    #[arg(short = 't', long = "threads", default_value_t = 4)]
+    threads: usize,
+
     /// Number of iterations for benchmark averages
     #[arg(short = 'n', long = "n-iter", default_value_t = 3)]
     n_iter: usize,
+
+    /// Optional path to audio WAV file to benchmark end-to-end transcription
+    #[arg(short = 'f', long = "file")]
+    file: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    println!("=== WHISPER.RS BENCHMARK SUITE ===");
-    println!("Loading model from '{}'...", args.model);
+    // Configure Rayon thread pool if specified
+    if args.threads > 0 {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads)
+            .build_global();
+    }
 
+    println!("=== WHISPER.RS BENCHMARK SUITE ===");
+    println!("Threads: {}", args.threads);
+    println!("Loading model from '{}'...", args.model);
     let t0 = Instant::now();
     let model = WhisperModel::load_from_file(Path::new(&args.model))?;
     let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -101,6 +118,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         1000.0 / avg_dec_ms
     );
     println!("==================================");
+
+    // 5. Optional full WAV transcription benchmark
+    if let Some(wav_file) = &args.file {
+        println!("\n[5/5] Benchmarking Real Audio File: '{}'...", wav_file);
+        let audio = whisper_rs::audio::WavAudio::load_from_file(wav_file)?;
+        let audio_dur = audio.samples.len() as f64 / audio.sample_rate as f64;
+        let ctx = whisper_rs::WhisperContext::new(model)?;
+        let params = whisper_rs::WhisperParams {
+            n_threads: args.threads,
+            ..Default::default()
+        };
+
+        let mut e2e_times = Vec::new();
+        let mut total_tokens = 0;
+        for _ in 0..args.n_iter {
+            let t = Instant::now();
+            let segments = ctx.transcribe_pcm(&audio.samples, &params);
+            e2e_times.push(t.elapsed().as_secs_f64() * 1000.0);
+            total_tokens = segments
+                .iter()
+                .map(|s| s.text.split_whitespace().count())
+                .sum();
+        }
+        let avg_e2e_ms = e2e_times.iter().sum::<f64>() / (e2e_times.len() as f64);
+        let e2e_rtf = (avg_e2e_ms / 1000.0) / audio_dur;
+        println!("  Audio duration:                 {:.2} s", audio_dur);
+        println!("  Avg End-to-End processing:      {:.2} ms", avg_e2e_ms);
+        println!("  End-to-End RTF:                 {:.3}x", e2e_rtf);
+        if total_tokens > 0 {
+            println!(
+                "  End-to-End Throughput:          {:.2} words / sec",
+                (total_tokens as f64) / (avg_e2e_ms / 1000.0)
+            );
+        }
+        println!("==================================");
+    }
 
     Ok(())
 }

@@ -1,10 +1,10 @@
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use whisper_rs_pure::audio::{compute_log_mel_spectrogram, WavAudio};
-use whisper_rs_pure::model::WhisperModel;
-use whisper_rs_pure::tokenizer::Tokenizer;
-use whisper_rs_pure::{DecoderKvCache, WhisperDecoder, WhisperEncoder};
+use whisper_rs::audio::{compute_log_mel_spectrogram, WavAudio};
+use whisper_rs::model::WhisperModel;
+use whisper_rs::tokenizer::Tokenizer;
+use whisper_rs::{DecoderKvCache, WhisperDecoder, WhisperEncoder};
 
 fn workspace_path(rel: &str) -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));

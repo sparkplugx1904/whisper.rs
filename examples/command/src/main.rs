@@ -1,8 +1,11 @@
+#![forbid(unsafe_code)]
+
 use clap::Parser;
 use std::path::Path;
-use whisper_rs_pure::audio::WavAudio;
-use whisper_rs_pure::model::WhisperModel;
-use whisper_rs_pure::{WhisperContext, WhisperParams};
+use std::process::Command;
+use whisper_rs::audio::WavAudio;
+use whisper_rs::model::WhisperModel;
+use whisper_rs::{WhisperContext, WhisperParams};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -19,9 +22,17 @@ struct Args {
     #[arg(short = 'f', long = "file", default_value = "samples/jfk.wav")]
     file: String,
 
-    /// Command to match (or 'any')
+    /// Keyword/phrase to detect
     #[arg(short = 'c', long = "command", default_value = "country")]
     command: String,
+
+    /// Shell command to execute when keyword is detected
+    #[arg(
+        short = 'e',
+        long = "exec",
+        default_value = "echo '>>> Action triggered by voice keyword'"
+    )]
+    exec: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,10 +68,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "\n>>> MATCH! Keyword '{}' detected in speech.",
             args.command
         );
-        println!(">>> Action executed successfully: status code 0.");
+        println!(">>> Executing subprocess: `{}`...", args.exec);
+
+        let status = Command::new("sh").arg("-c").arg(&args.exec).status()?;
+
+        println!(">>> Subprocess finished with exit status: {}", status);
     } else {
         println!(
-            "\n>>> NO MATCH: Target command '{}' not found in recognized speech.",
+            "\n>>> NO MATCH: Target keyword '{}' not found in recognized speech.",
             args.command
         );
     }

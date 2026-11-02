@@ -31,7 +31,7 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Build WASM Package
-        run: wasm-pack build --target web crates/whisper --out-dir ../../examples/wasm-dist || true
+        run: cd bindings/javascript && wasm-pack build --target web --out-dir ../../examples/wasm-dist
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

@@ -17,7 +17,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Pure-Rust Gate Check
+      - name: Gate Check
         run: ./scripts/check_pure_rust.sh
 
       - name: Rustfmt Check

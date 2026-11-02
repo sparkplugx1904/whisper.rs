@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use whisper_rs_pure::audio::{compute_log_mel_spectrogram, WavAudio};
-use whisper_rs_pure::model::WhisperModel;
-use whisper_rs_pure::{WhisperContext, WhisperParams};
+use whisper_rs::audio::{compute_log_mel_spectrogram, WavAudio};
+use whisper_rs::model::WhisperModel;
+use whisper_rs::{WhisperContext, WhisperParams};
 
 fn workspace_path(rel: &str) -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -19,7 +19,7 @@ fn resolve_model_path(name: &str) -> PathBuf {
 }
 
 #[test]
-fn bench_whisper_pure_vs_cpp() {
+fn bench_whisper_vs_cpp() {
     let wav_path = workspace_path("samples/jfk.wav");
     let model_path = resolve_model_path("ggml-tiny.en.bin");
 
@@ -57,7 +57,7 @@ fn bench_whisper_pure_vs_cpp() {
     let total_time = mel_time + transcribe_time;
     let rtf = total_time.as_secs_f64() / audio_duration;
 
-    eprintln!("\n=== BENCHMARK REPORT: whisper.rs (Pure Rust) ===");
+    eprintln!("\n=== BENCHMARK REPORT: whisper.rs ===");
     eprintln!("Audio duration:    {:.2} s", audio_duration);
     eprintln!(
         "Model load time:   {:.2} ms",
@@ -89,7 +89,7 @@ fn bench_whisper_pure_vs_cpp() {
     if !cfg!(debug_assertions) {
         assert!(
             rtf < 1.0,
-            "Pure Rust engine must be faster than real-time (RTF < 1.0 in release mode)"
+            "whisper.rs must be faster than real-time (RTF < 1.0 in release mode)"
         );
     }
 }

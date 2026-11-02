@@ -1,6 +1,6 @@
 # @whisper-rs/wasm
 
-Pure-Rust WebAssembly (WASM) bindings for `whisper.rs`. Runs directly in modern browsers and Node.js without any C++ toolchains or Emscripten.
+WebAssembly (WASM) bindings for `whisper.rs`. Runs directly in modern browsers and Node.js without any C++ toolchains or Emscripten.
 
 ## Installation / Build
 

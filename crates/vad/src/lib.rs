@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Voice Activity Detection (VAD) for whisper.rs.
 
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -145,10 +146,7 @@ pub fn detect_speech_segments(samples: &[f32], params: &VadParams) -> Vec<Speech
         }
     }
 
-    // If no voice segment was detected, fall back to entire audio
-    if segments.is_empty() {
-        segments.push(SpeechSegment::new(0.0, total_sec));
-    }
+    // If no voice segment was detected, return empty (clean silence)
 
     segments
 }

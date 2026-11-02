@@ -1,11 +1,13 @@
+#![forbid(unsafe_code)]
+
 use clap::Parser;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
-use whisper_rs_pure::audio::WavAudio;
-use whisper_rs_pure::model::WhisperModel;
-use whisper_rs_pure::{WhisperContext, WhisperParams};
+use whisper_rs::audio::WavAudio;
+use whisper_rs::model::WhisperModel;
+use whisper_rs::{WhisperContext, WhisperParams};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -63,6 +65,12 @@ fn handle_client(mut stream: TcpStream, ctx: Arc<WhisperContext>) {
                 boundary = header_line[pos + 9..].trim().to_string();
             }
         }
+    }
+    const MAX_BODY_SIZE: usize = 64 * 1024 * 1024; // 64 MB
+    if content_length > MAX_BODY_SIZE {
+        let response = "HTTP/1.1 413 Payload Too Large\r\n\r\nPayload Too Large";
+        let _ = stream.write_all(response.as_bytes());
+        return;
     }
 
     if method == "GET" && path == "/health" {
@@ -131,8 +139,15 @@ fn handle_client(mut stream: TcpStream, ctx: Arc<WhisperContext>) {
 }
 
 fn extract_wav_from_multipart(body: &[u8]) -> &[u8] {
-    // Search for RIFF header in multipart payload
+    // Locate RIFF header in multipart payload and slice exact WAV file length
     if let Some(pos) = body.windows(4).position(|w| w == b"RIFF") {
+        if pos + 8 <= body.len() {
+            let riff_len =
+                u32::from_le_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]])
+                    as usize;
+            let total_wav_len = (riff_len + 8).min(body.len() - pos);
+            return &body[pos..pos + total_wav_len];
+        }
         return &body[pos..];
     }
     body

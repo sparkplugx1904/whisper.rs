@@ -23,7 +23,7 @@ jobs:
       - name: Clippy Strict Check
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Pure-Rust Gate Script
+      - name: Gate Script
         run: ./scripts/check_pure_rust.sh
 
       - name: Install Cargo Deny

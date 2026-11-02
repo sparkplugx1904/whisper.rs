@@ -1,5 +1,5 @@
 [package]
-name = "whisper-rs-pure"
+name = "whisper-rs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,9 +9,9 @@ whisper-tensor = { path = "../tensor" }
 whisper-audio = { path = "../audio" }
 whisper-model = { path = "../model" }
 whisper-tokenizer = { path = "../tokenizer" }
-thiserror = { workspace = true }
-byteorder = { workspace = true }
 whisper-grammar = { path = "../grammar" }
+thiserror = { workspace = true }
 
 [dev-dependencies]
+byteorder = { workspace = true }
 whisper-vad = { path = "../vad" }

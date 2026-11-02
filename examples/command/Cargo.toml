@@ -9,5 +9,5 @@ name = "whisper-command"
 path = "src/main.rs"
 
 [dependencies]
-whisper-rs-pure = { path = "../../crates/whisper" }
+whisper-rs = { path = "../../crates/whisper" }
 clap = { workspace = true }

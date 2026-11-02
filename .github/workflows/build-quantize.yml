@@ -15,8 +15,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Quantizer
-        run: cargo build --package whisper-tensor --package whisper-cli --release
+      - name: Build Quantizer Binary
+        run: cargo build --package whisper-quantize --release --verbose
 
       - name: Test Quant Kernels
-        run: cargo test --package whisper-tensor --test test_quant_kernels --release
+        run: cargo test --package whisper-tensor --test test_quant_kernels --release --verbose

@@ -1,7 +1,7 @@
 use wasm_bindgen::prelude::*;
-use whisper_rs_pure::audio::WavAudio;
-use whisper_rs_pure::model::WhisperModel;
-use whisper_rs_pure::{WhisperContext, WhisperParams};
+use whisper_rs::audio::WavAudio;
+use whisper_rs::model::WhisperModel;
+use whisper_rs::{WhisperContext, WhisperParams};
 
 #[wasm_bindgen]
 pub struct WhisperWasm {

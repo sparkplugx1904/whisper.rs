@@ -19,7 +19,12 @@ impl Segment {
     /// Format as SRT subtitle entry
     pub fn to_srt(&self, index: usize) -> String {
         let fmt_time = |secs: f64| {
-            let total_ms = (secs * 1000.0).round() as u64;
+            let s_clamped = if secs.is_finite() && secs >= 0.0 {
+                secs
+            } else {
+                0.0
+            };
+            let total_ms = (s_clamped * 1000.0).round() as u64;
             let ms = total_ms % 1000;
             let total_s = total_ms / 1000;
             let s = total_s % 60;
@@ -29,7 +34,7 @@ impl Segment {
             format!("{:02}:{:02}:{:02},{:03}", h, m, s, ms)
         };
         format!(
-            "{}\n{} --> {}\n{}\n",
+            "{}\n{} --> {}\n{}\n\n",
             index,
             fmt_time(self.t0),
             fmt_time(self.t1),
@@ -40,7 +45,12 @@ impl Segment {
     /// Format as VTT subtitle entry
     pub fn to_vtt(&self) -> String {
         let fmt_time = |secs: f64| {
-            let total_ms = (secs * 1000.0).round() as u64;
+            let s_clamped = if secs.is_finite() && secs >= 0.0 {
+                secs
+            } else {
+                0.0
+            };
+            let total_ms = (s_clamped * 1000.0).round() as u64;
             let ms = total_ms % 1000;
             let total_s = total_ms / 1000;
             let s = total_s % 60;
@@ -50,10 +60,97 @@ impl Segment {
             format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
         };
         format!(
-            "{} --> {}\n{}\n",
+            "{} --> {}\n{}\n\n",
             fmt_time(self.t0),
             fmt_time(self.t1),
             self.text.trim()
         )
+    }
+
+    /// Format as JSON segment object with `start`, `end`, and `text`
+    pub fn to_json(&self) -> String {
+        let t0 = if self.t0.is_finite() && self.t0 >= 0.0 {
+            self.t0
+        } else {
+            0.0
+        };
+        let t1 = if self.t1.is_finite() && self.t1 >= 0.0 {
+            self.t1
+        } else {
+            0.0
+        };
+        format!(
+            "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\"}}",
+            t0,
+            t1,
+            escape_json(self.text.trim())
+        )
+    }
+}
+
+/// Escape string for JSON serialization according to RFC 8259
+pub fn escape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0C' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_srt_timestamp_format() {
+        let seg = Segment::new(65.123, 3661.004, " Hello World! ".to_string(), vec![]);
+        let srt = seg.to_srt(1);
+        assert_eq!(srt, "1\n00:01:05,123 --> 01:01:01,004\nHello World!\n\n");
+    }
+
+    #[test]
+    fn test_vtt_timestamp_format() {
+        let seg = Segment::new(65.123, 3661.004, " Hello World! ".to_string(), vec![]);
+        let vtt = seg.to_vtt();
+        assert_eq!(vtt, "00:01:05.123 --> 01:01:01.004\nHello World!\n\n");
+    }
+
+    #[test]
+    fn test_json_format_and_escaping() {
+        let seg = Segment::new(
+            0.0,
+            2.5,
+            " He said \"Hello\\World\"\nNext line\tTab ".to_string(),
+            vec![],
+        );
+        let json = seg.to_json();
+        assert_eq!(
+            json,
+            r#"{"start": 0.000, "end": 2.500, "text": "He said \"Hello\\World\"\nNext line\tTab"}"#
+        );
+    }
+
+    #[test]
+    fn test_edge_case_timestamps() {
+        let seg = Segment::new(-1.0, f64::NAN, "test".to_string(), vec![]);
+        let srt = seg.to_srt(2);
+        assert_eq!(srt, "2\n00:00:00,000 --> 00:00:00,000\ntest\n\n");
+        let vtt = seg.to_vtt();
+        assert_eq!(vtt, "00:00:00.000 --> 00:00:00.000\ntest\n\n");
+        let json = seg.to_json();
+        assert_eq!(json, r#"{"start": 0.000, "end": 0.000, "text": "test"}"#);
     }
 }

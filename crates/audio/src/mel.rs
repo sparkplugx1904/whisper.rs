@@ -82,7 +82,11 @@ pub fn compute_log_mel_spectrogram(
     }
 
     let n_len = (samples_padded.len() - frame_size) / frame_step;
-    let n_len_org = 1 + (n_samples + stage_2_pad - frame_size) / frame_step;
+    let n_len_org = if n_samples + stage_2_pad >= frame_size {
+        1 + (n_samples + stage_2_pad - frame_size) / frame_step
+    } else {
+        0
+    };
     let mut mel_data = vec![0.0f32; n_mel * n_len];
 
     let mut fft_in = vec![0.0f32; frame_size];

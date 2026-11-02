@@ -1,7 +1,7 @@
 {
   "name": "@whisper-rs/wasm",
   "version": "0.1.0",
-  "description": "Pure-Rust WebAssembly bindings for whisper.rs",
+  "description": "WebAssembly bindings for whisper.rs",
   "main": "pkg/whisper_wasm.js",
   "types": "pkg/whisper_wasm.d.ts",
   "files": [

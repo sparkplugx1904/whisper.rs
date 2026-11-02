@@ -1,4 +1,4 @@
-/// Calculate text compression ratio using a pure-Rust LZ77 dictionary estimator.
+/// Calculate text compression ratio using an LZ77 dictionary estimator.
 /// Repetitive/hallucinated text produces high compression ratio (> 2.4).
 pub fn compression_ratio(text: &str) -> f64 {
     let bytes = text.as_bytes();

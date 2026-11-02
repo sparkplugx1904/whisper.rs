@@ -15,8 +15,5 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build VAD subsystem
-        run: cargo build --package whisper-audio --release
-
-      - name: Test Audio Frontend
-        run: cargo test --package whisper-audio --release
+      - name: Test VAD Crate
+        run: cargo test --package whisper-vad --release --verbose

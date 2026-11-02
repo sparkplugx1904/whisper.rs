@@ -303,7 +303,8 @@ name = "whisper-bench"
 version = "0.1.0"
 dependencies = [
  "clap",
- "whisper-rs-pure",
+ "rayon",
+ "whisper-rs",
 ]
 
 [[package]]
@@ -311,7 +312,7 @@ name = "whisper-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "whisper-rs-pure",
+ "whisper-rs",
 ]
 
 [[package]]
@@ -319,14 +320,14 @@ name = "whisper-command"
 version = "0.1.0"
 dependencies = [
  "clap",
- "whisper-rs-pure",
+ "whisper-rs",
 ]
 
 [[package]]
 name = "whisper-ffi"
 version = "0.1.0"
 dependencies = [
- "whisper-rs-pure",
+ "whisper-rs",
 ]
 
 [[package]]
@@ -358,7 +359,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "whisper-rs-pure"
+name = "whisper-rs"
 version = "0.1.0"
 dependencies = [
  "byteorder",
@@ -376,7 +377,7 @@ name = "whisper-server"
 version = "0.1.0"
 dependencies = [
  "clap",
- "whisper-rs-pure",
+ "whisper-rs",
 ]
 
 [[package]]
@@ -384,7 +385,7 @@ name = "whisper-stream"
 version = "0.1.0"
 dependencies = [
  "clap",
- "whisper-rs-pure",
+ "whisper-rs",
 ]
 
 [[package]]
@@ -411,7 +412,6 @@ dependencies = [
  "byteorder",
  "thiserror",
  "whisper-audio",
- "whisper-model",
 ]
 
 [[package]]

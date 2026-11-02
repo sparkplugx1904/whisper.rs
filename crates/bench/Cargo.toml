@@ -9,5 +9,6 @@ name = "whisper-bench"
 path = "src/main.rs"
 
 [dependencies]
-whisper-rs-pure = { path = "../whisper" }
+whisper-rs = { path = "../whisper" }
 clap = { workspace = true }
+rayon = { workspace = true }

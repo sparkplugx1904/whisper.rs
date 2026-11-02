@@ -9,4 +9,4 @@ name = "whisper"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-whisper-rs-pure = { path = "../whisper" }
+whisper-rs = { path = "../whisper" }

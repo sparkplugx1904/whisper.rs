@@ -5,82 +5,173 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
-use whisper_rs_pure::audio::WavAudio;
-use whisper_rs_pure::model::WhisperModel;
-use whisper_rs_pure::{WhisperContext, WhisperParams};
+use whisper_rs::audio::WavAudio;
+use whisper_rs::model::WhisperModel;
+use whisper_rs::{WhisperContext, WhisperParams};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone, PartialEq, Eq)]
 #[command(
     author,
     version,
-    about = "Pure-Rust Whisper CLI (whisper.cpp port, zero C/FFI)",
+    about = "whisper.rs CLI (whisper.cpp port, zero C/FFI)",
     long_about = None
 )]
-struct Args {
+pub struct Args {
     /// Path to model file (.bin)
     #[arg(short = 'm', long = "model")]
-    model: String,
+    pub model: String,
 
     /// Path to input audio WAV file
     #[arg(short = 'f', long = "file", default_value = "")]
-    file: String,
+    pub file: String,
 
     /// Language code (e.g. en, id, auto)
     #[arg(short = 'l', long = "language", default_value = "auto")]
-    language: String,
+    pub language: String,
 
     /// Number of threads
     #[arg(short = 't', long = "threads", default_value_t = 4)]
-    threads: usize,
+    pub threads: usize,
 
     /// Translate from source language to English
-    #[arg(long = "translate", default_value_t = false)]
-    translate: bool,
+    #[arg(long = "translate", alias = "tr", default_value_t = false)]
+    pub translate: bool,
+
     /// Beam size for beam search (1 = greedy, >1 = beam search)
-    #[arg(short = 'b', long = "beam-size", default_value_t = 1)]
-    beam_size: usize,
+    #[arg(short = 'b', long = "beam-size", alias = "bs", default_value_t = 1)]
+    pub beam_size: usize,
 
     /// Initial prompt for context conditioning
     #[arg(long = "prompt")]
-    prompt: Option<String>,
+    pub prompt: Option<String>,
 
     /// Disable timestamp tokens
-    #[arg(long = "no-timestamps", default_value_t = false)]
-    no_timestamps: bool,
+    #[arg(long = "no-timestamps", alias = "nt", default_value_t = false)]
+    pub no_timestamps: bool,
+
     /// Print model information and exit
     #[arg(long = "info", default_value_t = false)]
-    info: bool,
+    pub info: bool,
 
     /// Output result in a text file (.txt)
-    #[arg(long = "output-txt", default_value_t = false)]
-    output_txt: bool,
+    #[arg(long = "output-txt", alias = "otxt", default_value_t = false)]
+    pub output_txt: bool,
 
     /// Output result in a SRT subtitle file (.srt)
-    #[arg(long = "output-srt", default_value_t = false)]
-    output_srt: bool,
+    #[arg(long = "output-srt", alias = "osrt", default_value_t = false)]
+    pub output_srt: bool,
 
     /// Output result in a VTT subtitle file (.vtt)
-    #[arg(long = "output-vtt", default_value_t = false)]
-    output_vtt: bool,
+    #[arg(long = "output-vtt", alias = "ovtt", default_value_t = false)]
+    pub output_vtt: bool,
 
     /// Output result in a JSON file (.json)
-    #[arg(long = "output-json", default_value_t = false)]
-    output_json: bool,
+    #[arg(long = "output-json", alias = "oj", default_value_t = false)]
+    pub output_json: bool,
 
     /// Output file path base (without extension)
-    #[arg(short = 'o', long = "output-file")]
-    output_file: Option<String>,
+    #[arg(short = 'o', long = "output-file", alias = "of")]
+    pub output_file: Option<String>,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+/// Preprocess command-line arguments to support whisper.cpp style flags such as
+/// `-otxt`, `-osrt`, `-ovtt`, `-oj`, `-of`, `-nt`, `-tr`, `-bs`.
+pub fn normalize_cli_args<I, T>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<String>,
+{
+    let mut out = Vec::new();
+    let mut iter = args.into_iter().map(Into::into);
 
+    if let Some(bin) = iter.next() {
+        out.push(bin);
+    }
+
+    for arg in iter {
+        match arg.as_str() {
+            "-otxt" => out.push("--output-txt".to_string()),
+            "-osrt" => out.push("--output-srt".to_string()),
+            "-ovtt" => out.push("--output-vtt".to_string()),
+            "-oj" => out.push("--output-json".to_string()),
+            "-of" => out.push("--output-file".to_string()),
+            "-nt" => out.push("--no-timestamps".to_string()),
+            "-tr" => out.push("--translate".to_string()),
+            "-bs" => out.push("--beam-size".to_string()),
+            s if s.starts_with("-of=") => out.push(format!("--output-file={}", &s[4..])),
+            s if s.starts_with("-bs=") => out.push(format!("--beam-size={}", &s[4..])),
+            _ => out.push(arg),
+        }
+    }
+    out
+}
+
+/// Write exported files (.txt, .srt, .vtt, .json) according to CLI options.
+pub fn write_output_files(
+    args: &Args,
+    base_name: &str,
+    segments: &[whisper_rs::Segment],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if args.output_txt {
+        let path = format!("{}.txt", base_name);
+        let mut f = File::create(&path)
+            .map_err(|e| format!("failed to create TXT output file '{}': {}", path, e))?;
+        for s in segments {
+            writeln!(f, "{}", s.text.trim())
+                .map_err(|e| format!("failed to write TXT output file '{}': {}", path, e))?;
+        }
+        println!("Saved TXT output to '{}'", path);
+    }
+
+    if args.output_srt {
+        let path = format!("{}.srt", base_name);
+        let mut f = File::create(&path)
+            .map_err(|e| format!("failed to create SRT output file '{}': {}", path, e))?;
+        for (i, s) in segments.iter().enumerate() {
+            write!(f, "{}", s.to_srt(i + 1))
+                .map_err(|e| format!("failed to write SRT output file '{}': {}", path, e))?;
+        }
+        println!("Saved SRT output to '{}'", path);
+    }
+
+    if args.output_vtt {
+        let path = format!("{}.vtt", base_name);
+        let mut f = File::create(&path)
+            .map_err(|e| format!("failed to create VTT output file '{}': {}", path, e))?;
+        writeln!(f, "WEBVTT\n")
+            .map_err(|e| format!("failed to write VTT header to '{}': {}", path, e))?;
+        for s in segments {
+            write!(f, "{}", s.to_vtt())
+                .map_err(|e| format!("failed to write VTT output file '{}': {}", path, e))?;
+        }
+        println!("Saved VTT output to '{}'", path);
+    }
+
+    if args.output_json {
+        let path = format!("{}.json", base_name);
+        let mut f = File::create(&path)
+            .map_err(|e| format!("failed to create JSON output file '{}': {}", path, e))?;
+        writeln!(f, "[").map_err(|e| format!("failed to write JSON array to '{}': {}", path, e))?;
+        for (i, s) in segments.iter().enumerate() {
+            let comma = if i + 1 < segments.len() { "," } else { "" };
+            writeln!(f, "  {}{}", s.to_json(), comma)
+                .map_err(|e| format!("failed to write JSON segment to '{}': {}", path, e))?;
+        }
+        writeln!(f, "]").map_err(|e| format!("failed to close JSON array in '{}': {}", path, e))?;
+        println!("Saved JSON output to '{}'", path);
+    }
+
+    Ok(())
+}
+
+pub fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     println!(
         "whisper_init_from_file: loading model from '{}'...",
         args.model
     );
-    let model = WhisperModel::load_from_file(Path::new(&args.model))?;
+    let model = WhisperModel::load_from_file(Path::new(&args.model))
+        .map_err(|e| format!("failed to load model from '{}': {}", args.model, e))?;
 
     let h = &model.hparams;
     println!("whisper_model_load: n_vocab       = {}", h.n_vocab);
@@ -121,12 +212,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.file.is_empty() {
-        eprintln!("\nNotice: No audio file provided (-f <file.wav>). Exiting.");
-        return Ok(());
+        return Err("no audio file provided (specify with -f <file.wav>)".into());
     }
 
     println!("\nLoading audio from '{}'...", args.file);
-    let audio = WavAudio::load_from_file(&args.file)?;
+    let audio = WavAudio::load_from_file(&args.file)
+        .map_err(|e| format!("failed to load audio from '{}': {}", args.file, e))?;
     let audio_dur = audio.samples.len() as f64 / audio.sample_rate as f64;
     println!(
         "read_audio_data: {} samples, sample_rate: {} Hz ({:.2} s)",
@@ -135,14 +226,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         audio_dur
     );
 
-    let ctx = WhisperContext::new(model)?;
+    let ctx = WhisperContext::new(model)
+        .map_err(|e| format!("failed to initialize whisper context: {}", e))?;
     let load_dur = t0.elapsed();
 
     let params = WhisperParams {
         language: args.language.clone(),
         translate: args.translate,
         beam_size: args.beam_size,
-        initial_prompt: args.prompt,
+        initial_prompt: args.prompt.clone(),
         no_timestamps: args.no_timestamps,
         n_threads: args.threads,
         ..Default::default()
@@ -162,21 +254,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let t_trans = Instant::now();
-    let segments = ctx.transcribe_file(&args.file, &params)?;
+    let segments = ctx
+        .transcribe_file(&args.file, &params)
+        .map_err(|e| format!("transcription failed: {}", e))?;
     let proc_dur = t_trans.elapsed();
 
     for seg in &segments {
         if args.no_timestamps {
             println!("{}", seg.text.trim());
         } else {
+            let t0 = if seg.t0.is_finite() && seg.t0 >= 0.0 {
+                seg.t0
+            } else {
+                0.0
+            };
+            let t1 = if seg.t1.is_finite() && seg.t1 >= 0.0 {
+                seg.t1
+            } else {
+                0.0
+            };
             println!(
                 "[{:02}:{:02}:{:06.3} --> {:02}:{:02}:{:06.3}] {}",
-                (seg.t0 / 3600.0) as u32,
-                ((seg.t0 % 3600.0) / 60.0) as u32,
-                seg.t0 % 60.0,
-                (seg.t1 / 3600.0) as u32,
-                ((seg.t1 % 3600.0) / 60.0) as u32,
-                seg.t1 % 60.0,
+                (t0 / 3600.0) as u32,
+                ((t0 % 3600.0) / 60.0) as u32,
+                t0 % 60.0,
+                (t1 / 3600.0) as u32,
+                ((t1 % 3600.0) / 60.0) as u32,
+                t1 % 60.0,
                 seg.text.trim()
             );
         }
@@ -196,7 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // File exports
-    let base_name = args.output_file.unwrap_or_else(|| {
+    let base_name = args.output_file.clone().unwrap_or_else(|| {
         Path::new(&args.file)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -204,50 +308,231 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_string()
     });
 
-    if args.output_txt {
-        let path = format!("{}.txt", base_name);
-        let mut f = File::create(&path)?;
-        for s in &segments {
-            writeln!(f, "{}", s.text.trim())?;
-        }
-        println!("Saved TXT output to '{}'", path);
-    }
-
-    if args.output_srt {
-        let path = format!("{}.srt", base_name);
-        let mut f = File::create(&path)?;
-        for (i, s) in segments.iter().enumerate() {
-            write!(f, "{}", s.to_srt(i + 1))?;
-        }
-        println!("Saved SRT output to '{}'", path);
-    }
-
-    if args.output_vtt {
-        let path = format!("{}.vtt", base_name);
-        let mut f = File::create(&path)?;
-        writeln!(f, "WEBVTT\n")?;
-        for s in &segments {
-            write!(f, "{}", s.to_vtt())?;
-        }
-        println!("Saved VTT output to '{}'", path);
-    }
-
-    if args.output_json {
-        let path = format!("{}.json", base_name);
-        let mut f = File::create(&path)?;
-        writeln!(f, "[")?;
-        for (i, s) in segments.iter().enumerate() {
-            let comma = if i + 1 < segments.len() { "," } else { "" };
-            let escaped = s.text.trim().replace('\\', "\\\\").replace('"', "\\\"");
-            writeln!(
-                f,
-                "  {{\"t0\": {:.3}, \"t1\": {:.3}, \"text\": \"{}\"}}{}",
-                s.t0, s.t1, escaped, comma
-            )?;
-        }
-        writeln!(f, "]")?;
-        println!("Saved JSON output to '{}'", path);
-    }
+    write_output_files(&args, &base_name, &segments)?;
 
     Ok(())
+}
+
+fn main() {
+    let raw_args = std::env::args();
+    let normalized = normalize_cli_args(raw_args);
+    let args = match Args::try_parse_from(normalized) {
+        Ok(args) => args,
+        Err(err) => {
+            err.exit();
+        }
+    };
+
+    if let Err(err) = run(args) {
+        eprintln!("error: {err}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_normalize_cli_args_flags() {
+        let input = vec![
+            "whisper-cli",
+            "-m",
+            "model.bin",
+            "-f",
+            "audio.wav",
+            "-otxt",
+            "-osrt",
+            "-ovtt",
+            "-oj",
+            "-of",
+            "custom_output",
+            "-nt",
+            "-tr",
+            "-bs",
+            "4",
+        ];
+        let normalized = normalize_cli_args(input);
+        assert_eq!(
+            normalized,
+            vec![
+                "whisper-cli",
+                "-m",
+                "model.bin",
+                "-f",
+                "audio.wav",
+                "--output-txt",
+                "--output-srt",
+                "--output-vtt",
+                "--output-json",
+                "--output-file",
+                "custom_output",
+                "--no-timestamps",
+                "--translate",
+                "--beam-size",
+                "4",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_normalize_cli_args_equals_syntax() {
+        let input = vec!["whisper-cli", "-m", "model.bin", "-of=result_base", "-bs=2"];
+        let normalized = normalize_cli_args(input);
+        assert_eq!(
+            normalized,
+            vec![
+                "whisper-cli",
+                "-m",
+                "model.bin",
+                "--output-file=result_base",
+                "--beam-size=2",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_args_with_normalized_flags() {
+        let input = vec![
+            "whisper-cli",
+            "-m",
+            "tiny.bin",
+            "-f",
+            "speech.wav",
+            "-otxt",
+            "-osrt",
+            "-ovtt",
+            "-oj",
+            "-of",
+            "out_speech",
+        ];
+        let normalized = normalize_cli_args(input);
+        let args = Args::try_parse_from(normalized).expect("Parse args");
+        assert_eq!(args.model, "tiny.bin");
+        assert_eq!(args.file, "speech.wav");
+        assert!(args.output_txt);
+        assert!(args.output_srt);
+        assert!(args.output_vtt);
+        assert!(args.output_json);
+        assert_eq!(args.output_file.as_deref(), Some("out_speech"));
+    }
+
+    #[test]
+    fn test_write_output_files_formatting() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "whisper_cli_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_dir).expect("Create temp dir");
+        let base = temp_dir.join("test_out");
+        let base_str = base.to_str().unwrap();
+
+        let args = Args {
+            model: "model.bin".to_string(),
+            file: "audio.wav".to_string(),
+            language: "en".to_string(),
+            threads: 4,
+            translate: false,
+            beam_size: 1,
+            prompt: None,
+            no_timestamps: false,
+            info: false,
+            output_txt: true,
+            output_srt: true,
+            output_vtt: true,
+            output_json: true,
+            output_file: Some(base_str.to_string()),
+        };
+
+        let segments = vec![
+            whisper_rs::Segment::new(0.0, 2.500, " Hello world! ".to_string(), vec![1, 2, 3]),
+            whisper_rs::Segment::new(
+                2.500,
+                65.123,
+                " Line 2 with \"quotes\" and \\slash ".to_string(),
+                vec![4, 5],
+            ),
+        ];
+
+        write_output_files(&args, base_str, &segments).expect("Write output files");
+
+        // Verify TXT
+        let txt_content = fs::read_to_string(format!("{}.txt", base_str)).expect("Read txt");
+        assert_eq!(
+            txt_content,
+            "Hello world!\nLine 2 with \"quotes\" and \\slash\n"
+        );
+
+        // Verify SRT
+        let srt_content = fs::read_to_string(format!("{}.srt", base_str)).expect("Read srt");
+        let expected_srt = "1\n00:00:00,000 --> 00:00:02,500\nHello world!\n\n\
+                            2\n00:00:02,500 --> 00:01:05,123\nLine 2 with \"quotes\" and \\slash\n\n";
+        assert_eq!(srt_content, expected_srt);
+
+        // Verify VTT
+        let vtt_content = fs::read_to_string(format!("{}.vtt", base_str)).expect("Read vtt");
+        let expected_vtt = "WEBVTT\n\n\
+                            00:00:00.000 --> 00:00:02.500\nHello world!\n\n\
+                            00:00:02.500 --> 00:01:05.123\nLine 2 with \"quotes\" and \\slash\n\n";
+        assert_eq!(vtt_content, expected_vtt);
+
+        // Verify JSON
+        let json_content = fs::read_to_string(format!("{}.json", base_str)).expect("Read json");
+        let expected_json = "[\n  {\"start\": 0.000, \"end\": 2.500, \"text\": \"Hello world!\"},\n  {\"start\": 2.500, \"end\": 65.123, \"text\": \"Line 2 with \\\"quotes\\\" and \\\\slash\"}\n]\n";
+        assert_eq!(json_content, expected_json);
+
+        // Clean up temp dir
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_missing_model_error() {
+        let args = Args {
+            model: "non_existent_model_file_12345.bin".to_string(),
+            file: "audio.wav".to_string(),
+            language: "auto".to_string(),
+            threads: 1,
+            translate: false,
+            beam_size: 1,
+            prompt: None,
+            no_timestamps: false,
+            info: false,
+            output_txt: false,
+            output_srt: false,
+            output_vtt: false,
+            output_json: false,
+            output_file: None,
+        };
+        let res = run(args);
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("failed to load model"));
+    }
+
+    #[test]
+    fn test_missing_audio_file_arg_error() {
+        let args = Args {
+            model: "non_existent_model_file_12345.bin".to_string(),
+            file: "".to_string(),
+            language: "auto".to_string(),
+            threads: 1,
+            translate: false,
+            beam_size: 1,
+            prompt: None,
+            no_timestamps: false,
+            info: false,
+            output_txt: false,
+            output_srt: false,
+            output_vtt: false,
+            output_json: false,
+            output_file: None,
+        };
+        let res = run(args);
+        assert!(res.is_err());
+    }
 }

@@ -4,9 +4,9 @@
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr;
-use whisper_rs_pure::model::vocab::{lang_id, lang_str};
-use whisper_rs_pure::model::WhisperModel;
-use whisper_rs_pure::{WhisperContext, WhisperParams, WhisperState};
+use whisper_rs::model::vocab::{lang_id, lang_str};
+use whisper_rs::model::WhisperModel;
+use whisper_rs::{WhisperContext, WhisperParams, WhisperState};
 
 #[allow(non_camel_case_types)]
 pub struct whisper_context {
@@ -872,27 +872,17 @@ pub unsafe extern "C" fn whisper_tokenize(
         Err(_) => return 0,
     };
 
-    let mut count = 0;
-    for word in text_str.split_whitespace() {
-        if count >= n_max_tokens as usize {
-            break;
-        }
-        let w_space = format!(" {}", word);
-        let id = context
-            .inner
-            .tokenizer
-            .token_to_id(&w_space)
-            .or_else(|| context.inner.tokenizer.token_to_id(word))
-            .unwrap_or(0);
-        *tokens.add(count) = id;
-        count += 1;
+    let token_ids = context.inner.tokenizer.encode(text_str);
+    let count = token_ids.len().min(n_max_tokens as usize);
+    for (i, &tok_id) in token_ids.iter().take(count).enumerate() {
+        *tokens.add(i) = tok_id;
     }
     count as c_int
 }
 
 #[no_mangle]
 pub extern "C" fn whisper_lang_max_id() -> c_int {
-    (whisper_rs_pure::model::vocab::LANGUAGES.len() - 1) as c_int
+    (whisper_rs::model::vocab::LANGUAGES.len() - 1) as c_int
 }
 
 #[no_mangle]
@@ -914,7 +904,7 @@ pub extern "C" fn whisper_lang_str(id: c_int) -> *const c_char {
     }
     if lang_str(id as usize).is_some() {
         static CACHED_LANGS: std::sync::LazyLock<Vec<CString>> = std::sync::LazyLock::new(|| {
-            whisper_rs_pure::model::vocab::LANGUAGES
+            whisper_rs::model::vocab::LANGUAGES
                 .iter()
                 .map(|(code, _)| CString::new(*code).unwrap())
                 .collect()
@@ -930,53 +920,175 @@ pub extern "C" fn whisper_lang_str(id: c_int) -> *const c_char {
 
 #[no_mangle]
 pub unsafe extern "C" fn whisper_pcm_to_mel(
-    _ctx: *mut whisper_context,
-    _samples: *const f32,
-    _n_samples: c_int,
+    ctx: *mut whisper_context,
+    samples: *const f32,
+    n_samples: c_int,
     _n_threads: c_int,
 ) -> c_int {
+    if ctx.is_null() || samples.is_null() || n_samples <= 0 {
+        return -1;
+    }
+    let context = &mut *ctx;
+    let sample_slice = std::slice::from_raw_parts(samples, n_samples as usize);
+    let mel = whisper_rs::audio::compute_log_mel_spectrogram(
+        sample_slice,
+        &context.inner.model.filters.data,
+        context.inner.model.filters.n_mel,
+    );
+    context.default_state.inner.mel = Some(mel);
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn whisper_set_mel(
-    _ctx: *mut whisper_context,
-    _data: *const f32,
-    _n_len: c_int,
-    _n_mel: c_int,
+    ctx: *mut whisper_context,
+    data: *const f32,
+    n_len: c_int,
+    n_mel: c_int,
 ) -> c_int {
+    if ctx.is_null() || data.is_null() || n_len <= 0 || n_mel <= 0 {
+        return -1;
+    }
+    if n_len.checked_mul(n_mel).is_none() {
+        return -1;
+    }
+    let context = &mut *ctx;
+    let total_elements = match (n_len as usize).checked_mul(n_mel as usize) {
+        Some(n) => n,
+        None => return -1,
+    };
+    let mel_slice = std::slice::from_raw_parts(data, total_elements);
+    let mel = whisper_rs::audio::MelSpectrogram {
+        n_mel: n_mel as usize,
+        n_len: n_len as usize,
+        n_len_org: n_len as usize,
+        data: mel_slice.to_vec(),
+    };
+    context.default_state.inner.mel = Some(mel);
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn whisper_lang_auto_detect(
-    _ctx: *mut whisper_context,
-    _state: *mut whisper_state,
+    ctx: *mut whisper_context,
+    state: *mut whisper_state,
     _offset_ms: c_int,
     _n_threads: c_int,
-    _lang_probs: *mut f32,
+    lang_probs: *mut f32,
 ) -> c_int {
-    0
+    if ctx.is_null() {
+        return -1;
+    }
+    let context = &*ctx;
+    let st = if !state.is_null() {
+        &(*state).inner
+    } else {
+        &context.default_state.inner
+    };
+
+    let mel = match &st.mel {
+        Some(m) => m,
+        None => return -1,
+    };
+
+    let max_langs = whisper_lang_max_id() as usize + 1;
+    let mut probs = vec![0.0f32; max_langs];
+
+    let (_code, best_idx, _prob) = context.inner.detect_language_probs(mel, Some(&mut probs));
+
+    if !lang_probs.is_null() {
+        let slice = std::slice::from_raw_parts_mut(lang_probs, max_langs);
+        slice.copy_from_slice(&probs);
+    }
+
+    best_idx as c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn whisper_encode(
-    _ctx: *mut whisper_context,
-    _offset: c_int,
+    ctx: *mut whisper_context,
+    offset: c_int,
     _n_threads: c_int,
 ) -> c_int {
+    if ctx.is_null() {
+        return -1;
+    }
+    let context = &mut *ctx;
+    let n_audio_ctx = context.inner.model.hparams.n_audio_ctx as usize;
+    let mel_chunk = if let Some(ref mel) = context.default_state.inner.mel {
+        mel.get_chunk(offset.max(0) as usize, n_audio_ctx)
+    } else {
+        vec![0.0f32; context.inner.model.filters.n_mel * 2 * n_audio_ctx]
+    };
+
+    let enc_out = context.inner.encoder.forward(&mel_chunk);
+    context.default_state.inner.encoder_output = enc_out;
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn whisper_decode(
-    _ctx: *mut whisper_context,
-    _tokens: *const c_int,
-    _n_tokens: c_int,
-    _n_past: c_int,
+    ctx: *mut whisper_context,
+    tokens: *const c_int,
+    n_tokens: c_int,
+    n_past: c_int,
     _n_threads: c_int,
 ) -> c_int {
-    0
+    if ctx.is_null() || tokens.is_null() || n_tokens <= 0 {
+        return -1;
+    }
+    let context = &mut *ctx;
+    let n_vocab = context.inner.model.hparams.n_vocab;
+    let token_slice = std::slice::from_raw_parts(tokens, n_tokens as usize);
+    for &tok in token_slice {
+        if tok < 0 || tok >= n_vocab {
+            return -1;
+        }
+    }
+    let tok_vec: Vec<i32> = token_slice.to_vec();
+
+    context.default_state.inner.cache.t_past = n_past.max(0) as usize;
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        context.inner.decoder.decode(
+            &tok_vec,
+            &context.default_state.inner.encoder_output,
+            &mut context.default_state.inner.cache,
+        )
+    }));
+    match res {
+        Ok(logits) => {
+            context.default_state.inner.logits = logits;
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_get_logits(ctx: *mut whisper_context) -> *mut f32 {
+    if ctx.is_null() {
+        return ptr::null_mut();
+    }
+    let context = &mut *ctx;
+    let len = context.default_state.inner.logits.len();
+    let n_vocab = context.inner.model.hparams.n_vocab as usize;
+    if len < n_vocab {
+        ptr::null_mut()
+    } else {
+        context.default_state.inner.logits[len - n_vocab..].as_mut_ptr()
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_get_logits_from_state(state: *mut whisper_state) -> *mut f32 {
+    if state.is_null() {
+        return ptr::null_mut();
+    }
+    let state_ref = &mut *state;
+    if state_ref.inner.logits.is_empty() {
+        return ptr::null_mut();
+    }
+    state_ref.inner.logits.as_mut_ptr()
 }
 
 #[no_mangle]
@@ -985,8 +1097,7 @@ pub unsafe extern "C" fn whisper_print_timings(_ctx: *mut whisper_context) {}
 #[no_mangle]
 pub unsafe extern "C" fn whisper_reset_timings(_ctx: *mut whisper_context) {}
 
-static SYSTEM_INFO: &str =
-    "whisper-rs-pure: 100% Pure Rust, AVX2=1, FMA=1, NEON=1, MultiThreading=1\0";
+static SYSTEM_INFO: &str = "whisper.rs: AVX2=1, FMA=1, NEON=1, MultiThreading=1\0";
 
 #[no_mangle]
 pub extern "C" fn whisper_print_system_info() -> *const c_char {

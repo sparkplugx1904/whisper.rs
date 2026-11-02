@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! whisper-rs-pure: 100% Pure Rust implementation of OpenAI Whisper inference (whisper.cpp port).
+//! whisper.rs: Rust implementation of OpenAI Whisper inference (whisper.cpp port).
 
 pub mod beam;
 pub mod decoder;

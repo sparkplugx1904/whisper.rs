@@ -20,8 +20,12 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: Build C-ABI Library
-        run: cargo build --package whisper-ffi --release || true
+      - name: Build C-ABI Library (libwhisper)
+        run: cargo build --package whisper-ffi --release --verbose
 
       - name: Run Go Bindings Tests
-        run: cd bindings/go && go test -v ./... || true
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
+          C_INCLUDE_PATH: ${{ github.workspace }}/include
+          LIBRARY_PATH: ${{ github.workspace }}/target/release
+        run: cd bindings/go && CGO_ENABLED=1 go test -v .

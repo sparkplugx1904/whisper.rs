@@ -26,4 +26,4 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Build WASM target
-        run: cargo build --package whisper-rs-pure --target ${{ matrix.target }} --release
+        run: cargo build --package whisper-rs --target ${{ matrix.target }} --release

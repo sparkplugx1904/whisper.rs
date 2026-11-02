@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use byteorder::{LittleEndian, WriteBytesExt};
 use clap::Parser;
 use std::fs::File;
