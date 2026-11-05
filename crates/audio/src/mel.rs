@@ -109,6 +109,15 @@ pub fn compute_log_mel_spectrogram(
     mel_filters: &[f32],
     n_mel: usize,
 ) -> MelSpectrogram {
+    if samples.is_empty() {
+        return MelSpectrogram {
+            n_mel,
+            n_len: 0,
+            n_len_org: 0,
+            data: Vec::new(),
+        };
+    }
+
     let n_samples = samples.len();
     let frame_size = N_FFT; // 400
     let frame_step = HOP_LENGTH; // 160

@@ -4,6 +4,7 @@
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr;
+use whisper_rs::model::header::ModelType;
 use whisper_rs::model::vocab::{lang_id, lang_str};
 use whisper_rs::model::WhisperModel;
 use whisper_rs::{WhisperContext, WhisperParams, WhisperState};
@@ -1340,4 +1341,387 @@ static SYSTEM_INFO: &str = "whisper.rs: AVX2=1, FMA=1, NEON=1, MultiThreading=1\
 #[no_mangle]
 pub extern "C" fn whisper_print_system_info() -> *const c_char {
     SYSTEM_INFO.as_ptr() as *const c_char
+}
+
+#[no_mangle]
+pub extern "C" fn whisper_version() -> *const c_char {
+    static VERSION: std::sync::LazyLock<CString> =
+        std::sync::LazyLock::new(|| CString::new(env!("CARGO_PKG_VERSION")).unwrap());
+    VERSION.as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn whisper_lang_str_full(id: c_int) -> *const c_char {
+    if id < 0 {
+        return ptr::null();
+    }
+    static CACHED_FULL_LANGS: std::sync::LazyLock<Vec<CString>> = std::sync::LazyLock::new(|| {
+        whisper_rs::model::vocab::LANGUAGES
+            .iter()
+            .map(|(_, name)| CString::new(*name).unwrap())
+            .collect()
+    });
+    if (id as usize) < CACHED_FULL_LANGS.len() {
+        return CACHED_FULL_LANGS[id as usize].as_ptr();
+    }
+    ptr::null()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_lang_id_from_state(state: *mut whisper_state) -> c_int {
+    if state.is_null() {
+        return -1;
+    }
+    let state_ref = &*state;
+    state_ref.inner.lang_id as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_segment_no_speech_prob(
+    ctx: *mut whisper_context,
+    i_segment: c_int,
+) -> f32 {
+    if ctx.is_null() || i_segment < 0 {
+        return 0.0;
+    }
+    let context = &*ctx;
+    if let Some(seg) = context.default_state.inner.segments.get(i_segment as usize) {
+        seg.no_speech_prob
+    } else {
+        0.0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_segment_no_speech_prob_from_state(
+    state: *mut whisper_state,
+    i_segment: c_int,
+) -> f32 {
+    if state.is_null() || i_segment < 0 {
+        return 0.0;
+    }
+    let state_ref = &*state;
+    if let Some(seg) = state_ref.inner.segments.get(i_segment as usize) {
+        seg.no_speech_prob
+    } else {
+        0.0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_segment_speaker_turn_next_from_state(
+    state: *mut whisper_state,
+    i_segment: c_int,
+) -> bool {
+    if state.is_null() || i_segment < 0 {
+        return false;
+    }
+    let state_ref = &*state;
+    if let Some(seg) = state_ref.inner.segments.get(i_segment as usize) {
+        seg.text.contains("[SPEAKER_TURN]")
+    } else {
+        false
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_segment_speaker_turn_next(
+    ctx: *mut whisper_context,
+    i_segment: c_int,
+) -> bool {
+    if ctx.is_null() {
+        return false;
+    }
+    let context = &*ctx;
+    let state_ptr = (&*context.default_state as *const whisper_state) as *mut whisper_state;
+    whisper_full_get_segment_speaker_turn_next_from_state(state_ptr, i_segment)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_n_tokens_from_state(
+    state: *mut whisper_state,
+    i_segment: c_int,
+) -> c_int {
+    if state.is_null() || i_segment < 0 {
+        return 0;
+    }
+    let state_ref = &*state;
+    if let Some(seg) = state_ref.inner.segments.get(i_segment as usize) {
+        seg.tokens.len() as c_int
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_token_id_from_state(
+    state: *mut whisper_state,
+    i_segment: c_int,
+    i_token: c_int,
+) -> c_int {
+    if state.is_null() || i_segment < 0 || i_token < 0 {
+        return -1;
+    }
+    let state_ref = &*state;
+    if let Some(seg) = state_ref.inner.segments.get(i_segment as usize) {
+        seg.tokens.get(i_token as usize).copied().unwrap_or(-1)
+    } else {
+        -1
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_token_text_from_state(
+    ctx: *mut whisper_context,
+    state: *mut whisper_state,
+    i_segment: c_int,
+    i_token: c_int,
+) -> *const c_char {
+    let tok_id = whisper_full_get_token_id_from_state(state, i_segment, i_token);
+    if tok_id < 0 {
+        return ptr::null();
+    }
+    whisper_token_to_str(ctx, tok_id)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_n_vad_segments_from_state(
+    state: *mut whisper_state,
+) -> c_int {
+    if state.is_null() {
+        return 0;
+    }
+    let state_ref = &*state;
+    state_ref.inner.vad_segments.len() as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_n_vad_segments(ctx: *mut whisper_context) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    context.default_state.inner.vad_segments.len() as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_vad_segment_t0_from_state(
+    state: *mut whisper_state,
+    i: c_int,
+) -> i64 {
+    if state.is_null() || i < 0 {
+        return 0;
+    }
+    let state_ref = &*state;
+    if let Some(&(t0, _)) = state_ref.inner.vad_segments.get(i as usize) {
+        (t0 as f64 * 0.02 * 100.0).round() as i64
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_vad_segment_t0(
+    ctx: *mut whisper_context,
+    i: c_int,
+) -> i64 {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    let state_ptr = (&*context.default_state as *const whisper_state) as *mut whisper_state;
+    whisper_full_get_vad_segment_t0_from_state(state_ptr, i)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_vad_segment_t1_from_state(
+    state: *mut whisper_state,
+    i: c_int,
+) -> i64 {
+    if state.is_null() || i < 0 {
+        return 0;
+    }
+    let state_ref = &*state;
+    if let Some(&(_, t1)) = state_ref.inner.vad_segments.get(i as usize) {
+        (t1 as f64 * 0.02 * 100.0).round() as i64
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_get_vad_segment_t1(
+    ctx: *mut whisper_context,
+    i: c_int,
+) -> i64 {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    let state_ptr = (&*context.default_state as *const whisper_state) as *mut whisper_state;
+    whisper_full_get_vad_segment_t1_from_state(state_ptr, i)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_model_n_vocab(ctx: *mut whisper_context) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    context.inner.model.hparams.n_vocab
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_model_n_audio_ctx(ctx: *mut whisper_context) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    context.inner.model.hparams.n_audio_ctx
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_model_n_audio_state(ctx: *mut whisper_context) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    context.inner.model.hparams.n_audio_state
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_model_n_audio_head(ctx: *mut whisper_context) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    context.inner.model.hparams.n_audio_head
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_model_n_audio_layer(ctx: *mut whisper_context) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    context.inner.model.hparams.n_audio_layer
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_model_n_text_ctx(ctx: *mut whisper_context) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    context.inner.model.hparams.n_text_ctx
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_model_n_text_state(ctx: *mut whisper_context) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    context.inner.model.hparams.n_text_state
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_model_n_text_head(ctx: *mut whisper_context) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    context.inner.model.hparams.n_text_head
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_model_n_text_layer(ctx: *mut whisper_context) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    context.inner.model.hparams.n_text_layer
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_model_n_mels(ctx: *mut whisper_context) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    context.inner.model.hparams.n_mels
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_model_ftype(ctx: *mut whisper_context) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    context.inner.model.hparams.ftype
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_model_type(ctx: *mut whisper_context) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    let context = &*ctx;
+    match context.inner.model.hparams.model_type {
+        ModelType::Tiny => 1,
+        ModelType::Base => 2,
+        ModelType::Small => 3,
+        ModelType::Medium => 4,
+        ModelType::Large | ModelType::LargeV3 | ModelType::LargeV3Turbo => 5,
+        ModelType::Unknown => 0,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_model_type_readable(ctx: *mut whisper_context) -> *const c_char {
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    let context = &*ctx;
+    static STR_TINY: &[u8] = b"tiny\0";
+    static STR_BASE: &[u8] = b"base\0";
+    static STR_SMALL: &[u8] = b"small\0";
+    static STR_MEDIUM: &[u8] = b"medium\0";
+    static STR_LARGE: &[u8] = b"large\0";
+    static STR_LARGE_V3: &[u8] = b"large-v3\0";
+    static STR_LARGE_TURBO: &[u8] = b"large-v3-turbo\0";
+    static STR_UNKNOWN: &[u8] = b"unknown\0";
+
+    match context.inner.model.hparams.model_type {
+        ModelType::Tiny => STR_TINY.as_ptr() as *const c_char,
+        ModelType::Base => STR_BASE.as_ptr() as *const c_char,
+        ModelType::Small => STR_SMALL.as_ptr() as *const c_char,
+        ModelType::Medium => STR_MEDIUM.as_ptr() as *const c_char,
+        ModelType::Large => STR_LARGE.as_ptr() as *const c_char,
+        ModelType::LargeV3 => STR_LARGE_V3.as_ptr() as *const c_char,
+        ModelType::LargeV3Turbo => STR_LARGE_TURBO.as_ptr() as *const c_char,
+        ModelType::Unknown => STR_UNKNOWN.as_ptr() as *const c_char,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_token_nosp(ctx: *mut whisper_context) -> c_int {
+    if ctx.is_null() {
+        return -1;
+    }
+    let context = &*ctx;
+    context.inner.model.vocab.token_nosp
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_n_len_from_state(state: *mut whisper_state) -> c_int {
+    if state.is_null() {
+        return 0;
+    }
+    let state_ref = &*state;
+    if let Some(m) = &state_ref.inner.mel {
+        m.n_len as c_int
+    } else {
+        0
+    }
 }

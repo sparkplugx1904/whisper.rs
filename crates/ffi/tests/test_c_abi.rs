@@ -239,3 +239,25 @@ fn test_sizeof_whisper_context_params() {
         "whisper_context_params must be exactly 48 bytes matching C-ABI include/whisper.h"
     );
 }
+
+#[test]
+fn test_c_abi_version_and_metadata_accessors() {
+    unsafe {
+        let ver_ptr = whisper_version();
+        assert!(!ver_ptr.is_null());
+        let ver = CStr::from_ptr(ver_ptr).to_str().unwrap();
+        assert!(!ver.is_empty());
+
+        let en_full = whisper_lang_str_full(0);
+        assert!(!en_full.is_null());
+        assert_eq!(CStr::from_ptr(en_full).to_str().unwrap(), "english");
+
+        let zh_full = whisper_lang_str_full(1);
+        assert!(!zh_full.is_null());
+        assert_eq!(CStr::from_ptr(zh_full).to_str().unwrap(), "chinese");
+
+        let de_full = whisper_lang_str_full(2);
+        assert!(!de_full.is_null());
+        assert_eq!(CStr::from_ptr(de_full).to_str().unwrap(), "german");
+    }
+}

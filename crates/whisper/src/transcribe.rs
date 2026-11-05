@@ -714,7 +714,7 @@ fn split_segments_by_max_len(
 
     let mut out = Vec::new();
     for seg in segments {
-        if seg.text.trim().len() <= max_len || seg.words.is_empty() {
+        if seg.text.trim().chars().count() <= max_len || seg.words.is_empty() {
             out.push(seg);
             continue;
         }
@@ -728,7 +728,7 @@ fn split_segments_by_max_len(
                     .last()
                     .map(|cw: &crate::dtw::WordTiming| cw.word.ends_with('-'))
                     .unwrap_or(false);
-            let w_len = w.word.len() + if cur_len > 0 { 1 } else { 0 };
+            let w_len = w.word.chars().count() + if cur_len > 0 { 1 } else { 0 };
             if cur_len + w_len > max_len && !cur_words.is_empty() && !is_contraction {
                 let t0 = cur_words.first().unwrap().t0;
                 let t1 = cur_words.last().unwrap().t1;
@@ -750,7 +750,7 @@ fn split_segments_by_max_len(
                 cur_words = Vec::new();
                 cur_len = 0;
             }
-            cur_len += w.word.len() + if cur_len > 0 { 1 } else { 0 };
+            cur_len += w.word.chars().count() + if cur_len > 0 { 1 } else { 0 };
             cur_words.push(w);
         }
 
@@ -870,7 +870,7 @@ impl FallbackEvaluation {
         let fallback_needed = cr > params.compression_ratio_threshold
             || (avg_logprob < params.logprob_threshold as f32
                 && no_speech_prob < params.no_speech_threshold as f32)
-            || avg_entropy > params.entropy_thold;
+            || (token_entropies.len() >= 32 && avg_entropy > params.entropy_thold);
 
         Self {
             avg_logprob,
