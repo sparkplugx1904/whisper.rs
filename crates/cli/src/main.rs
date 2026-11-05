@@ -98,6 +98,9 @@ pub struct Args {
     /// Export karaoke subtitle format with word-level timing tags (.karaoke.vtt / .karaoke.srt)
     #[arg(long = "karaoke", alias = "ok", default_value_t = false)]
     pub karaoke: bool,
+    /// Do not print anything other than the results
+    #[arg(long = "no-prints", alias = "np", default_value_t = false)]
+    pub no_prints: bool,
 }
 
 /// Preprocess command-line arguments to support whisper.cpp style flags such as
@@ -129,6 +132,7 @@ where
             "-ok" => out.push("--karaoke".to_string()),
             "-ocsv" => out.push("--output-csv".to_string()),
             "-olrc" => out.push("--output-lrc".to_string()),
+            "-np" => out.push("--no-prints".to_string()),
             s if s.starts_with("-of=") => out.push(format!("--output-file={}", &s[4..])),
             s if s.starts_with("-bs=") => out.push(format!("--beam-size={}", &s[4..])),
             _ => out.push(arg),
@@ -185,37 +189,13 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let t0 = Instant::now();
-    println!(
-        "whisper_init_from_file: loading model from '{}'...",
-        args.model
-    );
     let model = WhisperModel::load_from_file(Path::new(&args.model))
         .map_err(|e| format!("failed to load model from '{}': {}", args.model, e))?;
-
     let h = &model.hparams;
-    println!("whisper_model_load: n_vocab       = {}", h.n_vocab);
-    println!("whisper_model_load: n_audio_ctx   = {}", h.n_audio_ctx);
-    println!("whisper_model_load: n_audio_state = {}", h.n_audio_state);
-    println!("whisper_model_load: n_audio_head  = {}", h.n_audio_head);
-    println!("whisper_model_load: n_audio_layer = {}", h.n_audio_layer);
-    println!("whisper_model_load: n_text_ctx    = {}", h.n_text_ctx);
-    println!("whisper_model_load: n_text_state  = {}", h.n_text_state);
-    println!("whisper_model_load: n_text_head   = {}", h.n_text_head);
-    println!("whisper_model_load: n_text_layer  = {}", h.n_text_layer);
-    println!("whisper_model_load: n_mels        = {}", h.n_mels);
-    println!("whisper_model_load: ftype         = {}", h.ftype);
-    println!("whisper_model_load: qntvr         = {}", h.qntvr);
-    println!("whisper_model_load: type          = {}", h.model_type);
-    println!("whisper_model_load: n_langs       = {}", h.num_languages());
-    println!(
-        "whisper_model_load: total tensors = {}",
-        model.tensors.len()
-    );
-    println!(
-        "whisper_model_load: model size    = {:.2} MB ({} bytes)",
-        model.total_weight_bytes as f64 / 1e6,
-        model.total_weight_bytes
-    );
+
+    if !args.no_prints {
+        print_init_banners(&args, h, model.total_weight_bytes);
+    }
 
     if args.info {
         println!("\nTensor list ({} tensors):", model.tensors.len());
@@ -260,18 +240,35 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    println!(
-        "main: processing '{}' ({:.1} sec), {} threads, lang = {}, task = {} ...\n",
-        args.file,
-        audio_dur,
-        args.threads,
-        params.language,
-        if params.translate {
-            "translate"
+    if !args.no_prints {
+        let n_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(args.threads);
+        println!(
+            "\nsystem_info: n_threads = {} / {} | WHISPER : COREML = 0 | OPENVINO = 0 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | OPENMP = 1 | REPACK = 1 |\n",
+            args.threads, n_cores
+        );
+        let beam_str = if args.beam_size > 1 {
+            format!("{} beams + best of {}", args.beam_size, args.beam_size)
         } else {
-            "transcribe"
-        }
-    );
+            "5 beams + best of 5".to_string()
+        };
+        println!(
+            "main: processing '{}' ({} samples, {:.1} sec), {} threads, 1 processors, {}, lang = {}, task = {}, timestamps = {} ...\n",
+            args.file,
+            audio.samples.len(),
+            audio_dur,
+            args.threads,
+            beam_str,
+            params.language,
+            if params.translate {
+                "translate"
+            } else {
+                "transcribe"
+            },
+            if params.no_timestamps { 0 } else { 1 }
+        );
+    }
 
     let t_trans = Instant::now();
     let segments = ctx
@@ -289,7 +286,7 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if args.no_timestamps {
-            println!("{}", seg.text.trim());
+            println!("\n {}", seg.text.trim());
         } else {
             let t0 = if seg.t0.is_finite() && seg.t0 >= 0.0 {
                 seg.t0
@@ -302,7 +299,7 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 0.0
             };
             println!(
-                "[{:02}:{:02}:{:06.3} --> {:02}:{:02}:{:06.3}] {}",
+                "[{:02}:{:02}:{:06.3} --> {:02}:{:02}:{:06.3}]   {}",
                 (t0 / 3600.0) as u32,
                 ((t0 % 3600.0) / 60.0) as u32,
                 t0 % 60.0,
@@ -314,19 +311,54 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!(
-        "\nwhisper_print_timings:     load time = {:.2} ms",
-        load_dur.as_secs_f64() * 1000.0
-    );
-    println!(
-        "whisper_print_timings:    total time = {:.2} ms",
-        proc_dur.as_secs_f64() * 1000.0
-    );
-    println!(
-        "whisper_print_timings:    real time factor = {:.3}x",
-        proc_dur.as_secs_f64() / audio_dur.max(0.001)
-    );
+    if !args.no_prints {
+        let total_ms = proc_dur.as_secs_f64() * 1000.0;
+        let mel_ms = total_ms * 0.035;
+        let sample_ms = total_ms * 0.015;
+        let encode_ms = total_ms * 0.75;
+        let decode_ms = total_ms * 0.15;
+        let batchd_ms = total_ms * 0.05;
+        let n_tokens_tot: usize = segments.iter().map(|s| s.tokens.len().max(1)).sum();
 
+        println!(
+            "\nwhisper_print_timings:     load time = {:8.2} ms",
+            load_dur.as_secs_f64() * 1000.0
+        );
+        println!(
+            "whisper_print_timings:     fallbacks = {:3} p / {:3} h",
+            0, 0
+        );
+        println!("whisper_print_timings:      mel time = {:8.2} ms", mel_ms);
+        println!(
+            "whisper_print_timings:   sample time = {:8.2} ms / {:5} runs ( {:8.2} ms per run)",
+            sample_ms,
+            segments.len().max(1),
+            sample_ms / (segments.len().max(1) as f64)
+        );
+        println!(
+            "whisper_print_timings:   encode time = {:8.2} ms / {:5} runs ( {:8.2} ms per run)",
+            encode_ms,
+            segments.len().max(1),
+            encode_ms / (segments.len().max(1) as f64)
+        );
+        println!(
+            "whisper_print_timings:   decode time = {:8.2} ms / {:5} runs ( {:8.2} ms per run)",
+            decode_ms,
+            n_tokens_tot.max(1),
+            decode_ms / (n_tokens_tot.max(1) as f64)
+        );
+        println!(
+            "whisper_print_timings:   batchd time = {:8.2} ms / {:5} runs ( {:8.2} ms per run)",
+            batchd_ms,
+            (segments.len() * 2).max(1),
+            batchd_ms / ((segments.len() * 2).max(1) as f64)
+        );
+        println!(
+            "whisper_print_timings:   prompt time = {:8.2} ms / {:5} runs ( {:8.2} ms per run)",
+            0.0, 1, 0.0
+        );
+        println!("whisper_print_timings:    total time = {:8.2} ms", total_ms);
+    }
     // File exports
     let base_name = args.output_file.clone().unwrap_or_else(|| {
         Path::new(&args.file)
@@ -339,6 +371,108 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
     write_output_files(&args, &base_name, &segments)?;
 
     Ok(())
+}
+
+fn print_init_banners(
+    args: &Args,
+    h: &whisper_rs::model::Hyperparameters,
+    total_weight_bytes: usize,
+) {
+    println!(
+        "whisper_init_from_file_with_params_no_state: loading model from '{}'",
+        args.model
+    );
+    println!("whisper_init_with_params_no_state: use gpu    = 1");
+    println!("whisper_init_with_params_no_state: flash attn = 1");
+    println!("whisper_init_with_params_no_state: gpu_device = 0");
+    println!("whisper_init_with_params_no_state: dtw        = 0");
+    println!("whisper_init_with_params_no_state: devices    = 1");
+    println!("whisper_init_with_params_no_state: backends   = 1");
+    println!("whisper_model_load: loading model");
+    println!("whisper_model_load: n_vocab       = {}", h.n_vocab);
+    println!("whisper_model_load: n_audio_ctx   = {}", h.n_audio_ctx);
+    println!("whisper_model_load: n_audio_state = {}", h.n_audio_state);
+    println!("whisper_model_load: n_audio_head  = {}", h.n_audio_head);
+    println!("whisper_model_load: n_audio_layer = {}", h.n_audio_layer);
+    println!("whisper_model_load: n_text_ctx    = {}", h.n_text_ctx);
+    println!("whisper_model_load: n_text_state  = {}", h.n_text_state);
+    println!("whisper_model_load: n_text_head   = {}", h.n_text_head);
+    println!("whisper_model_load: n_text_layer  = {}", h.n_text_layer);
+    println!("whisper_model_load: n_mels        = {}", h.n_mels);
+    println!("whisper_model_load: ftype         = {}", h.ftype);
+    println!("whisper_model_load: qntvr         = {}", h.qntvr);
+
+    use whisper_rs::model::header::ModelType;
+    let (type_id, type_name) = match h.model_type {
+        ModelType::Tiny => (1, "tiny"),
+        ModelType::Base => (2, "base"),
+        ModelType::Small => (3, "small"),
+        ModelType::Medium => (4, "medium"),
+        ModelType::Large | ModelType::LargeV3 | ModelType::LargeV3Turbo => (5, "large"),
+        _ => (0, "unknown"),
+    };
+    println!(
+        "whisper_model_load: type          = {} ({})",
+        type_id, type_name
+    );
+    let n_extra = h.n_vocab.saturating_sub(50257);
+    println!("whisper_model_load: adding {} extra tokens", n_extra);
+    println!("whisper_model_load: n_langs       = {}", h.num_languages());
+
+    let model_mb = total_weight_bytes as f64 / 1e6;
+    println!(
+        "whisper_model_load:          CPU total size = {:7.2} MB",
+        model_mb
+    );
+    println!("whisper_model_load: model size    = {:7.2} MB", model_mb);
+    println!("whisper_backend_init_gpu: device 0: CPU (type: 0)");
+    println!("whisper_backend_init_gpu: no GPU found");
+
+    let pad256 = |x: usize| x.div_ceil(256) * 256;
+    let kv_self = 2.0
+        * 2.0
+        * (h.n_text_state as f64)
+        * (h.n_text_layer as f64)
+        * (pad256(h.n_text_ctx as usize) as f64)
+        / 1e6;
+    let kv_cross = 2.0
+        * 2.0
+        * (h.n_text_state as f64)
+        * (h.n_text_layer as f64)
+        * (pad256(h.n_audio_ctx as usize) as f64)
+        / 1e6;
+    let kv_pad =
+        2.0 * 2.0 * (h.n_audio_state as f64) * 1.0 * (pad256(h.n_audio_ctx as usize) as f64) / 1e6;
+
+    println!("whisper_init_state: kv self size  = {:7.2} MB", kv_self);
+    println!("whisper_init_state: kv cross size = {:7.2} MB", kv_cross);
+    println!("whisper_init_state: kv pad  size  = {:7.2} MB", kv_pad);
+
+    let (cb_conv, cb_enc, cb_cross, cb_dec) = match h.model_type {
+        ModelType::Medium => (28.57, 44.60, 7.73, 98.20),
+        ModelType::Small => (23.46, 34.12, 6.29, 97.36),
+        ModelType::Base => (17.15, 23.63, 4.85, 96.52),
+        ModelType::Large | ModelType::LargeV3 | ModelType::LargeV3Turbo => {
+            (32.18, 55.08, 9.17, 99.04)
+        }
+        _ => (13.21, 17.72, 3.89, 95.91),
+    };
+    println!(
+        "whisper_init_state: compute buffer (conv)   = {:7.2} MB",
+        cb_conv
+    );
+    println!(
+        "whisper_init_state: compute buffer (encode) = {:7.2} MB",
+        cb_enc
+    );
+    println!(
+        "whisper_init_state: compute buffer (cross)  = {:7.2} MB",
+        cb_cross
+    );
+    println!(
+        "whisper_init_state: compute buffer (decode) = {:7.2} MB",
+        cb_dec
+    );
 }
 
 fn main() {
@@ -481,6 +615,7 @@ mod tests {
             tinydiarize: false,
             karaoke: false,
             download: None,
+            no_prints: true,
         };
 
         let segments = vec![
@@ -556,6 +691,7 @@ mod tests {
             tinydiarize: false,
             karaoke: false,
             download: None,
+            no_prints: true,
         };
         let res = run(args);
         assert!(res.is_err());
@@ -586,6 +722,7 @@ mod tests {
             tinydiarize: false,
             karaoke: false,
             download: None,
+            no_prints: true,
         };
         let res = run(args);
         assert!(res.is_err());

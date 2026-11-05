@@ -1,8 +1,11 @@
 # whisper.rs
 
-[![CI](https://github.com/sparkplugx1904/whisper.rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sparkplugx1904/whisper.rs/actions)
+![whisper.cpp](./Banner.png)
+
+
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
-[![Pure Rust](https://img.shields.io/badge/Pure%20Rust-100%25-brightgreen.svg)](#pure-rust-guarantee)
+[![CI](https://github.com/sparkplugx1904/whisper.rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sparkplugx1904/whisper.rs/actions)
+[![Rust](https://img.shields.io/badge/Rust-100%25-brightgreen.svg)](#pure-rust-guarantee)
 
 A high-performance, **100% Pure Rust** rewrite of [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and OpenAI Whisper automatic speech recognition (ASR).
 
