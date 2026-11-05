@@ -7,6 +7,7 @@
 [![CI](https://github.com/sparkplugx1904/whisper.rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sparkplugx1904/whisper.rs/actions)
 [![Rust](https://img.shields.io/badge/Rust-100%25-brightgreen.svg)](#pure-rust-guarantee)
 
+
 A high-performance, **100% Pure Rust** rewrite of [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and OpenAI Whisper automatic speech recognition (ASR).
 
 `whisper.rs` provides complete feature parity with whisper.cpp: drop-in C-ABI compatibility (`libwhisper.so` / `include/whisper.h`), native WebAssembly bindings, Go bindings, universal audio container decoding, direct integer quantization kernels (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, K-quants), formal GBNF grammar-constrained decoding, Voice Activity Detection (VAD), streaming audio processing, DTW word-level timestamps, karaoke subtitle exports, and an OpenAI-compatible REST server — all with **strictly zero C/C++/assembly dependencies** in the build tree.
@@ -36,6 +37,7 @@ A high-performance, **100% Pure Rust** rewrite of [whisper.cpp](https://github.c
   - [Go Bindings (`bindings/go`)](#go-bindings-bindingsgo)
   - [WebAssembly / JS (`bindings/javascript`)](#webassembly--js-bindingsjavascript)
 - [Testing & Verification](#testing--verification)
+- [Special Thanks & Acknowledgements](#special-thanks--acknowledgements)
 - [License](#license)
 
 ---
@@ -483,6 +485,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 # 4. Run all unit and integration test suites
 cargo test --release --workspace
 ```
+
+---
+
+## Special Thanks & Acknowledgements
+
+This project stands on the shoulders of giants in the open-source speech recognition community. Sincere gratitude and respect to the following projects and maintainers:
+
+- **[whisper.cpp (ggml-org)](https://github.com/ggml-org/whisper.cpp)**: Georgi Gerganov and the ggml-org community for the pioneering C/C++ inference implementation, the GGML model format, quantization algorithms, and setting the gold standard for lightweight edge ASR.
+- **[whisper-rs by tazz](https://codeberg.org/tazz/whisper-rs)** (also on [GitHub](https://github.com/tazz4843/whisper-rs)): tazz4843 for creating the original Rust bindings ecosystem for whisper.cpp, providing idiomatic Rust wrappers and inspiring pure-Rust ASR exploration.
+- **[faster-whisper (SYSTRAN)](https://github.com/SYSTRAN/faster-whisper)**: Guillaume Klein and the SYSTRAN team for the high-performance CTranslate2 reimplementation of Whisper, establishing benchmarks in batched CPU/GPU throughput and memory efficiency.
+- **[OpenAI Whisper](https://github.com/openai/whisper)**: Radford et al. and the OpenAI research team for open-sourcing the revolutionary Whisper model architecture and foundational weights.
 
 ---
 
