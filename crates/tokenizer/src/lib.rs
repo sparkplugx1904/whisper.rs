@@ -14,6 +14,7 @@ pub enum TokenizerError {
     DecodeError(String),
 }
 
+#[derive(Clone)]
 pub struct Tokenizer {
     pub vocab: Vocab,
 }

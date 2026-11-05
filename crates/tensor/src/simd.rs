@@ -92,16 +92,7 @@ unsafe fn dot_f32_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
         p_b = p_b.add(8);
     }
 
-    // Horizontal sum of __m256 (8 floats)
-    // acc = [f0, f1, f2, f3, f4, f5, f6, f7]
-    let hi_128 = _mm256_extractf128_ps(acc, 1);
-    let lo_128 = _mm256_castps256_ps128(acc);
-    let sum128 = _mm_add_ps(lo_128, hi_128); // [f0+f4, f1+f5, f2+f6, f3+f7]
-    let shuf = _mm_movehl_ps(sum128, sum128); // [f2+f6, f3+f7, ...]
-    let sum64 = _mm_add_ps(sum128, shuf);
-    let shuf2 = _mm_shuffle_ps(sum64, sum64, 1);
-    let sum32 = _mm_add_ss(sum64, shuf2);
-    let mut result = _mm_cvtss_f32(sum32);
+    let mut result = hsum256_ps(acc);
 
     // Tail scalar elements (0..7)
     let tail_offset = len - (len % 8);
@@ -110,6 +101,19 @@ unsafe fn dot_f32_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
     }
 
     result
+}
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn hsum256_ps(acc: core::arch::x86_64::__m256) -> f32 {
+    use core::arch::x86_64::*;
+    let hi_128 = _mm256_extractf128_ps(acc, 1);
+    let lo_128 = _mm256_castps256_ps128(acc);
+    let sum128 = _mm_add_ps(lo_128, hi_128);
+    let shuf = _mm_movehl_ps(sum128, sum128);
+    let sum64 = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_shuffle_ps(sum64, sum64, 1);
+    let sum32 = _mm_add_ss(sum64, shuf2);
+    _mm_cvtss_f32(sum32)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -146,6 +150,79 @@ unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
     }
 
     result
+}
+/// # Safety
+///
+/// Requires target features AVX2 and FMA. Caller must ensure slices have matching lengths.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn gemv_f32_avx2_fma(
+    x: &[f32],
+    w: &[f32],
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+    in_features: usize,
+    out_features: usize,
+) {
+    let p_bias = bias.map(|b| b.as_ptr());
+    let p_w = w.as_ptr();
+    let p_out = out.as_mut_ptr();
+
+    for r in 0..out_features {
+        let wr_slice = std::slice::from_raw_parts(p_w.add(r * in_features), in_features);
+        let mut sum = dot_f32_avx2_fma(x, wr_slice);
+        if let Some(pb) = p_bias {
+            sum += *pb.add(r);
+        }
+        *p_out.add(r) = sum;
+    }
+}
+
+pub fn gemv_f32_scalar(
+    x: &[f32],
+    w: &[f32],
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+    in_features: usize,
+    out_features: usize,
+) {
+    for r in 0..out_features {
+        let w_row = &w[r * in_features..(r + 1) * in_features];
+        let mut sum = dot_f32_scalar(x, w_row);
+        if let Some(b) = bias {
+            sum += b[r];
+        }
+        out[r] = sum;
+    }
+}
+
+#[inline(always)]
+pub fn gemv_f32(
+    x: &[f32],
+    w: &[f32],
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+    in_features: usize,
+    out_features: usize,
+) {
+    assert_eq!(x.len(), in_features);
+    assert_eq!(w.len(), out_features * in_features);
+    assert_eq!(out.len(), out_features);
+    if let Some(b) = bias {
+        assert_eq!(b.len(), out_features);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe {
+                gemv_f32_avx2_fma(x, w, bias, out, in_features, out_features);
+            }
+            return;
+        }
+    }
+
+    gemv_f32_scalar(x, w, bias, out, in_features, out_features);
 }
 
 #[inline(always)]

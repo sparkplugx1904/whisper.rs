@@ -429,6 +429,14 @@ pub unsafe extern "C" fn whisper_full_with_state(
         None
     };
 
+    let raw_prompt_tokens = if !params.prompt_tokens.is_null() && params.prompt_n_tokens > 0 {
+        let slice =
+            std::slice::from_raw_parts(params.prompt_tokens, params.prompt_n_tokens as usize);
+        slice.to_vec()
+    } else {
+        Vec::new()
+    };
+
     let beam_sz = if params.strategy == whisper_sampling_strategy::WHISPER_SAMPLING_BEAM_SEARCH {
         params.beam_search.beam_size.max(1) as usize
     } else {
@@ -443,6 +451,9 @@ pub unsafe extern "C" fn whisper_full_with_state(
         beam_size: beam_sz,
         no_timestamps: params.no_timestamps,
         initial_prompt: prompt_str,
+        prompt_tokens: raw_prompt_tokens,
+        no_context: params.no_context,
+        carry_initial_prompt: params.carry_initial_prompt,
         n_threads: params.n_threads.max(1) as usize,
         max_tokens: if params.max_tokens > 0 {
             params.max_tokens as usize

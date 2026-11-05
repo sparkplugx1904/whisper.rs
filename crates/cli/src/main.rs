@@ -1,12 +1,15 @@
 #![forbid(unsafe_code)]
 
 use clap::Parser;
-use std::fs::File;
-use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 pub mod download;
 pub use download::{download_model, get_model_download_url};
+pub mod format;
+pub use format::{
+    export_segments_to_file, JsonFormatter, KaraokeVttFormatter, OutputFormatOptions,
+    OutputFormatter, SrtFormatter, TxtFormatter, VttFormatter,
+};
 use whisper_rs::model::WhisperModel;
 use whisper_rs::{WhisperContext, WhisperParams};
 
@@ -125,74 +128,29 @@ where
     out
 }
 
-/// Write exported files (.txt, .srt, .vtt, .json) according to CLI options.
+impl From<&Args> for OutputFormatOptions {
+    fn from(args: &Args) -> Self {
+        Self {
+            output_txt: args.output_txt,
+            output_srt: args.output_srt,
+            output_vtt: args.output_vtt,
+            output_json: args.output_json,
+            karaoke: args.karaoke,
+        }
+    }
+}
+
+/// Write exported files (.txt, .srt, .vtt, .json, .karaoke.vtt) according to CLI options.
 pub fn write_output_files(
     args: &Args,
     base_name: &str,
     segments: &[whisper_rs::Segment],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if args.output_txt {
-        let path = format!("{}.txt", base_name);
-        let mut f = File::create(&path)
-            .map_err(|e| format!("failed to create TXT output file '{}': {}", path, e))?;
-        for s in segments {
-            writeln!(f, "{}", s.text.trim())
-                .map_err(|e| format!("failed to write TXT output file '{}': {}", path, e))?;
-        }
-        println!("Saved TXT output to '{}'", path);
+    let opts = OutputFormatOptions::from(args);
+    for formatter in opts.active_formatters() {
+        let path = export_segments_to_file(formatter.as_ref(), base_name, segments)?;
+        println!("Saved {} output to '{}'", formatter.name(), path);
     }
-
-    if args.output_srt {
-        let path = format!("{}.srt", base_name);
-        let mut f = File::create(&path)
-            .map_err(|e| format!("failed to create SRT output file '{}': {}", path, e))?;
-        for (i, s) in segments.iter().enumerate() {
-            write!(f, "{}", s.to_srt(i + 1))
-                .map_err(|e| format!("failed to write SRT output file '{}': {}", path, e))?;
-        }
-        println!("Saved SRT output to '{}'", path);
-    }
-
-    if args.output_vtt {
-        let path = format!("{}.vtt", base_name);
-        let mut f = File::create(&path)
-            .map_err(|e| format!("failed to create VTT output file '{}': {}", path, e))?;
-        writeln!(f, "WEBVTT\n")
-            .map_err(|e| format!("failed to write VTT header to '{}': {}", path, e))?;
-        for s in segments {
-            write!(f, "{}", s.to_vtt())
-                .map_err(|e| format!("failed to write VTT output file '{}': {}", path, e))?;
-        }
-        println!("Saved VTT output to '{}'", path);
-    }
-
-    if args.output_json {
-        let path = format!("{}.json", base_name);
-        let mut f = File::create(&path)
-            .map_err(|e| format!("failed to create JSON output file '{}': {}", path, e))?;
-        writeln!(f, "[").map_err(|e| format!("failed to write JSON array to '{}': {}", path, e))?;
-        for (i, s) in segments.iter().enumerate() {
-            let comma = if i + 1 < segments.len() { "," } else { "" };
-            writeln!(f, "  {}{}", s.to_json(), comma)
-                .map_err(|e| format!("failed to write JSON segment to '{}': {}", path, e))?;
-        }
-        writeln!(f, "]").map_err(|e| format!("failed to close JSON array in '{}': {}", path, e))?;
-        println!("Saved JSON output to '{}'", path);
-    }
-
-    if args.karaoke {
-        let vtt_path = format!("{}.karaoke.vtt", base_name);
-        let mut f = File::create(&vtt_path)
-            .map_err(|e| format!("failed to create Karaoke VTT file '{}': {}", vtt_path, e))?;
-        writeln!(f, "WEBVTT\n")
-            .map_err(|e| format!("failed to write header in '{}': {}", vtt_path, e))?;
-        for s in segments {
-            write!(f, "{}", s.to_karaoke_vtt())
-                .map_err(|e| format!("failed to write segment in '{}': {}", vtt_path, e))?;
-        }
-        println!("Saved Karaoke VTT output to '{}'", vtt_path);
-    }
-
     Ok(())
 }
 

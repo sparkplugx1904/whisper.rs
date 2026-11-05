@@ -1,7 +1,10 @@
 use crate::beam::BeamSearch;
 use crate::decoder::{DecoderKvCache, WhisperDecoder};
 use crate::encoder::WhisperEncoder;
-use crate::filter::compression_ratio;
+use crate::filter::{
+    compression_ratio, GrammarLogitFilter, LogitFilterContext, LogitFilterPipeline,
+    RepetitionPenaltyFilter, SuppressBlankFilter, SuppressNonSpeechFilter, TimestampLogitFilter,
+};
 use crate::params::WhisperParams;
 use crate::segment::Segment;
 use crate::state::WhisperState;
@@ -158,9 +161,55 @@ impl WhisperContext {
         (best_lang.to_string(), best_idx, best_prob)
     }
 
+    pub fn detect_language_with_enc(&self, enc_out: &[f32]) -> (String, f32) {
+        if !self.model.hparams.is_multilingual() {
+            return ("en".to_string(), 1.0);
+        }
+
+        let mut cache = DecoderKvCache::new(self.decoder.n_layers);
+        let prompt = [self.tokenizer.sot()];
+        let logits = self.decoder.decode(&prompt, enc_out, &mut cache);
+
+        let num_langs = self.model.hparams.num_languages();
+        let sot = self.tokenizer.sot();
+
+        let mut lang_scores = Vec::with_capacity(num_langs);
+        let mut max_score = f32::NEG_INFINITY;
+
+        for (i, &(code, _)) in LANGUAGES.iter().take(num_langs).enumerate() {
+            let token_id = sot + 1 + i as i32;
+            let score = logits[token_id as usize];
+            if score > max_score {
+                max_score = score;
+            }
+            lang_scores.push((code, score));
+        }
+
+        let mut sum_exp = 0.0f32;
+        for (_, score) in &mut lang_scores {
+            *score = (*score - max_score).exp();
+            sum_exp += *score;
+        }
+
+        let inv_sum = 1.0 / sum_exp.max(1e-10);
+        let mut best_lang = "en";
+        let mut best_prob = 0.0f32;
+
+        for (code, score) in lang_scores {
+            let prob = score * inv_sum;
+            if prob > best_prob {
+                best_prob = prob;
+                best_lang = code;
+            }
+        }
+
+        (best_lang.to_string(), best_prob)
+    }
+
     pub fn detect_language(&self, mel: &MelSpectrogram) -> (String, f32) {
-        let (code, _, prob) = self.detect_language_probs(mel, None);
-        (code, prob)
+        let mel_chunk = mel.get_chunk(0, self.model.hparams.n_audio_ctx as usize);
+        let enc_out = self.encoder.forward(&mel_chunk);
+        self.detect_language_with_enc(&enc_out)
     }
 
     /// Transcribe whole audio mel spectrogram into text segments.
@@ -176,14 +225,20 @@ impl WhisperContext {
         state: &mut WhisperState,
     ) -> Vec<Segment> {
         let is_multilingual = self.model.hparams.is_multilingual();
+        let n_audio_ctx = self.model.hparams.n_audio_ctx as usize;
+
+        // Precompute chunk 0 encoder output so we never compute it twice
+        let mel_chunk_0 = mel.get_chunk(0, n_audio_ctx);
+        let enc_out_0 = self.encoder.forward(&mel_chunk_0);
+
         let lang = if params.language == "auto" {
-            let (detected, prob) = self.detect_language(mel);
+            let (detected, prob) = self.detect_language_with_enc(&enc_out_0);
             state.lang_prob = prob;
             detected
         } else {
+            state.lang_prob = 1.0;
             params.language.clone()
         };
-
         let lang_idx = whisper_model::vocab::lang_id(&lang).unwrap_or(0);
         state.lang_id = lang_idx;
 
@@ -194,8 +249,11 @@ impl WhisperContext {
 
         let mut prompt_base = Vec::new();
 
-        // 1. Initial prompt injection
-        if let Some(prompt_text) = &params.initial_prompt {
+        // 1. Initial prompt injection (raw tokens or text)
+        if !params.prompt_tokens.is_empty() {
+            prompt_base.push(self.model.vocab.token_prev);
+            prompt_base.extend_from_slice(&params.prompt_tokens);
+        } else if let Some(prompt_text) = &params.initial_prompt {
             if !prompt_text.trim().is_empty() {
                 prompt_base.push(self.model.vocab.token_prev);
                 let encoded_prompt = self.tokenizer.encode(prompt_text);
@@ -224,6 +282,7 @@ impl WhisperContext {
         let n_audio_ctx = self.model.hparams.n_audio_ctx as usize;
         let chunk_frames = 2 * n_audio_ctx; // 3000 frames = 30 seconds
         let total_audio_sec = mel.n_len_org as f64 * 0.01;
+        let mut history_tokens: Vec<i32> = Vec::new();
 
         while seek_frame < mel.n_len_org {
             if let Some(ref cb) = params.on_progress {
@@ -235,13 +294,33 @@ impl WhisperContext {
                 break;
             }
             let seek_time = seek_frame as f64 * 0.01;
-            let mel_chunk = mel.get_chunk(seek_frame, n_audio_ctx);
-            let enc_out = self.encoder.forward(&mel_chunk);
+            let enc_out = if seek_frame == 0 {
+                enc_out_0.clone()
+            } else {
+                let mel_chunk = mel.get_chunk(seek_frame, n_audio_ctx);
+                self.encoder.forward(&mel_chunk)
+            };
             state.encoder_output = enc_out.clone();
+
+            let prompt_builder = WindowPromptBuilder {
+                prompt_base: &prompt_base,
+                is_multilingual,
+                lang_idx,
+                sot,
+                not_token,
+                token_prev: self.model.vocab.token_prev,
+            };
+            let window_prompt = prompt_builder.build(
+                seek_frame,
+                &history_tokens,
+                params,
+                &self.tokenizer,
+            );
 
             let mut temperature = params.temperature;
             let mut tokens_cur = Vec::new();
             let mut token_logprobs = Vec::new();
+            let mut token_entropies = Vec::new();
             let mut no_speech_prob = 0.01f32;
 
             let gbnf_grammar = params
@@ -253,11 +332,12 @@ impl WhisperContext {
             while temperature <= 1.0 {
                 tokens_cur.clear();
                 token_logprobs.clear();
+                token_entropies.clear();
                 let mut cache = DecoderKvCache::new(self.decoder.n_layers);
 
                 if params.beam_size > 1 && temperature == 0.0 {
                     // BEAM SEARCH
-                    let mut logits = self.decoder.decode(&prompt_base, &enc_out, &mut cache);
+                    let mut logits = self.decoder.decode(&window_prompt, &enc_out, &mut cache);
                     let mut beam = BeamSearch::new(params.beam_size, cache);
 
                     // Seed beam candidates with top branches from initial prompt
@@ -265,17 +345,26 @@ impl WhisperContext {
                     let start_idx = logits.len() - n_vocab;
                     let step_logits = &mut logits[start_idx..];
 
+                    let mut beam_pipeline = LogitFilterPipeline::new();
                     if params.suppress_blank {
-                        step_logits[220] = f32::NEG_INFINITY;
-                        step_logits[eot as usize] = f32::NEG_INFINITY;
+                        beam_pipeline.add(SuppressBlankFilter::new(220, eot));
                     }
                     if params.no_timestamps {
-                        step_logits[(beg as usize)..n_vocab].fill(f32::NEG_INFINITY);
+                        beam_pipeline.add(TimestampLogitFilter::new(beg as usize, n_vocab, true));
                     }
-
-                    if let Some(gbnf) = &gbnf_grammar {
-                        gbnf.filter_logits("", step_logits, &self.model.vocab);
+                    if let Some(gbnf) = gbnf_grammar.clone() {
+                        beam_pipeline.add(GrammarLogitFilter::new(
+                            gbnf,
+                            self.model.vocab.clone(),
+                            self.tokenizer.clone(),
+                        ));
                     }
+                    let seed_ctx = LogitFilterContext {
+                        step: 0,
+                        tokens_cur: &[],
+                        last_timestamp_token: None,
+                    };
+                    beam_pipeline.apply(step_logits, &seed_ctx);
 
                     let mut seed_tokens = Vec::new();
                     for (tok, &l) in step_logits.iter().enumerate() {
@@ -327,46 +416,46 @@ impl WhisperContext {
                     }
                 } else {
                     // GREEDY DECODING
-                    let mut logits = self.decoder.decode(&prompt_base, &enc_out, &mut cache);
-                    tokens_cur.clear();
+                    let mut logits = self.decoder.decode(&window_prompt, &enc_out, &mut cache);
                     let mut last_timestamp_token: Option<i32> = None;
                     let max_steps = 224;
                     let n_vocab = self.decoder.n_vocab;
+                    let mut greedy_pipeline = LogitFilterPipeline::new();
+                    if params.suppress_blank {
+                        greedy_pipeline.add(SuppressBlankFilter::new(220, eot));
+                    }
+                    if params.suppress_nst {
+                        let nst_indices = crate::filter::get_non_speech_tokens(&self.model.vocab);
+                        greedy_pipeline.add(SuppressNonSpeechFilter::new(nst_indices));
+                    }
+                    if params.repetition_penalty > 1.0 {
+                        greedy_pipeline.add(RepetitionPenaltyFilter::new(
+                            params.repetition_penalty,
+                        ));
+                    }
+                    greedy_pipeline.add(TimestampLogitFilter::new(
+                        beg as usize,
+                        n_vocab,
+                        params.no_timestamps,
+                    ));
+                    if let Some(gbnf) = gbnf_grammar.clone() {
+                        greedy_pipeline.add(GrammarLogitFilter::new(
+                            gbnf,
+                            self.model.vocab.clone(),
+                            self.tokenizer.clone(),
+                        ));
+                    }
 
                     for step in 0..max_steps {
                         let start_idx = logits.len() - n_vocab;
                         let step_logits = &mut logits[start_idx..];
 
-                        if params.suppress_blank && step == 0 {
-                            crate::filter::apply_suppress_blank(step_logits, 220, eot);
-                        }
-                        if params.suppress_nst {
-                            crate::filter::apply_suppress_non_speech(
-                                step_logits,
-                                &self.model.vocab,
-                            );
-                        }
-                        if params.repetition_penalty > 1.0 {
-                            crate::filter::apply_repetition_penalty(
-                                step_logits,
-                                &tokens_cur,
-                                params.repetition_penalty,
-                            );
-                        }
-
-                        if params.no_timestamps {
-                            step_logits[(beg as usize)..n_vocab].fill(f32::NEG_INFINITY);
-                        } else if let Some(last_ts) = last_timestamp_token {
-                            if (last_ts as usize) > (beg as usize) {
-                                step_logits[(beg as usize)..(last_ts as usize)]
-                                    .fill(f32::NEG_INFINITY);
-                            }
-                        }
-
-                        if let Some(gbnf) = &gbnf_grammar {
-                            let cur_txt = self.tokenizer.decode(&tokens_cur, true);
-                            gbnf.filter_logits(&cur_txt, step_logits, &self.model.vocab);
-                        }
+                        let filter_ctx = LogitFilterContext {
+                            step,
+                            tokens_cur: &tokens_cur,
+                            last_timestamp_token,
+                        };
+                        greedy_pipeline.apply(step_logits, &filter_ctx);
 
                         // Greedy argmax & logprob calculation
                         let mut best_id = 0;
@@ -396,6 +485,9 @@ impl WhisperContext {
                         let logprob = best_logit - lse;
                         token_logprobs.push(logprob);
 
+                        let step_entropy = crate::filter::compute_distribution_entropy(step_logits);
+                        token_entropies.push(step_entropy);
+
                         if step == 0 && n_vocab > 50362 {
                             let ns_logit = step_logits[50362];
                             if ns_logit > f32::NEG_INFINITY {
@@ -416,33 +508,31 @@ impl WhisperContext {
                     }
                 }
 
-                let avg_logprob = if !token_logprobs.is_empty() {
-                    token_logprobs.iter().sum::<f32>() / token_logprobs.len() as f32
-                } else {
-                    -0.2
-                };
-
-                // Check fallback criteria
                 let text = self.tokenizer.decode(&tokens_cur, true);
-                let cr = compression_ratio(&text);
+                let eval = FallbackEvaluation::evaluate(
+                    &text,
+                    &token_logprobs,
+                    &token_entropies,
+                    no_speech_prob,
+                    params,
+                );
 
-                let fallback_needed = cr > params.compression_ratio_threshold
-                    || (avg_logprob < params.logprob_threshold as f32
-                        && no_speech_prob < params.no_speech_threshold as f32);
-
-                if !fallback_needed || params.temperature_inc <= 0.0 {
+                if !eval.fallback_needed || params.temperature_inc <= 0.0 {
                     break;
                 }
-
                 // Trigger temperature fallback
                 temperature += params.temperature_inc;
             }
 
-            let avg_logprob = if !token_logprobs.is_empty() {
-                token_logprobs.iter().sum::<f32>() / token_logprobs.len() as f32
-            } else {
-                -0.2
-            };
+            let eval = FallbackEvaluation::evaluate(
+                "",
+                &token_logprobs,
+                &token_entropies,
+                no_speech_prob,
+                params,
+            );
+            let avg_logprob = eval.avg_logprob;
+            let avg_entropy = eval.avg_entropy;
 
             // Extract segments from tokens_cur
             if params.no_timestamps || tokens_cur.is_empty() {
@@ -453,7 +543,7 @@ impl WhisperContext {
                 };
                 for chunk in tokens_cur.chunks(max_tok) {
                     let t1 = (seek_time + 30.0).min(total_audio_sec);
-                    let seg = self.build_segment(seek_time, t1, chunk, avg_logprob, no_speech_prob);
+                    let seg = self.build_segment(seek_time, t1, chunk, avg_logprob, no_speech_prob, avg_entropy);
                     if !seg.text.trim().is_empty() {
                         if let Some(ref cb) = params.on_new_segment {
                             cb(&seg);
@@ -481,6 +571,7 @@ impl WhisperContext {
                                 &seg_tokens,
                                 avg_logprob,
                                 no_speech_prob,
+                                avg_entropy,
                             );
                             if !seg.text.trim().is_empty() {
                                 if let Some(ref cb) = params.on_new_segment {
@@ -503,6 +594,7 @@ impl WhisperContext {
                                 &seg_tokens,
                                 avg_logprob,
                                 no_speech_prob,
+                                avg_entropy,
                             );
                             if !seg.text.trim().is_empty() {
                                 if let Some(ref cb) = params.on_new_segment {
@@ -518,7 +610,7 @@ impl WhisperContext {
                 if !seg_tokens.is_empty() {
                     let t1 = (seek_time + 30.0).min(total_audio_sec);
                     let seg =
-                        self.build_segment(seg_t0, t1, &seg_tokens, avg_logprob, no_speech_prob);
+                        self.build_segment(seg_t0, t1, &seg_tokens, avg_logprob, no_speech_prob, avg_entropy);
                     if !seg.text.trim().is_empty() {
                         if let Some(ref cb) = params.on_new_segment {
                             cb(&seg);
@@ -534,6 +626,7 @@ impl WhisperContext {
                 } else {
                     seek_frame += chunk_frames;
                 }
+                history_tokens.extend(tokens_cur.iter().copied().filter(|&t| t < beg && t != eot));
             }
         }
 
@@ -555,6 +648,7 @@ impl WhisperContext {
         tokens: &[i32],
         avg_logprob: f32,
         no_speech_prob: f32,
+        avg_entropy: f32,
     ) -> Segment {
         let mut text = self.tokenizer.decode(tokens, true);
         if tokens.iter().any(|&t| t == 50363 || t == 50364) && !text.starts_with("[SPEAKER_TURN]") {
@@ -586,6 +680,7 @@ impl WhisperContext {
             words,
             avg_logprob,
             no_speech_prob,
+            avg_entropy,
         )
     }
 }
@@ -610,8 +705,13 @@ fn split_segments_by_max_len(
         let mut cur_len = 0;
 
         for w in seg.words {
+            let is_contraction = w.word.starts_with('\'')
+                || cur_words
+                    .last()
+                    .map(|cw: &crate::dtw::WordTiming| cw.word.ends_with('-'))
+                    .unwrap_or(false);
             let w_len = w.word.len() + if cur_len > 0 { 1 } else { 0 };
-            if cur_len + w_len > max_len && !cur_words.is_empty() {
+            if cur_len + w_len > max_len && !cur_words.is_empty() && !is_contraction {
                 let t0 = cur_words.first().unwrap().t0;
                 let t1 = cur_words.last().unwrap().t1;
                 let text = cur_words
@@ -627,6 +727,7 @@ fn split_segments_by_max_len(
                     cur_words,
                     seg.avg_logprob,
                     seg.no_speech_prob,
+                    seg.avg_entropy,
                 ));
                 cur_words = Vec::new();
                 cur_len = 0;
@@ -651,9 +752,113 @@ fn split_segments_by_max_len(
                 cur_words,
                 seg.avg_logprob,
                 seg.no_speech_prob,
+                seg.avg_entropy,
             ));
         }
     }
 
     out
+}
+
+/// Helper responsible for assembling window prompts according to transcription parameters (SRP).
+#[derive(Debug)]
+pub struct WindowPromptBuilder<'a> {
+    pub prompt_base: &'a [i32],
+    pub is_multilingual: bool,
+    pub lang_idx: usize,
+    pub sot: i32,
+    pub not_token: i32,
+    pub token_prev: i32,
+}
+
+impl<'a> WindowPromptBuilder<'a> {
+    pub fn build(
+        &self,
+        seek_frame: usize,
+        history_tokens: &[i32],
+        params: &WhisperParams,
+        tokenizer: &Tokenizer,
+    ) -> Vec<i32> {
+        let mut window_prompt = Vec::new();
+        if seek_frame == 0 || params.no_context {
+            window_prompt.extend_from_slice(self.prompt_base);
+        } else {
+            let prev_tokens_slice = if history_tokens.len() > 224 {
+                &history_tokens[history_tokens.len() - 224..]
+            } else {
+                &history_tokens[..]
+            };
+
+            if !prev_tokens_slice.is_empty() {
+                window_prompt.push(self.token_prev);
+                if params.carry_initial_prompt {
+                    if !params.prompt_tokens.is_empty() {
+                        window_prompt.extend_from_slice(&params.prompt_tokens);
+                    } else if let Some(prompt_text) = &params.initial_prompt {
+                        window_prompt.extend(tokenizer.encode(prompt_text));
+                    }
+                }
+                window_prompt.extend_from_slice(prev_tokens_slice);
+            }
+
+            window_prompt.push(self.sot);
+            if self.is_multilingual {
+                let lang_token = self.sot + 1 + self.lang_idx as i32;
+                window_prompt.push(lang_token);
+                if params.translate {
+                    window_prompt.push(tokenizer.translate());
+                } else {
+                    window_prompt.push(tokenizer.transcribe());
+                }
+            }
+            if params.no_timestamps {
+                window_prompt.push(self.not_token);
+            }
+        }
+        window_prompt
+    }
+}
+
+/// Evaluator for decoding quality metrics against temperature fallback criteria (SRP).
+#[derive(Debug, Clone, Copy)]
+pub struct FallbackEvaluation {
+    pub avg_logprob: f32,
+    pub avg_entropy: f32,
+    pub compression_ratio: f64,
+    pub fallback_needed: bool,
+}
+
+impl FallbackEvaluation {
+    pub fn evaluate(
+        text: &str,
+        token_logprobs: &[f32],
+        token_entropies: &[f32],
+        no_speech_prob: f32,
+        params: &WhisperParams,
+    ) -> Self {
+        let avg_logprob = if !token_logprobs.is_empty() {
+            token_logprobs.iter().sum::<f32>() / token_logprobs.len() as f32
+        } else {
+            -0.2
+        };
+
+        let avg_entropy = if !token_entropies.is_empty() {
+            token_entropies.iter().sum::<f32>() / token_entropies.len() as f32
+        } else {
+            0.0
+        };
+
+        let cr = compression_ratio(text);
+        let fallback_needed = cr > params.compression_ratio_threshold
+            || (avg_logprob < params.logprob_threshold as f32
+                && no_speech_prob < params.no_speech_threshold as f32)
+            || avg_entropy > params.entropy_thold;
+
+        Self {
+            avg_logprob,
+            avg_entropy,
+            compression_ratio: cr,
+            fallback_needed,
+        }
+    }
 }

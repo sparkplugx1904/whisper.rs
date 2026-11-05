@@ -1,3 +1,5 @@
+use rayon::prelude::*;
+
 pub const GELU_COEF_A: f32 = 0.044715;
 pub const SQRT_2_OVER_PI: f32 = 0.797_884_6;
 
@@ -7,7 +9,15 @@ pub fn gelu_scalar(x: f32) -> f32 {
 }
 
 pub fn gelu_inplace(data: &mut [f32]) {
-    for val in data.iter_mut() {
-        *val = gelu_scalar(*val);
+    if data.len() >= 4096 {
+        data.par_chunks_mut(4096).for_each(|chunk| {
+            for val in chunk.iter_mut() {
+                *val = gelu_scalar(*val);
+            }
+        });
+    } else {
+        for val in data.iter_mut() {
+            *val = gelu_scalar(*val);
+        }
     }
 }

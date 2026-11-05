@@ -53,6 +53,14 @@ pub struct WhisperParams {
     pub split_on_word: bool,
     /// Length penalty exponent for beam search (default: 0.7)
     pub length_penalty: f32,
+    /// Pre-computed raw token ID array for context priming
+    pub prompt_tokens: Vec<i32>,
+    /// Disable context carryover between 30-second audio windows (default: false)
+    pub no_context: bool,
+    /// Carry over initial text prompt across subsequent 30s windows (default: false)
+    pub carry_initial_prompt: bool,
+    /// Entropy threshold for dynamic temperature fallback (default: 2.40)
+    pub entropy_thold: f32,
 }
 
 impl std::fmt::Debug for WhisperParams {
@@ -90,10 +98,14 @@ impl Default for WhisperParams {
             flash_attn: false,
             tdrz_enable: false,
             dtw_aheads_preset: crate::dtw::AlignmentHeadsPreset::TinyEn,
-            repetition_penalty: 1.0,
             max_len: 0,
             split_on_word: false,
+            repetition_penalty: 1.0,
             length_penalty: 0.7,
+            prompt_tokens: Vec::new(),
+            no_context: false,
+            carry_initial_prompt: false,
+            entropy_thold: 2.40,
             on_new_segment: None,
             on_progress: None,
         }
@@ -212,6 +224,25 @@ impl FullParamsBuilder {
         self
     }
 
+    pub fn prompt_tokens(mut self, tokens: Vec<i32>) -> Self {
+        self.params.prompt_tokens = tokens;
+        self
+    }
+
+    pub fn no_context(mut self, no_context: bool) -> Self {
+        self.params.no_context = no_context;
+        self
+    }
+
+    pub fn carry_initial_prompt(mut self, carry: bool) -> Self {
+        self.params.carry_initial_prompt = carry;
+        self
+    }
+
+    pub fn entropy_thold(mut self, thold: f32) -> Self {
+        self.params.entropy_thold = thold;
+        self
+    }
     pub fn build(self) -> WhisperParams {
         self.params
     }

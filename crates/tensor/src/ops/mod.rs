@@ -5,7 +5,7 @@ pub mod matmul;
 pub mod norm;
 pub mod quant;
 pub mod softmax;
-pub use attention::{flash_attention_2, multi_head_attention};
+pub use attention::{flash_attention_2, multi_head_attention, single_token_mha_d64};
 pub use conv::{conv1d_c_first, conv1d_t_first};
 pub use gelu::{gelu_inplace, gelu_scalar};
 pub use matmul::{add_inplace, linear};

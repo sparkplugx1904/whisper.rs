@@ -424,7 +424,6 @@ impl WhisperDecoder {
         logits
     }
 }
-
 /// Specialized causal multi-head self-attention with KV cache.
 /// `t_past`: number of tokens already in cache before this batch.
 /// Each query token `i` in `0..n_tokens` has position `t_past + i`,
@@ -447,9 +446,13 @@ fn multi_head_attention_with_cache(
     assert_eq!(v.len(), total_tokens * d_model);
     assert_eq!(output.len(), n_tokens * d_model);
 
+    if n_tokens == 1 && d_head == 64 {
+        whisper_tensor::ops::single_token_mha_d64(q, k, v, t_past + 1, n_heads, d_model, output);
+        return;
+    }
+
     let scale = 1.0f32 / (d_head as f32).sqrt();
     let mut scores = vec![0.0f32; total_tokens];
-
     for h in 0..n_heads {
         let head_offset = h * d_head;
 
@@ -473,6 +476,9 @@ fn multi_head_attention_with_cache(
 
             for j in 0..max_j {
                 let weight = scores[j];
+                if weight < 1e-7 {
+                    continue;
+                }
                 let v_vec = &v[j * d_model + head_offset..j * d_model + head_offset + d_head];
                 for d in 0..d_head {
                     out_vec[d] += weight * v_vec[d];

@@ -1,4 +1,4 @@
-use crate::simd::dot_f32;
+use crate::simd::{dot_f32, gemv_f32};
 use rayon::prelude::*;
 
 pub fn linear(
@@ -44,22 +44,51 @@ pub fn linear_parallel(
 
     let n_threads = n_threads.clamp(1, 16);
 
-    // When num_tokens is small (e.g. single-token decoding), run sequentially to eliminate thread dispatch overhead
-    if n_threads == 1 || num_tokens < 16 {
-        linear_sequential(
-            input,
-            weight,
-            bias,
-            in_features,
-            out_features,
-            0..num_tokens,
-            0..out_features,
-            output,
-        );
+    // When num_tokens is small (e.g. single-token decoding), use optimized GEMV microkernels
+    if num_tokens == 1 {
+        let in_row = &input[..in_features];
+        if n_threads > 1 && out_features >= 1024 {
+            let chunk_size = out_features.div_ceil(n_threads).div_ceil(4) * 4;
+            output
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(chunk_idx, out_chunk)| {
+                    let r_start = chunk_idx * chunk_size;
+                    let r_count = out_chunk.len();
+                    let w_chunk = &weight[r_start * in_features..(r_start + r_count) * in_features];
+                    let b_chunk = bias.map(|b| &b[r_start..r_start + r_count]);
+                    gemv_f32(in_row, w_chunk, b_chunk, out_chunk, in_features, r_count);
+                });
+        } else {
+            gemv_f32(in_row, weight, bias, output, in_features, out_features);
+        }
         return;
     }
 
-    // Parallelize across tokens using Rayon's thread pool
+    if num_tokens < 16 {
+        for t in 0..num_tokens {
+            let in_row = &input[t * in_features..(t + 1) * in_features];
+            let out_token = &mut output[t * out_features..(t + 1) * out_features];
+            if n_threads > 1 && out_features >= 1024 {
+                let chunk_size = out_features.div_ceil(n_threads).div_ceil(4) * 4;
+                out_token
+                    .par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(chunk_idx, out_chunk)| {
+                        let r_start = chunk_idx * chunk_size;
+                        let r_count = out_chunk.len();
+                        let w_chunk = &weight[r_start * in_features..(r_start + r_count) * in_features];
+                        let b_chunk = bias.map(|b| &b[r_start..r_start + r_count]);
+                        gemv_f32(in_row, w_chunk, b_chunk, out_chunk, in_features, r_count);
+                    });
+            } else {
+                gemv_f32(in_row, weight, bias, out_token, in_features, out_features);
+            }
+        }
+        return;
+    }
+
+    // Parallelize across token chunks using Rayon and BLIS-optimized GEMM microkernels
     let chunk_size = num_tokens.div_ceil(n_threads);
     output
         .par_chunks_mut(chunk_size * out_features)
@@ -69,23 +98,36 @@ pub fn linear_parallel(
             let t_count = out_chunk.len() / out_features;
             let in_chunk = &input[t_start * in_features..(t_start + t_count) * in_features];
 
-            for t in 0..t_count {
-                let in_row = &in_chunk[t * in_features..(t + 1) * in_features];
-                let out_row = &mut out_chunk[t * out_features..(t + 1) * out_features];
+            unsafe {
+                matrixmultiply::sgemm(
+                    t_count,
+                    in_features,
+                    out_features,
+                    1.0,
+                    in_chunk.as_ptr(),
+                    in_features as isize,
+                    1,
+                    weight.as_ptr(),
+                    1,
+                    in_features as isize,
+                    0.0,
+                    out_chunk.as_mut_ptr(),
+                    out_features as isize,
+                    1,
+                );
+            }
 
-                for r in 0..out_features {
-                    let w_row = &weight[r * in_features..(r + 1) * in_features];
-                    let mut dot = dot_f32(in_row, w_row);
-                    if let Some(b) = bias {
-                        dot += b[r];
+            if let Some(b) = bias {
+                for t in 0..t_count {
+                    let out_row = &mut out_chunk[t * out_features..(t + 1) * out_features];
+                    for (r, &b_val) in b.iter().enumerate() {
+                        out_row[r] += b_val;
                     }
-                    out_row[r] = dot;
                 }
             }
         });
 }
-
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 fn linear_sequential(
     input: &[f32],
     weight: &[f32],
@@ -113,7 +155,17 @@ fn linear_sequential(
 
 pub fn add_inplace(a: &mut [f32], b: &[f32]) {
     assert_eq!(a.len(), b.len());
-    for (val_a, &val_b) in a.iter_mut().zip(b) {
-        *val_a += val_b;
+    if a.len() >= 8192 {
+        a.par_chunks_mut(4096)
+            .zip(b.par_chunks(4096))
+            .for_each(|(a_chunk, b_chunk)| {
+                for (val_a, &val_b) in a_chunk.iter_mut().zip(b_chunk) {
+                    *val_a += val_b;
+                }
+            });
+    } else {
+        for (val_a, &val_b) in a.iter_mut().zip(b) {
+            *val_a += val_b;
+        }
     }
 }

@@ -9,6 +9,7 @@ pub struct Segment {
     pub words: Vec<WordTiming>,
     pub avg_logprob: f32,
     pub no_speech_prob: f32,
+    pub avg_entropy: f32,
 }
 
 impl Segment {
@@ -21,6 +22,7 @@ impl Segment {
             words: Vec::new(),
             avg_logprob: -0.2,
             no_speech_prob: 0.01,
+            avg_entropy: 0.5,
         }
     }
 
@@ -39,6 +41,7 @@ impl Segment {
             words,
             avg_logprob: -0.2,
             no_speech_prob: 0.01,
+            avg_entropy: 0.5,
         }
     }
 
@@ -50,6 +53,7 @@ impl Segment {
         words: Vec<WordTiming>,
         avg_logprob: f32,
         no_speech_prob: f32,
+        avg_entropy: f32,
     ) -> Self {
         Self {
             t0,
@@ -59,183 +63,181 @@ impl Segment {
             words,
             avg_logprob,
             no_speech_prob,
+            avg_entropy,
         }
     }
 
-    /// Format as SRT subtitle entry
+    /// Format as SRT subtitle entry (delegates to `format_srt`).
     pub fn to_srt(&self, index: usize) -> String {
-        let fmt_time = |secs: f64| {
-            let s_clamped = if secs.is_finite() && secs >= 0.0 {
-                secs
-            } else {
-                0.0
-            };
-            let total_ms = (s_clamped * 1000.0).round() as u64;
-            let ms = total_ms % 1000;
-            let total_s = total_ms / 1000;
-            let s = total_s % 60;
-            let total_m = total_s / 60;
-            let m = total_m % 60;
-            let h = total_m / 60;
-            format!("{:02}:{:02}:{:02},{:03}", h, m, s, ms)
-        };
-        format!(
-            "{}\n{} --> {}\n{}\n\n",
-            index,
-            fmt_time(self.t0),
-            fmt_time(self.t1),
-            self.text.trim()
-        )
+        format_srt(self, index)
     }
 
-    /// Format as VTT subtitle entry
+    /// Format as VTT subtitle entry (delegates to `format_vtt`).
     pub fn to_vtt(&self) -> String {
-        let fmt_time = |secs: f64| {
-            let s_clamped = if secs.is_finite() && secs >= 0.0 {
-                secs
-            } else {
-                0.0
-            };
-            let total_ms = (s_clamped * 1000.0).round() as u64;
-            let ms = total_ms % 1000;
-            let total_s = total_ms / 1000;
-            let s = total_s % 60;
-            let total_m = total_s / 60;
-            let m = total_m % 60;
-            let h = total_m / 60;
-            format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
-        };
-        format!(
-            "{} --> {}\n{}\n\n",
-            fmt_time(self.t0),
-            fmt_time(self.t1),
-            self.text.trim()
-        )
+        format_vtt(self)
     }
 
     /// Format as Karaoke WebVTT subtitle entry with word-level timing tags `<HH:MM:SS.mmm>word`.
     pub fn to_karaoke_vtt(&self) -> String {
-        let fmt_vtt = |secs: f64| {
-            let s_clamped = if secs.is_finite() && secs >= 0.0 {
-                secs
-            } else {
-                0.0
-            };
-            let total_ms = (s_clamped * 1000.0).round() as u64;
-            let ms = total_ms % 1000;
-            let total_s = total_ms / 1000;
-            let s = total_s % 60;
-            let total_m = total_s / 60;
-            let m = total_m % 60;
-            let h = total_m / 60;
-            format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
-        };
-
-        let mut body = String::new();
-        if self.words.is_empty() {
-            body.push_str(self.text.trim());
-        } else {
-            for (i, w) in self.words.iter().enumerate() {
-                if i > 0 {
-                    body.push(' ');
-                }
-                body.push_str(&format!("<{}>{}", fmt_vtt(w.t0), w.word));
-            }
-        }
-
-        format!(
-            "{} --> {}\n{}\n\n",
-            fmt_vtt(self.t0),
-            fmt_vtt(self.t1),
-            body
-        )
+        format_karaoke_vtt(self)
     }
 
     /// Format as Karaoke SubRip subtitle entry with word-level timing tags `<HH:MM:SS,mmm>word`.
     pub fn to_karaoke_srt(&self, index: usize) -> String {
-        let fmt_srt = |secs: f64| {
-            let s_clamped = if secs.is_finite() && secs >= 0.0 {
-                secs
-            } else {
-                0.0
-            };
-            let total_ms = (s_clamped * 1000.0).round() as u64;
-            let ms = total_ms % 1000;
-            let total_s = total_ms / 1000;
-            let s = total_s % 60;
-            let total_m = total_s / 60;
-            let m = total_m % 60;
-            let h = total_m / 60;
-            format!("{:02}:{:02}:{:02},{:03}", h, m, s, ms)
-        };
-
-        let mut body = String::new();
-        if self.words.is_empty() {
-            body.push_str(self.text.trim());
-        } else {
-            for (i, w) in self.words.iter().enumerate() {
-                if i > 0 {
-                    body.push(' ');
-                }
-                body.push_str(&format!("<{}>{}", fmt_srt(w.t0), w.word));
-            }
-        }
-
-        format!(
-            "{}\n{} --> {}\n{}\n\n",
-            index,
-            fmt_srt(self.t0),
-            fmt_srt(self.t1),
-            body
-        )
+        format_karaoke_srt(self, index)
     }
 
-    /// Format as JSON segment object with `start`, `end`, and `text`
+    /// Format as JSON segment object with `start`, `end`, and `text`.
     pub fn to_json(&self) -> String {
-        let t0 = if self.t0.is_finite() && self.t0 >= 0.0 {
-            self.t0
-        } else {
-            0.0
-        };
-        let t1 = if self.t1.is_finite() && self.t1 >= 0.0 {
-            self.t1
-        } else {
-            0.0
-        };
-        if self.words.is_empty() {
-            format!(
-                "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}}}",
-                t0,
-                t1,
-                escape_json(self.text.trim()),
-                self.avg_logprob,
-                self.no_speech_prob
-            )
-        } else {
-            let words_json = self
-                .words
-                .iter()
-                .map(|w| {
-                    format!(
-                        "{{\"word\": \"{}\", \"start\": {:.3}, \"end\": {:.3}, \"probability\": {:.4}}}",
-                        escape_json(&w.word),
-                        w.t0,
-                        w.t1,
-                        w.probability
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}, \"words\": [{}]}}",
-                t0,
-                t1,
-                escape_json(self.text.trim()),
-                self.avg_logprob,
-                self.no_speech_prob,
-                words_json
-            )
+        format_json(self)
+    }
+}
+
+/// Format a timestamp in seconds to `HH:MM:SS,mmm` (SRT style).
+fn fmt_time_srt(secs: f64) -> String {
+    let s_clamped = if secs.is_finite() && secs >= 0.0 {
+        secs
+    } else {
+        0.0
+    };
+    let total_ms = (s_clamped * 1000.0).round() as u64;
+    let ms = total_ms % 1000;
+    let total_s = total_ms / 1000;
+    let s = total_s % 60;
+    let total_m = total_s / 60;
+    let m = total_m % 60;
+    let h = total_m / 60;
+    format!("{:02}:{:02}:{:02},{:03}", h, m, s, ms)
+}
+
+/// Format a timestamp in seconds to `HH:MM:SS.mmm` (VTT style).
+fn fmt_time_vtt(secs: f64) -> String {
+    let s_clamped = if secs.is_finite() && secs >= 0.0 {
+        secs
+    } else {
+        0.0
+    };
+    let total_ms = (s_clamped * 1000.0).round() as u64;
+    let ms = total_ms % 1000;
+    let total_s = total_ms / 1000;
+    let s = total_s % 60;
+    let total_m = total_s / 60;
+    let m = total_m % 60;
+    let h = total_m / 60;
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+}
+
+/// Render segment as SRT subtitle string (SRP).
+pub fn format_srt(segment: &Segment, index: usize) -> String {
+    format!(
+        "{}\n{} --> {}\n{}\n\n",
+        index,
+        fmt_time_srt(segment.t0),
+        fmt_time_srt(segment.t1),
+        segment.text.trim()
+    )
+}
+
+/// Render segment as VTT subtitle string (SRP).
+pub fn format_vtt(segment: &Segment) -> String {
+    format!(
+        "{} --> {}\n{}\n\n",
+        fmt_time_vtt(segment.t0),
+        fmt_time_vtt(segment.t1),
+        segment.text.trim()
+    )
+}
+
+/// Render segment as Karaoke VTT string (SRP).
+pub fn format_karaoke_vtt(segment: &Segment) -> String {
+    let mut body = String::new();
+    if segment.words.is_empty() {
+        body.push_str(segment.text.trim());
+    } else {
+        for (i, w) in segment.words.iter().enumerate() {
+            if i > 0 {
+                body.push(' ');
+            }
+            body.push_str(&format!("<{}>{}", fmt_time_vtt(w.t0), w.word));
         }
+    }
+
+    format!(
+        "{} --> {}\n{}\n\n",
+        fmt_time_vtt(segment.t0),
+        fmt_time_vtt(segment.t1),
+        body
+    )
+}
+
+/// Render segment as Karaoke SRT string (SRP).
+pub fn format_karaoke_srt(segment: &Segment, index: usize) -> String {
+    let mut body = String::new();
+    if segment.words.is_empty() {
+        body.push_str(segment.text.trim());
+    } else {
+        for (i, w) in segment.words.iter().enumerate() {
+            if i > 0 {
+                body.push(' ');
+            }
+            body.push_str(&format!("<{}>{}", fmt_time_srt(w.t0), w.word));
+        }
+    }
+
+    format!(
+        "{}\n{} --> {}\n{}\n\n",
+        index,
+        fmt_time_srt(segment.t0),
+        fmt_time_srt(segment.t1),
+        body
+    )
+}
+
+/// Render segment as JSON string (SRP).
+pub fn format_json(segment: &Segment) -> String {
+    let t0 = if segment.t0.is_finite() && segment.t0 >= 0.0 {
+        segment.t0
+    } else {
+        0.0
+    };
+    let t1 = if segment.t1.is_finite() && segment.t1 >= 0.0 {
+        segment.t1
+    } else {
+        0.0
+    };
+    if segment.words.is_empty() {
+        format!(
+            "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}}}",
+            t0,
+            t1,
+            escape_json(segment.text.trim()),
+            segment.avg_logprob,
+            segment.no_speech_prob
+        )
+    } else {
+        let words_json = segment
+            .words
+            .iter()
+            .map(|w| {
+                format!(
+                    "{{\"word\": \"{}\", \"start\": {:.3}, \"end\": {:.3}, \"probability\": {:.4}}}",
+                    escape_json(&w.word),
+                    w.t0,
+                    w.t1,
+                    w.probability
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}, \"words\": [{}]}}",
+            t0,
+            t1,
+            escape_json(segment.text.trim()),
+            segment.avg_logprob,
+            segment.no_speech_prob,
+            words_json
+        )
     }
 }
 

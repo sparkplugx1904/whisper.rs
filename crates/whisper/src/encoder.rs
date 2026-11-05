@@ -1,7 +1,7 @@
 use whisper_model::{ModelError, WhisperModel};
 use whisper_tensor::ops::{
-    add_inplace, conv1d_c_first, conv1d_t_first, gelu_inplace, layer_norm, linear,
-    multi_head_attention,
+    add_inplace, conv1d_c_first, conv1d_t_first, flash_attention_2, gelu_inplace, layer_norm,
+    linear,
 };
 
 #[derive(Clone)]
@@ -13,9 +13,10 @@ pub struct EncoderBlockWeights {
     pub attn_k_w: Vec<f32>,
     pub attn_v_w: Vec<f32>,
     pub attn_v_b: Vec<f32>,
+    pub attn_qkv_w: Vec<f32>,
+    pub attn_qkv_b: Vec<f32>,
     pub attn_out_w: Vec<f32>,
     pub attn_out_b: Vec<f32>,
-
     pub mlp_ln_w: Vec<f32>,
     pub mlp_ln_b: Vec<f32>,
     pub mlp0_w: Vec<f32>,
@@ -49,17 +50,35 @@ impl EncoderWeights {
 
         for l in 0..n_layers {
             let prefix = format!("encoder.blocks.{}", l);
+            let attn_q_w = model.get_tensor_f32(&format!("{}.attn.query.weight", prefix))?;
+            let attn_q_b = model.get_tensor_f32(&format!("{}.attn.query.bias", prefix))?;
+            let attn_k_w = model.get_tensor_f32(&format!("{}.attn.key.weight", prefix))?;
+            let attn_v_w = model.get_tensor_f32(&format!("{}.attn.value.weight", prefix))?;
+            let attn_v_b = model.get_tensor_f32(&format!("{}.attn.value.bias", prefix))?;
+
+            let d_model = model.hparams.n_audio_state as usize;
+            let mut attn_qkv_w = Vec::with_capacity(3 * d_model * d_model);
+            attn_qkv_w.extend_from_slice(&attn_q_w);
+            attn_qkv_w.extend_from_slice(&attn_k_w);
+            attn_qkv_w.extend_from_slice(&attn_v_w);
+
+            let mut attn_qkv_b = Vec::with_capacity(3 * d_model);
+            attn_qkv_b.extend_from_slice(&attn_q_b);
+            attn_qkv_b.extend(std::iter::repeat(0.0).take(d_model)); // Key has no bias
+            attn_qkv_b.extend_from_slice(&attn_v_b);
+
             let block = EncoderBlockWeights {
                 attn_ln_w: model.get_tensor_f32(&format!("{}.attn_ln.weight", prefix))?,
                 attn_ln_b: model.get_tensor_f32(&format!("{}.attn_ln.bias", prefix))?,
-                attn_q_w: model.get_tensor_f32(&format!("{}.attn.query.weight", prefix))?,
-                attn_q_b: model.get_tensor_f32(&format!("{}.attn.query.bias", prefix))?,
-                attn_k_w: model.get_tensor_f32(&format!("{}.attn.key.weight", prefix))?,
-                attn_v_w: model.get_tensor_f32(&format!("{}.attn.value.weight", prefix))?,
-                attn_v_b: model.get_tensor_f32(&format!("{}.attn.value.bias", prefix))?,
+                attn_q_w,
+                attn_q_b,
+                attn_k_w,
+                attn_v_w,
+                attn_v_b,
+                attn_qkv_w,
+                attn_qkv_b,
                 attn_out_w: model.get_tensor_f32(&format!("{}.attn.out.weight", prefix))?,
                 attn_out_b: model.get_tensor_f32(&format!("{}.attn.out.bias", prefix))?,
-
                 mlp_ln_w: model.get_tensor_f32(&format!("{}.mlp_ln.weight", prefix))?,
                 mlp_ln_b: model.get_tensor_f32(&format!("{}.mlp_ln.bias", prefix))?,
                 mlp0_w: model.get_tensor_f32(&format!("{}.mlp.0.weight", prefix))?,
@@ -112,11 +131,15 @@ impl WhisperEncoder {
     /// `mel_chunk`: flattened mel spectrogram slice of size [n_mels, 3000].
     /// Returns encoded output of size [1500, d_model].
     pub fn forward(&self, mel_chunk: &[f32]) -> Vec<f32> {
+        let do_profile = std::env::var("WHISPER_PROFILE").is_ok();
+        let t_start = std::time::Instant::now();
+
         let l_in = 2 * self.n_audio_ctx; // 3000 frames
         assert_eq!(mel_chunk.len(), self.n_mels * l_in);
 
         // 1. Conv1: [n_mels, 3000] -> [d_model, 3000] with GELU
         let mut conv1_out = vec![0.0f32; self.d_model * l_in];
+        let t0 = std::time::Instant::now();
         conv1d_c_first(
             mel_chunk,
             &self.weights.conv1_w,
@@ -130,10 +153,12 @@ impl WhisperEncoder {
             true,
             &mut conv1_out,
         );
+        let d_conv1 = t0.elapsed();
 
         // 2. Conv2: [d_model, 3000] -> [1500, d_model] with GELU
         let l_out = self.n_audio_ctx; // 1500 tokens
         let mut x = vec![0.0f32; l_out * self.d_model];
+        let t0 = std::time::Instant::now();
         conv1d_t_first(
             &conv1_out,
             &self.weights.conv2_w,
@@ -147,6 +172,7 @@ impl WhisperEncoder {
             true,
             &mut x,
         );
+        let d_conv2 = t0.elapsed();
 
         // 3. Add positional embedding
         assert_eq!(
@@ -154,7 +180,6 @@ impl WhisperEncoder {
             l_out * self.d_model
         );
         add_inplace(&mut x, &self.weights.positional_embedding);
-
         // Workspace buffers to avoid allocations per layer
         let mut norm_buf = vec![0.0f32; l_out * self.d_model];
         let mut q_buf = vec![0.0f32; l_out * self.d_model];
@@ -162,10 +187,10 @@ impl WhisperEncoder {
         let mut v_buf = vec![0.0f32; l_out * self.d_model];
         let mut attn_out = vec![0.0f32; l_out * self.d_model];
         let mut proj_out = vec![0.0f32; l_out * self.d_model];
+        let mut qkv_buf = vec![0.0f32; l_out * 3 * self.d_model];
 
         let d_mlp = self.d_model * 4;
         let mut mlp0_out = vec![0.0f32; l_out * d_mlp];
-
         // 4. Transformer blocks
         for block in &self.weights.blocks {
             // (a) Pre-LN for attention
@@ -178,38 +203,26 @@ impl WhisperEncoder {
                 self.d_model,
                 &mut norm_buf,
             );
-
-            // (b) Self-Attention Q, K, V projections
             linear(
                 &norm_buf,
-                &block.attn_q_w,
-                Some(&block.attn_q_b),
+                &block.attn_qkv_w,
+                Some(&block.attn_qkv_b),
                 self.d_model,
-                self.d_model,
+                3 * self.d_model,
                 l_out,
-                &mut q_buf,
-            );
-            linear(
-                &norm_buf,
-                &block.attn_k_w,
-                None, // Note: Whisper encoder key projection has no bias
-                self.d_model,
-                self.d_model,
-                l_out,
-                &mut k_buf,
-            );
-            linear(
-                &norm_buf,
-                &block.attn_v_w,
-                Some(&block.attn_v_b),
-                self.d_model,
-                self.d_model,
-                l_out,
-                &mut v_buf,
+                &mut qkv_buf,
             );
 
-            // (c) Multi-Head Attention
-            multi_head_attention(
+            let d_m = self.d_model;
+            let chunk_qkv = 3 * d_m;
+            for i in 0..l_out {
+                let row = &qkv_buf[i * chunk_qkv..(i + 1) * chunk_qkv];
+                q_buf[i * d_m..(i + 1) * d_m].copy_from_slice(&row[..d_m]);
+                k_buf[i * d_m..(i + 1) * d_m].copy_from_slice(&row[d_m..2 * d_m]);
+                v_buf[i * d_m..(i + 1) * d_m].copy_from_slice(&row[2 * d_m..]);
+            }
+            // (c) Multi-Head Attention with Flash Attention 2
+            flash_attention_2(
                 &q_buf,
                 &k_buf,
                 &v_buf,
@@ -221,7 +234,6 @@ impl WhisperEncoder {
                 &mut attn_out,
             );
 
-            // (d) Out projection & residual
             linear(
                 &attn_out,
                 &block.attn_out_w,
@@ -243,8 +255,6 @@ impl WhisperEncoder {
                 self.d_model,
                 &mut norm_buf,
             );
-
-            // (f) MLP: linear 0 -> GELU -> linear 2 -> residual
             linear(
                 &norm_buf,
                 &block.mlp0_w,
@@ -267,7 +277,6 @@ impl WhisperEncoder {
             );
             add_inplace(&mut x, &proj_out);
         }
-
         // 5. Final LayerNorm
         let mut final_out = vec![0.0f32; l_out * self.d_model];
         layer_norm(
@@ -279,6 +288,16 @@ impl WhisperEncoder {
             self.d_model,
             &mut final_out,
         );
+        if do_profile {
+            let total = t_start.elapsed();
+            eprintln!(
+                "[PROFILE ENCODER] Total: {:.2}ms | Conv1: {:.2}ms | Conv2: {:.2}ms | Blocks: {:.2}ms",
+                total.as_secs_f64() * 1000.0,
+                d_conv1.as_secs_f64() * 1000.0,
+                d_conv2.as_secs_f64() * 1000.0,
+                (total - d_conv1 - d_conv2).as_secs_f64() * 1000.0
+            );
+        }
 
         final_out
     }

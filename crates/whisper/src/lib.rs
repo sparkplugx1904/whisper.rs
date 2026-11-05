@@ -16,9 +16,17 @@ pub use dtw::{
     align_dtw, get_alignment_heads, merge_tokens_to_words, AlignmentHeadsPreset, WordTiming,
 };
 pub use encoder::{EncoderBlockWeights, EncoderWeights, WhisperEncoder};
-pub use filter::{compression_ratio, compute_token_logprob};
+pub use filter::{
+    apply_repetition_penalty, apply_suppress_blank, apply_suppress_non_speech, compression_ratio,
+    compute_distribution_entropy, compute_token_logprob, GrammarLogitFilter, LogitFilter,
+    LogitFilterContext, LogitFilterPipeline, RepetitionPenaltyFilter, SuppressBlankFilter,
+    SuppressNonSpeechFilter, TimestampLogitFilter,
+};
 pub use params::{FullParamsBuilder, SamplingStrategy, WhisperParams};
-pub use segment::Segment;
+pub use segment::{
+    format_json, format_karaoke_srt, format_karaoke_vtt, format_srt, format_vtt, Segment,
+};
+pub use transcribe::{FallbackEvaluation, WindowPromptBuilder};
 pub use state::WhisperState;
 pub use transcribe::WhisperContext;
 

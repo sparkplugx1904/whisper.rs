@@ -1,5 +1,6 @@
 use crate::fft::{Fft400, N_FFT};
 use crate::wav::WHISPER_SAMPLE_RATE;
+use rayon::prelude::*;
 use std::f32::consts::PI;
 
 pub const HOP_LENGTH: usize = 160;
@@ -131,8 +132,6 @@ pub fn compute_log_mel_spectrogram(
     };
 
     let hann = hann_window(frame_size);
-    let fft = Fft400::new();
-
     // Padding
     let stage_1_pad = (WHISPER_SAMPLE_RATE as usize) * 30; // 480000
     let stage_2_pad = frame_size / 2; // 200
@@ -157,44 +156,58 @@ pub fn compute_log_mel_spectrogram(
     };
     let mut mel_data = vec![0.0f32; n_mel * n_len];
 
-    let mut fft_in = vec![0.0f32; frame_size];
-    let mut fft_out = vec![0.0f32; frame_size * 2];
-    let mut power = vec![0.0f32; n_fft_bins];
-
     let n_samples_stage2 = n_samples + stage_2_pad;
     let active_frames = ((n_samples_stage2 / frame_step) + 1).min(n_len);
 
-    for i in 0..active_frames {
-        let offset = i * frame_step;
-        let valid_samples = if offset < n_samples_stage2 {
-            frame_size.min(n_samples_stage2 - offset)
-        } else {
-            0
-        };
+    const N_FFT_BINS: usize = 1 + N_FFT / 2;
 
-        for (j, &s) in samples_padded[offset..offset + valid_samples]
-            .iter()
-            .enumerate()
-        {
-            fft_in[j] = hann[j] * s;
-        }
-        fft_in[valid_samples..frame_size].fill(0.0);
-        fft.compute(&fft_in, &mut fft_out);
+    let active_mel: Vec<Vec<f32>> = (0..active_frames)
+        .into_par_iter()
+        .map(|i| {
+            let fft = Fft400::new();
+            let mut fft_in = [0.0f32; N_FFT];
+            let mut fft_out = [0.0f32; N_FFT * 2];
+            let mut power = [0.0f32; N_FFT_BINS];
+            let mut frame_out = vec![0.0f32; n_mel];
 
-        for j in 0..n_fft_bins {
-            let re = fft_out[2 * j];
-            let im = fft_out[2 * j + 1];
-            power[j] = re * re + im * im;
-        }
+            let offset = i * frame_step;
+            let valid_samples = if offset < n_samples_stage2 {
+                N_FFT.min(n_samples_stage2 - offset)
+            } else {
+                0
+            };
 
-        for j in 0..n_mel {
-            let filter_row = &filters[j * n_fft_bins..(j + 1) * n_fft_bins];
-            let mut sum = 0.0f32;
-            for k in 0..n_fft_bins {
-                sum += power[k] * filter_row[k];
+            for (j, &s) in samples_padded[offset..offset + valid_samples]
+                .iter()
+                .enumerate()
+            {
+                fft_in[j] = hann[j] * s;
             }
-            let log_val = (sum.max(1e-10)).log10();
-            mel_data[j * n_len + i] = log_val;
+            fft_in[valid_samples..N_FFT].fill(0.0);
+            fft.compute(&fft_in, &mut fft_out);
+
+            for j in 0..N_FFT_BINS {
+                let re = fft_out[2 * j];
+                let im = fft_out[2 * j + 1];
+                power[j] = re * re + im * im;
+            }
+
+            for j in 0..n_mel {
+                let filter_row = &filters[j * N_FFT_BINS..(j + 1) * N_FFT_BINS];
+                let mut sum = 0.0f32;
+                for k in 0..N_FFT_BINS {
+                    sum += power[k] * filter_row[k];
+                }
+                frame_out[j] = (sum.max(1e-10)).log10();
+            }
+
+            frame_out
+        })
+        .collect();
+
+    for (i, frame) in active_mel.into_iter().enumerate() {
+        for j in 0..n_mel {
+            mel_data[j * n_len + i] = frame[j];
         }
     }
 

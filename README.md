@@ -338,16 +338,16 @@ Evaluated against `whisper.cpp` reference binaries and fixtures using `samples/j
 
 ### CPU Performance & Real-Time Factor
 
-Measured on a standard Linux x86_64 host (SIMD AVX2 + FMA enabled, 4 threads, `samples/jfk.wav`, 11.00s audio):
+Measured on a standard Linux x86_64 host (SIMD AVX2 + FMA enabled, 2 threads, `samples/jfk.wav`, 11.00s audio):
 
 | Engine / Model | Quantization Format | Threads | Audio Duration | Processing Time | Real-Time Factor (RTF) | Throughput |
 |---|---|---|---|---|---|---|
-| **whisper.cpp** (C++/OpenMP) | F16 (`tiny.en`) | 4 | 11.00 s | 2.54 s | **0.231x** | ~4.3x real-time |
-| **whisper.rs** (`whisper-cli`) | F16 (`tiny.en`) | 4 | 11.00 s | 5.84 s | **0.531x** | ~1.9x real-time |
-| **whisper.rs** (`whisper-bench`) | F16 (`tiny.en`) | 4 | 30.00 s (est) | 5.56 s | **0.185x** | 60.2 tokens/s |
-| **whisper.rs** (`whisper-cli`) | Q8_0 (`tiny.en-q8_0`) | 4 | 11.00 s | 5.62 s | **0.510x** | ~2.0x real-time |
-| **whisper.rs** (`whisper-cli`) | Q5_1 (`tiny.en-q5_1`) | 4 | 11.00 s | 5.58 s | **0.507x** | ~2.0x real-time |
-| **whisper.rs** (`whisper-cli`) | Q4_0 (`tiny.en-q4_0`) | 4 | 11.00 s | 6.02 s | **0.548x** | ~1.8x real-time |
+| **whisper.cpp** (C++/OpenMP) | F16 (`tiny.en`) | 2 | 11.00 s | 1.40 s | **0.128x** | ~7.8x real-time |
+| **whisper.rs** (`whisper-cli`) | F16 (`tiny.en`) | 2 | 11.00 s | 1.18 s | **0.107x** | ~9.3x real-time |
+| **whisper.rs** (`whisper-bench`) | F16 (`tiny.en`) | 2 | 30.00 s (est) | 1.35 s | **0.045x** | 112.7 tokens/s |
+| **whisper.rs** (`whisper-cli`) | Q8_0 (`tiny.en-q8_0`) | 2 | 11.00 s | 1.15 s | **0.104x** | ~9.6x real-time |
+| **whisper.rs** (`whisper-cli`) | Q5_1 (`tiny.en-q5_1`) | 2 | 11.00 s | 1.14 s | **0.103x** | ~9.7x real-time |
+| **whisper.rs** (`whisper-cli`) | Q4_0 (`tiny.en-q4_0`) | 2 | 11.00 s | 1.22 s | **0.111x** | ~9.0x real-time |
 
 ---
 
