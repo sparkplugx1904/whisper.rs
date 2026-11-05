@@ -66,14 +66,6 @@ local.properties
 .log
 .exe
 
-# AGENTS
-.pi/SYSTEM.md
-NOTES.md
-PROGRESS.md
-REPORT.md
-PROMPT.md
-AGENTS.md
-
 target/
 models/*.bin
 !models/for-tests-*.bin

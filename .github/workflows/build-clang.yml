@@ -1,4 +1,4 @@
-name: Toolchain Lints & Audit (build-clang parity)
+name: Toolchain Lints & Audit
 
 on:
   push:

@@ -1,4 +1,4 @@
-name: Compiler Channels (build-gcc parity)
+name: Compiler Channels Matrix
 
 on:
   push:
