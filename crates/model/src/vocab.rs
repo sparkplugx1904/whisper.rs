@@ -222,6 +222,14 @@ impl Vocab {
         }
 
         let total_vocab = hparams.n_vocab as usize;
+
+        // Every special token ID (token_beg is the largest) must be a valid index into the logits
+        if total_vocab <= token_beg as usize {
+            return Err(ModelError::FormatError(format!(
+                "invalid model: n_vocab ({}) must be greater than token_beg ({})",
+                total_vocab, token_beg
+            )));
+        }
         if n_vocab_file < total_vocab {
             for (i, slot) in id_to_token
                 .iter_mut()

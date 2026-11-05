@@ -22,7 +22,7 @@ pub use filter::{
     LogitFilterContext, LogitFilterPipeline, RepetitionPenaltyFilter, SuppressBlankFilter,
     SuppressNonSpeechFilter, TimestampLogitFilter,
 };
-pub use params::{FullParamsBuilder, SamplingStrategy, WhisperParams};
+pub use params::{AbortCallback, FullParamsBuilder, SamplingStrategy, WhisperParams};
 pub use segment::{
     format_json, format_karaoke_srt, format_karaoke_vtt, format_srt, format_vtt, Segment,
 };

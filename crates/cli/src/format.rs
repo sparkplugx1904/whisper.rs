@@ -123,13 +123,75 @@ impl OutputFormatter for KaraokeVttFormatter {
     }
 }
 
-/// Segregated configuration for output format selection (ISP compliance).
+/// Comma-Separated Values (.csv) subtitle formatter matching whisper.cpp format.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CsvFormatter;
+
+impl OutputFormatter for CsvFormatter {
+    fn name(&self) -> &'static str {
+        "CSV"
+    }
+
+    fn file_extension(&self) -> &'static str {
+        "csv"
+    }
+
+    fn write_segments(&self, segments: &[Segment], writer: &mut dyn Write) -> std::io::Result<()> {
+        writeln!(writer, "start,end,text")?;
+        for s in segments {
+            let t0_ms = (s.t0.max(0.0) * 1000.0).round() as u64;
+            let t1_ms = (s.t1.max(0.0) * 1000.0).round() as u64;
+            let escaped = s.text.trim().replace('"', "\"\"");
+            writeln!(writer, "{},{},\"{}\"", t0_ms, t1_ms, escaped)?;
+        }
+        Ok(())
+    }
+}
+
+/// Synchronized lyrics (.lrc) formatter matching whisper.cpp format.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LrcFormatter;
+
+impl OutputFormatter for LrcFormatter {
+    fn name(&self) -> &'static str {
+        "LRC"
+    }
+
+    fn file_extension(&self) -> &'static str {
+        "lrc"
+    }
+
+    fn write_segments(&self, segments: &[Segment], writer: &mut dyn Write) -> std::io::Result<()> {
+        writeln!(writer, "[by:whisper.cpp]")?;
+        for s in segments {
+            let secs = s.t0.max(0.0);
+            let total_cs = (secs * 100.0).round() as u64;
+            let cs = total_cs % 100;
+            let total_s = total_cs / 100;
+            let s_rem = total_s % 60;
+            let min = total_s / 60;
+            writeln!(
+                writer,
+                "[{:02}:{:02}.{:02}]{}",
+                min,
+                s_rem,
+                cs,
+                s.text.trim()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Configuration for output format selection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OutputFormatOptions {
     pub output_txt: bool,
     pub output_srt: bool,
     pub output_vtt: bool,
     pub output_json: bool,
+    pub output_csv: bool,
+    pub output_lrc: bool,
     pub karaoke: bool,
 }
 
@@ -148,6 +210,12 @@ impl OutputFormatOptions {
         }
         if self.output_json {
             list.push(Box::new(JsonFormatter));
+        }
+        if self.output_csv {
+            list.push(Box::new(CsvFormatter));
+        }
+        if self.output_lrc {
+            list.push(Box::new(LrcFormatter));
         }
         if self.karaoke {
             list.push(Box::new(KaraokeVttFormatter));

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 use clap::Parser;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -19,10 +19,9 @@ struct Args {
     #[arg(short = 'm', long = "model", default_value = "models/ggml-tiny.en.bin")]
     model: String,
 
-    /// Host address to bind
+    /// Host address to bind (e.g. 127.0.0.1 or a Unix domain socket path ending in .sock)
     #[arg(long = "host", default_value = "127.0.0.1")]
     host: String,
-
     /// Port to listen on
     #[arg(short = 'p', long = "port", default_value_t = 8080)]
     port: u16,
@@ -60,12 +59,11 @@ fn extract_wav_from_multipart(body: &[u8]) -> &[u8] {
     body
 }
 
-fn handle_client(mut stream: TcpStream, ctx: Arc<WhisperContext>) {
-    let mut reader = BufReader::new(match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    });
-
+fn handle_client<R: Read, W: Write>(
+    mut reader: BufReader<R>,
+    mut writer: W,
+    ctx: Arc<WhisperContext>,
+) {
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
         return;
@@ -103,13 +101,13 @@ fn handle_client(mut stream: TcpStream, ctx: Arc<WhisperContext>) {
     const MAX_BODY_SIZE: usize = 64 * 1024 * 1024; // 64 MB
     if content_length > MAX_BODY_SIZE {
         let response = "HTTP/1.1 413 Payload Too Large\r\n\r\nPayload Too Large";
-        let _ = stream.write_all(response.as_bytes());
+        let _ = writer.write_all(response.as_bytes());
         return;
     }
 
     if method == "GET" && path == "/health" {
         let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}";
-        let _ = stream.write_all(response.as_bytes());
+        let _ = writer.write_all(response.as_bytes());
         return;
     }
 
@@ -120,7 +118,7 @@ fn handle_client(mut stream: TcpStream, ctx: Arc<WhisperContext>) {
         let mut body = vec![0u8; content_length];
         if reader.read_exact(&mut body).is_err() {
             let response = "HTTP/1.1 400 Bad Request\r\n\r\nFailed to read body";
-            let _ = stream.write_all(response.as_bytes());
+            let _ = writer.write_all(response.as_bytes());
             return;
         }
 
@@ -255,7 +253,7 @@ fn handle_client(mut stream: TcpStream, ctx: Arc<WhisperContext>) {
                     body_str.len(),
                     body_str
                 );
-                let _ = stream.write_all(response.as_bytes());
+                let _ = writer.write_all(response.as_bytes());
             }
             Err(e) => {
                 let err_msg = format!("Failed to parse WAV audio: {}\n", e);
@@ -264,14 +262,14 @@ fn handle_client(mut stream: TcpStream, ctx: Arc<WhisperContext>) {
                     err_msg.len(),
                     err_msg
                 );
-                let _ = stream.write_all(response.as_bytes());
+                let _ = writer.write_all(response.as_bytes());
             }
         }
         return;
     }
 
     let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-    let _ = stream.write_all(response.as_bytes());
+    let _ = writer.write_all(response.as_bytes());
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -280,6 +278,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading Whisper model from '{}'...", args.model);
     let model = WhisperModel::load_from_file(Path::new(&args.model))?;
     let ctx = Arc::new(WhisperContext::new(model)?);
+
+    let is_unix_sock = args.host.ends_with(".sock");
+
+    #[cfg(unix)]
+    if is_unix_sock {
+        let sock_path = &args.host;
+        if std::path::Path::new(sock_path).exists() {
+            let _ = std::fs::remove_file(sock_path);
+        }
+        let listener = std::os::unix::net::UnixListener::bind(sock_path)?;
+        println!("Whisper HTTP server listening on unix://{}", sock_path);
+        println!("Endpoints:");
+        println!("  GET  /health");
+        println!("  POST /v1/audio/transcriptions");
+        println!("  POST /v1/audio/translations");
+
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => {
+                    let ctx_clone = Arc::clone(&ctx);
+                    std::thread::spawn(move || {
+                        if let Ok(reader_stream) = s.try_clone() {
+                            handle_client(BufReader::new(reader_stream), s, ctx_clone);
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("Connection failed: {}", e);
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    if is_unix_sock {
+        return Err("Unix domain sockets (.sock) are only supported on Unix targets".into());
+    }
 
     let addr = format!("{}:{}", args.host, args.port);
     let listener = TcpListener::bind(&addr)?;
@@ -294,7 +330,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(s) => {
                 let ctx_clone = Arc::clone(&ctx);
                 std::thread::spawn(move || {
-                    handle_client(s, ctx_clone);
+                    if let Ok(reader_stream) = s.try_clone() {
+                        handle_client(BufReader::new(reader_stream), s, ctx_clone);
+                    }
                 });
             }
             Err(e) => {
@@ -302,6 +340,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-
     Ok(())
 }

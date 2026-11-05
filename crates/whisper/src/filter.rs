@@ -177,7 +177,7 @@ pub struct LogitFilterContext<'a> {
     pub last_timestamp_token: Option<i32>,
 }
 
-/// Strategy trait for modifying logits before greedy or beam search sampling (OCP/Strategy).
+/// Strategy trait for modifying logits before greedy or beam search sampling.
 pub trait LogitFilter: Send + Sync {
     fn apply(&self, logits: &mut [f32], ctx: &LogitFilterContext);
 }

@@ -231,6 +231,10 @@ impl WhisperContext {
         let mel_chunk_0 = mel.get_chunk(0, n_audio_ctx);
         let enc_out_0 = self.encoder.forward(&mel_chunk_0);
 
+        if params.abort_callback.as_ref().is_some_and(|cb| cb()) {
+            return Vec::new();
+        }
+
         let lang = if params.language == "auto" {
             let (detected, prob) = self.detect_language_with_enc(&enc_out_0);
             state.lang_prob = prob;
@@ -285,6 +289,9 @@ impl WhisperContext {
         let mut history_tokens: Vec<i32> = Vec::new();
 
         while seek_frame < mel.n_len_org {
+            if params.abort_callback.as_ref().is_some_and(|cb| cb()) {
+                break;
+            }
             if let Some(ref cb) = params.on_progress {
                 let pct = ((seek_frame as f64 / mel.n_len_org.max(1) as f64) * 100.0)
                     .clamp(0.0, 100.0) as i32;
@@ -442,6 +449,9 @@ impl WhisperContext {
                     }
 
                     for step in 0..max_steps {
+                        if params.abort_callback.as_ref().is_some_and(|cb| cb()) {
+                            break;
+                        }
                         let start_idx = logits.len() - n_vocab;
                         let step_logits = &mut logits[start_idx..];
 
@@ -768,7 +778,7 @@ fn split_segments_by_max_len(
     out
 }
 
-/// Helper responsible for assembling window prompts according to transcription parameters (SRP).
+/// Helper responsible for assembling window prompts according to transcription parameters.
 #[derive(Debug)]
 pub struct WindowPromptBuilder<'a> {
     pub prompt_base: &'a [i32],
@@ -827,7 +837,7 @@ impl<'a> WindowPromptBuilder<'a> {
     }
 }
 
-/// Evaluator for decoding quality metrics against temperature fallback criteria (SRP).
+/// Evaluator for decoding quality metrics against temperature fallback criteria.
 #[derive(Debug, Clone, Copy)]
 pub struct FallbackEvaluation {
     pub avg_logprob: f32,

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 pub type NewSegmentCallback = Arc<dyn Fn(&crate::segment::Segment) + Send + Sync>;
 pub type ProgressCallback = Arc<dyn Fn(i32) + Send + Sync>;
+pub type AbortCallback = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[derive(Clone)]
 pub struct WhisperParams {
@@ -61,8 +62,9 @@ pub struct WhisperParams {
     pub carry_initial_prompt: bool,
     /// Entropy threshold for dynamic temperature fallback (default: 2.40)
     pub entropy_thold: f32,
+    /// Callback to abort processing early (return true to abort)
+    pub abort_callback: Option<AbortCallback>,
 }
-
 impl std::fmt::Debug for WhisperParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WhisperParams")
@@ -108,6 +110,7 @@ impl Default for WhisperParams {
             entropy_thold: 2.40,
             on_new_segment: None,
             on_progress: None,
+            abort_callback: None,
         }
     }
 }
@@ -241,6 +244,13 @@ impl FullParamsBuilder {
 
     pub fn entropy_thold(mut self, thold: f32) -> Self {
         self.params.entropy_thold = thold;
+        self
+    }
+    pub fn abort_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        self.params.abort_callback = Some(Arc::new(cb));
         self
     }
     pub fn build(self) -> WhisperParams {

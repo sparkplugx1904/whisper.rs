@@ -75,6 +75,13 @@ pub struct Args {
     /// Output result in a JSON file (.json)
     #[arg(long = "output-json", alias = "oj", default_value_t = false)]
     pub output_json: bool,
+    /// Output result in a CSV file (.csv)
+    #[arg(long = "output-csv", alias = "ocsv", default_value_t = false)]
+    pub output_csv: bool,
+
+    /// Output result in an LRC lyrics file (.lrc)
+    #[arg(long = "output-lrc", alias = "olrc", default_value_t = false)]
+    pub output_lrc: bool,
 
     /// Output file path base (without extension)
     #[arg(short = 'o', long = "output-file", alias = "of")]
@@ -120,6 +127,8 @@ where
             "-wt" => out.push("--word-timestamps".to_string()),
             "-tdrz" => out.push("--tinydiarize".to_string()),
             "-ok" => out.push("--karaoke".to_string()),
+            "-ocsv" => out.push("--output-csv".to_string()),
+            "-olrc" => out.push("--output-lrc".to_string()),
             s if s.starts_with("-of=") => out.push(format!("--output-file={}", &s[4..])),
             s if s.starts_with("-bs=") => out.push(format!("--beam-size={}", &s[4..])),
             _ => out.push(arg),
@@ -135,6 +144,8 @@ impl From<&Args> for OutputFormatOptions {
             output_srt: args.output_srt,
             output_vtt: args.output_vtt,
             output_json: args.output_json,
+            output_csv: args.output_csv,
+            output_lrc: args.output_lrc,
             karaoke: args.karaoke,
         }
     }
@@ -463,6 +474,8 @@ mod tests {
             output_srt: true,
             output_vtt: true,
             output_json: true,
+            output_csv: true,
+            output_lrc: true,
             output_file: Some(base_str.to_string()),
             word_timestamps: false,
             tinydiarize: false,
@@ -505,6 +518,15 @@ mod tests {
         // Verify JSON
         let json_content = fs::read_to_string(format!("{}.json", base_str)).expect("Read json");
         let expected_json = "[\n  {\"start\": 0.000, \"end\": 2.500, \"text\": \"Hello world!\", \"avg_logprob\": -0.2000, \"no_speech_prob\": 0.0100},\n  {\"start\": 2.500, \"end\": 65.123, \"text\": \"Line 2 with \\\"quotes\\\" and \\\\slash\", \"avg_logprob\": -0.2000, \"no_speech_prob\": 0.0100}\n]\n";
+        // Verify CSV
+        let csv_content = fs::read_to_string(format!("{}.csv", base_str)).expect("Read csv");
+        assert!(csv_content.starts_with("start,end,text\n"));
+        assert!(csv_content.contains("0,2500,\"Hello world!\"\n"));
+
+        // Verify LRC
+        let lrc_content = fs::read_to_string(format!("{}.lrc", base_str)).expect("Read lrc");
+        assert!(lrc_content.starts_with("[by:whisper.cpp]\n"));
+        assert!(lrc_content.contains("[00:00.00]Hello world!\n"));
         assert_eq!(json_content, expected_json);
 
         // Clean up temp dir
@@ -527,6 +549,8 @@ mod tests {
             output_srt: false,
             output_vtt: false,
             output_json: false,
+            output_csv: false,
+            output_lrc: false,
             output_file: None,
             word_timestamps: false,
             tinydiarize: false,
@@ -555,6 +579,8 @@ mod tests {
             output_srt: false,
             output_vtt: false,
             output_json: false,
+            output_csv: false,
+            output_lrc: false,
             output_file: None,
             word_timestamps: false,
             tinydiarize: false,

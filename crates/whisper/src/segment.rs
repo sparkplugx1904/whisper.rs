@@ -128,7 +128,7 @@ fn fmt_time_vtt(secs: f64) -> String {
     format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
 }
 
-/// Render segment as SRT subtitle string (SRP).
+/// Render segment as SRT subtitle string.
 pub fn format_srt(segment: &Segment, index: usize) -> String {
     format!(
         "{}\n{} --> {}\n{}\n\n",
@@ -139,7 +139,7 @@ pub fn format_srt(segment: &Segment, index: usize) -> String {
     )
 }
 
-/// Render segment as VTT subtitle string (SRP).
+/// Render segment as VTT subtitle string.
 pub fn format_vtt(segment: &Segment) -> String {
     format!(
         "{} --> {}\n{}\n\n",
@@ -149,7 +149,7 @@ pub fn format_vtt(segment: &Segment) -> String {
     )
 }
 
-/// Render segment as Karaoke VTT string (SRP).
+/// Render segment as Karaoke VTT string.
 pub fn format_karaoke_vtt(segment: &Segment) -> String {
     let mut body = String::new();
     if segment.words.is_empty() {
@@ -171,7 +171,7 @@ pub fn format_karaoke_vtt(segment: &Segment) -> String {
     )
 }
 
-/// Render segment as Karaoke SRT string (SRP).
+/// Render segment as Karaoke SRT string.
 pub fn format_karaoke_srt(segment: &Segment, index: usize) -> String {
     let mut body = String::new();
     if segment.words.is_empty() {
@@ -194,7 +194,7 @@ pub fn format_karaoke_srt(segment: &Segment, index: usize) -> String {
     )
 }
 
-/// Render segment as JSON string (SRP).
+/// Render segment as JSON string.
 pub fn format_json(segment: &Segment) -> String {
     let t0 = if segment.t0.is_finite() && segment.t0 >= 0.0 {
         segment.t0

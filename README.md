@@ -3,7 +3,6 @@
 [![CI](https://github.com/sparkplugx1904/whisper.rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sparkplugx1904/whisper.rs/actions)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![Pure Rust](https://img.shields.io/badge/Pure%20Rust-100%25-brightgreen.svg)](#pure-rust-guarantee)
-[![LibriSpeech WER](https://img.shields.io/badge/LibriSpeech%20WER-0.0000%25-success.svg)](#authentic-librispeech-evaluation)
 
 A high-performance, **100% Pure Rust** rewrite of [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and OpenAI Whisper automatic speech recognition (ASR).
 
@@ -14,7 +13,7 @@ A high-performance, **100% Pure Rust** rewrite of [whisper.cpp](https://github.c
 ## Table of Contents
 - [Key Features](#key-features)
 - [Pure Rust Guarantee](#pure-rust-guarantee)
-- [Architecture & SOLID Design](#architecture--solid-design)
+- [Architecture & Design](#architecture--design)
 - [Workspace Crates](#workspace-crates)
 - [Quickstart Guide](#quickstart-guide)
   - [Prerequisites & Build](#prerequisites--build)
@@ -26,7 +25,7 @@ A high-performance, **100% Pure Rust** rewrite of [whisper.cpp](https://github.c
   - [6. Real-time Audio Stream (`whisper-stream`)](#6-real-time-audio-stream-whisper-stream)
   - [7. Standalone Quantizer (`whisper-quantize`)](#7-standalone-quantizer-whisper-quantize)
 - [Accuracy & Benchmark vs whisper.cpp](#accuracy--benchmark-vs-whispercpp)
-  - [Authentic LibriSpeech Evaluation](#authentic-librispeech-evaluation)
+  - [Accuracy & Validation](#accuracy--validation)
   - [Numerical Parity Matrix](#numerical-parity-matrix)
   - [CPU Performance & Real-Time Factor](#cpu-performance--real-time-factor)
 - [Bindings Usage Guides](#bindings-usage-guides)
@@ -42,7 +41,7 @@ A high-performance, **100% Pure Rust** rewrite of [whisper.cpp](https://github.c
 
 - **Strictly Zero C/C++ or Foreign Code**: Verified by automated architecture gate `./scripts/check_pure_rust.sh`. No `-sys` crates, no `cc`/`cmake`/`bindgen` in build scripts, no non-std FFI imports.
 - **Universal Audio Decoder**: Built-in support for WAV, MP3, FLAC, OGG, and AAC via pure Rust decoders with automatic resampling to 16 kHz mono.
-- **Identical Numerical Accuracy**: Exactly matches `whisper.cpp` reference tensors (encoder cosine similarity $1.000000$, first-step logits cosine similarity $1.000000$, mel spectrogram max error $< 5 \times 10^{-5}$).
+- **High Numerical Fidelity**: Validated against reference implementations (encoder cosine similarity $> 0.9999$, mel spectrogram max error $< 5 \times 10^{-5}$).
 - **Direct Quantization Kernels**: Native execution of legacy GGML quantization (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0) and modern K-quants (Q4_K, Q5_K, Q6_K) without full dequantization into RAM.
 - **Flash Attention 2**: Tiled online softmax attention reducing peak memory and accelerating long-context encoder/decoder passes.
 - **Dynamic Time Warping (DTW) Alignment**: Precise word-level timestamps using pre-calibrated alignment head presets across all model sizes (Tiny through Large-v3-Turbo).
@@ -71,15 +70,13 @@ Our CI enforces the pure Rust guarantee on every commit and pull request:
 
 ---
 
-## Architecture & SOLID Design
+## Architecture & Design
 
-The codebase adheres strictly to pragmatic **SOLID** software engineering principles:
+The workspace is organized into modular, decoupled crates designed for high throughput, maintainability, and safety:
 
-- **Single Responsibility (SRP)**: Domain entities (`Segment`), inference decoders, prompt construction (`WindowPromptBuilder`), fallback heuristic evaluators (`FallbackEvaluation`), and output file formatters are decoupled into focused, single-purpose components.
-- **Open/Closed (OCP)**: Format outputs implement the extensible `OutputFormatter` trait, and decoding logit filters implement the `LogitFilter` pipeline. New formats (e.g. CSV, XML) or decoding filters (e.g. top-k, logit bias) can be added without modifying core execution loops.
-- **Interface Segregation (ISP)**: Formatters depend only on stream writing abstractions and narrow parameter slices (`OutputFormatOptions`) rather than fat CLI argument structs.
-- **Dependency Inversion (DIP)**: Core formatting serializes to generic `std::io::Write` streams, enabling pure in-memory testing without touching physical disks.
-
+- **Separation of Concerns**: Audio preprocessing (`whisper-audio`), tensor math & SIMD dot products (`whisper-tensor`), model/vocabulary parsing (`whisper-model`, `whisper-tokenizer`), and inference runtime (`whisper-rs`) operate independently.
+- **Extensible Pipeline**: Output formatting implements the `OutputFormatter` trait, and decoding logit filters implement the `LogitFilter` pipeline, allowing new export formats and sampling constraints without touching core execution loops.
+- **Strict Memory Safety**: `#![forbid(unsafe_code)]` is enforced across frontend, tokenizer, and runtime crates. Unsafe code is strictly quarantined to performance-critical SIMD vector math with runtime CPU feature detection.
 ```
                                   +-----------------------+
                                   | Audio File / In-Memory|
@@ -339,18 +336,16 @@ cargo run --release -p whisper-quantize -- \
 
 ## Accuracy & Benchmark vs whisper.cpp
 
-### Authentic LibriSpeech Evaluation
+### Accuracy & Validation
 
-`whisper.rs` is evaluated against genuine utterances from the official OpenSLR LibriSpeech `dev-clean` corpus (Speaker 2277, Chapter 149896):
+Transcription fidelity is evaluated against reference utterances from LibriSpeech `dev-clean` (Speaker 2277, Chapter 149896):
 
 ```bash
 ./scripts/eval_librispeech.sh
 ```
 
-- **Ground Truth**: `"HE WAS IN A FEVERED STATE OF MIND OWING TO THE BLIGHT HIS WIFE'S ACTION THREATENED TO CAST UPON HIS ENTIRE FUTURE"`
-- **Reference Words**: 22 words
-- **Hypothesis Words**: 22 words
-- **Word Error Rate (WER)**: **0.0000%**
+- **Reference**: `"HE WAS IN A FEVERED STATE OF MIND OWING TO THE BLIGHT HIS WIFE'S ACTION THREATENED TO CAST UPON HIS ENTIRE FUTURE"`
+- **Hypothesis**: Exact match (0 word substitutions, insertions, or deletions)
 - **Status**: **PASSED**
 
 ---
