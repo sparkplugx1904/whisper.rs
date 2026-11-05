@@ -1,7 +1,7 @@
 use half::f16;
 use whisper_tensor::dtype::DType;
 use whisper_tensor::ops::{
-    quantized_linear_vector, vec_dot_q4_0_f32, vec_dot_q5_1_f32, vec_dot_q8_0_f32,
+    quantized_linear_vector, vec_dot_q4_0_f32, vec_dot_q4_1_f32, vec_dot_q5_1_f32, vec_dot_q8_0_f32,
 };
 use whisper_tensor::simd::dot_f32;
 
@@ -53,6 +53,33 @@ fn test_kernel_dot_q4_0_vs_dequant() {
     assert!(
         diff < 1e-4,
         "Q4_0 direct dot {} vs dequant dot {}: diff {}",
+        dot_direct,
+        dot_dequant,
+        diff
+    );
+}
+
+#[test]
+fn test_kernel_dot_q4_1_vs_dequant() {
+    let mut raw_block = vec![0u8; 20];
+    let d_bits = f16::from_f32(0.25).to_bits();
+    let m_bits = f16::from_f32(-0.5).to_bits();
+    raw_block[0..2].copy_from_slice(&d_bits.to_le_bytes());
+    raw_block[2..4].copy_from_slice(&m_bits.to_le_bytes());
+    for i in 0..16 {
+        raw_block[4 + i] = ((i as u8) & 0x0F) | (((15 - i as u8) & 0x0F) << 4);
+    }
+
+    let x: Vec<f32> = (0..32).map(|i| (i as f32) * 0.05).collect();
+
+    let dot_direct = vec_dot_q4_1_f32(&raw_block, &x);
+    let dequant = DType::Q4_1.dequantize_to_f32(&raw_block, 32).unwrap();
+    let dot_dequant = dot_f32(&dequant, &x);
+
+    let diff = (dot_direct - dot_dequant).abs();
+    assert!(
+        diff < 1e-4,
+        "Q4_1 direct dot {} vs dequant dot {}: diff {}",
         dot_direct,
         dot_dequant,
         diff

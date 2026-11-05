@@ -23,7 +23,10 @@ pub fn vec_dot_q4_0_f32(raw_blocks: &[u8], x: &[f32]) -> f32 {
 pub fn vec_dot_q4_1_f32(raw_blocks: &[u8], x: &[f32]) -> f32 {
     let n_blocks = x.len() / 32;
     assert_eq!(raw_blocks.len(), n_blocks * 20);
+    crate::simd::dot_q4_1_f32(raw_blocks, x)
+}
 
+pub fn vec_dot_q4_1_f32_scalar(raw_blocks: &[u8], x: &[f32]) -> f32 {
     let mut sum = 0.0f32;
     for (i, chunk) in raw_blocks.chunks_exact(20).enumerate() {
         let d_bits = u16::from_le_bytes([chunk[0], chunk[1]]);
