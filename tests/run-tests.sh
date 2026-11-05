@@ -69,10 +69,20 @@ for v in "${parakeet_models[@]}"; do
 done
 
 if [ $is_parakeet -eq 1 ]; then
-    main="../build/bin/parakeet-cli"
+    if [ -f "../target/release/parakeet-cli" ]; then
+        main="../target/release/parakeet-cli"
+    else
+        main="../build/bin/parakeet-cli"
+    fi
     model_path="../models/ggml-parakeet-tdt-0.6b-v3-${parakeet_variant}.bin"
 else
-    main="../build/bin/whisper-cli"
+    if [ -f "../target/release/whisper-cli" ]; then
+        main="../target/release/whisper-cli"
+    elif [ -f "../target/debug/whisper-cli" ]; then
+        main="../target/debug/whisper-cli"
+    else
+        main="../build/bin/whisper-cli"
+    fi
     model_path="../models/ggml-${model}.bin"
 fi
 

@@ -32,19 +32,26 @@ models=(                                                                        
   "large-v2" "large-v2-q4_0" "large-v2-q4_1" "large-v2-q5_0" "large-v2-q5_1" "large-v2-q8_0" "large-v2-dis" \
   "large-v3-turbo"                           "large-v3-turbo-q5_0"           "large-v3-turbo-q8_0"          \
 )
+if [ -f "target/release/whisper-bench" ]; then
+    BENCH_BIN="target/release/whisper-bench"
+elif [ -f "target/debug/whisper-bench" ]; then
+    BENCH_BIN="target/debug/whisper-bench"
+else
+    BENCH_BIN="./build/bin/whisper-bench"
+fi
 
 if [ "$encoder_only" -eq 0 ]; then
     printf "\n"
     printf "Running memcpy benchmark\n"
     printf "\n"
 
-    ./build/bin/whisper-bench -w 1 -t $n_threads 2>&1
+    "$BENCH_BIN" -w 1 -t $n_threads 2>&1
 
     printf "\n"
     printf "Running ggml_mul_mat benchmark with $n_threads threads\n"
     printf "\n"
 
-    ./build/bin/whisper-bench -w 2 -t $n_threads 2>&1
+    "$BENCH_BIN" -w 2 -t $n_threads 2>&1
 
     printf "\n"
     printf "Running benchmark for all models\n"
@@ -64,7 +71,7 @@ printf "| %6s | %6s | %16s | %13s | %3s | %3s | %7s | %7s | %7s | %7s | %7s |\n"
 for model in "${models[@]}"; do
     # actual run
     # store stderr output in a variable in order to parse it later
-    output=$(./build/bin/whisper-bench -m ./models/ggml-$model.bin -t $n_threads $fattn 2>&1)
+    output=$("$BENCH_BIN" -m ./models/ggml-$model.bin -t $n_threads $fattn 2>&1)
     ret=$?
 
     # parse the output:

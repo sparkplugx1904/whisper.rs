@@ -15,12 +15,20 @@ declare -a filedex
 cd `dirname $0`
 cd ../
 
+if [ -f "target/release/whisper-quantize" ]; then
+    QUANTIZE_BIN="target/release/whisper-quantize"
+elif [ -f "target/debug/whisper-quantize" ]; then
+    QUANTIZE_BIN="target/debug/whisper-quantize"
+else
+    QUANTIZE_BIN="./build/bin/whisper-quantize"
+fi
+
 for i in `ls ./models | grep ^ggml-.*.bin | grep -v "\-q"`; do
     m="models/$i"
     if [ -f "$m" ]; then
         if [ "${m##*.}" == "bin" ]; then
-            ./build/bin/whisper-quantize "${m}" "${m::${#m}-4}-${qtype1}.bin" ${qtype1};
-            ./build/bin/whisper-quantize "${m}" "${m::${#m}-4}-${qtype0}.bin" ${qtype0};
+            "$QUANTIZE_BIN" -i "${m}" -o "${m::${#m}-4}-${qtype1}.bin" -t "${qtype1}"
+            "$QUANTIZE_BIN" -i "${m}" -o "${m::${#m}-4}-${qtype0}.bin" -t "${qtype0}"
             filedex+=( "${m::${#m}-4}-${qtype1}.bin" "${m::${#m}-4}-${qtype0}.bin" )
         fi
     fi
