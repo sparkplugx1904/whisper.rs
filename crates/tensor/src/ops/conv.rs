@@ -30,10 +30,10 @@ pub fn conv1d_c_first(
         for k in 0..kernel_size {
             let p = cin * kernel_size + k;
             let row = &mut x_col[p * l_out..(p + 1) * l_out];
-            for tout in 0..l_out {
+            for (tout, val) in row.iter_mut().enumerate() {
                 let tin = (tout * stride) as isize - (padding as isize) + k as isize;
                 if tin >= 0 && (tin as usize) < l_in {
-                    row[tout] = input[in_cin_offset + (tin as usize)];
+                    *val = input[in_cin_offset + (tin as usize)];
                 }
             }
         }
@@ -137,17 +137,15 @@ pub fn conv1d_t_first(
     }
 
     // Bias addition and optional GELU activation in parallel
-    output
-        .par_chunks_mut(out_channels)
-        .for_each(|row| {
-            if apply_gelu {
-                for (cout, val) in row.iter_mut().enumerate() {
-                    *val = gelu_scalar(*val + bias[cout]);
-                }
-            } else {
-                for (cout, val) in row.iter_mut().enumerate() {
-                    *val += bias[cout];
-                }
+    output.par_chunks_mut(out_channels).for_each(|row| {
+        if apply_gelu {
+            for (cout, val) in row.iter_mut().enumerate() {
+                *val = gelu_scalar(*val + bias[cout]);
             }
-        });
+        } else {
+            for (cout, val) in row.iter_mut().enumerate() {
+                *val += bias[cout];
+            }
+        }
+    });
 }

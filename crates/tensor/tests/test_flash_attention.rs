@@ -55,7 +55,17 @@ fn test_flash_attention_2_matches_standard() {
 
     // 2. Causal comparison
     let mut out_std_causal = vec![0.0f32; t_q * d_model];
-    reference_mha(&q, &k, &v, t_q, t_kv, n_heads, d_model, true, &mut out_std_causal);
+    reference_mha(
+        &q,
+        &k,
+        &v,
+        t_q,
+        t_kv,
+        n_heads,
+        d_model,
+        true,
+        &mut out_std_causal,
+    );
 
     let mut out_flash_causal = vec![0.0f32; t_q * d_model];
     flash_attention_2(

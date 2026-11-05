@@ -1,4 +1,4 @@
-FROM rust:1.80-bookworm as builder
+FROM rust:1-bookworm AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release -p whisper-cli -p whisper-server -p whisper-quantize

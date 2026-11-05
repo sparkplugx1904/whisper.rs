@@ -10,8 +10,8 @@ unsafe fn layer_norm_row_avx2(
     d_model: usize,
     out_slice: &mut [f32],
 ) {
-    use core::arch::x86_64::*;
     use crate::simd::hsum256_ps;
+    use core::arch::x86_64::*;
 
     let n_blocks = d_model / 8;
     let in_ptr = in_slice.as_ptr();

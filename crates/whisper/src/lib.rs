@@ -26,9 +26,9 @@ pub use params::{FullParamsBuilder, SamplingStrategy, WhisperParams};
 pub use segment::{
     format_json, format_karaoke_srt, format_karaoke_vtt, format_srt, format_vtt, Segment,
 };
-pub use transcribe::{FallbackEvaluation, WindowPromptBuilder};
 pub use state::WhisperState;
 pub use transcribe::WhisperContext;
+pub use transcribe::{FallbackEvaluation, WindowPromptBuilder};
 
 pub use whisper_audio as audio;
 pub use whisper_model as model;

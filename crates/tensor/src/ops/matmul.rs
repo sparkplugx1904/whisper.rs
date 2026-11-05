@@ -71,16 +71,16 @@ pub fn linear_parallel(
             let out_token = &mut output[t * out_features..(t + 1) * out_features];
             if n_threads > 1 && out_features >= 1024 {
                 let chunk_size = out_features.div_ceil(n_threads).div_ceil(4) * 4;
-                out_token
-                    .par_chunks_mut(chunk_size)
-                    .enumerate()
-                    .for_each(|(chunk_idx, out_chunk)| {
+                out_token.par_chunks_mut(chunk_size).enumerate().for_each(
+                    |(chunk_idx, out_chunk)| {
                         let r_start = chunk_idx * chunk_size;
                         let r_count = out_chunk.len();
-                        let w_chunk = &weight[r_start * in_features..(r_start + r_count) * in_features];
+                        let w_chunk =
+                            &weight[r_start * in_features..(r_start + r_count) * in_features];
                         let b_chunk = bias.map(|b| &b[r_start..r_start + r_count]);
                         gemv_f32(in_row, w_chunk, b_chunk, out_chunk, in_features, r_count);
-                    });
+                    },
+                );
             } else {
                 gemv_f32(in_row, weight, bias, out_token, in_features, out_features);
             }

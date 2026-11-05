@@ -14,7 +14,8 @@ jobs:
 
       - name: Install Nightly Rust
         uses: dtolnay/rust-toolchain@nightly
-
+        with:
+          components: rust-src
       - name: AddressSanitizer Test
         env:
           RUSTFLAGS: "-Zsanitizer=address"
@@ -29,7 +30,10 @@ jobs:
       - name: Install Nightly with Miri
         uses: dtolnay/rust-toolchain@nightly
         with:
-          components: miri
+          components: miri, rust-src
 
       - name: Run Miri on Tensor Operations
-        run: cargo miri test -p whisper-tensor
+        env:
+          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-disable-isolation"
+          RAYON_NUM_THREADS: "1"
+        run: cargo miri test -p whisper-tensor --lib

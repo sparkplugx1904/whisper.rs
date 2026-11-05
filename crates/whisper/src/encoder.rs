@@ -64,7 +64,7 @@ impl EncoderWeights {
 
             let mut attn_qkv_b = Vec::with_capacity(3 * d_model);
             attn_qkv_b.extend_from_slice(&attn_q_b);
-            attn_qkv_b.extend(std::iter::repeat(0.0).take(d_model)); // Key has no bias
+            attn_qkv_b.resize(attn_qkv_b.len() + d_model, 0.0); // Key has no bias
             attn_qkv_b.extend_from_slice(&attn_v_b);
 
             let block = EncoderBlockWeights {

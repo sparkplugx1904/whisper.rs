@@ -45,6 +45,7 @@ impl Segment {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_stats(
         t0: f64,
         t1: f64,

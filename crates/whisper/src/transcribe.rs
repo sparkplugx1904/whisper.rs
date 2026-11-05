@@ -310,12 +310,8 @@ impl WhisperContext {
                 not_token,
                 token_prev: self.model.vocab.token_prev,
             };
-            let window_prompt = prompt_builder.build(
-                seek_frame,
-                &history_tokens,
-                params,
-                &self.tokenizer,
-            );
+            let window_prompt =
+                prompt_builder.build(seek_frame, &history_tokens, params, &self.tokenizer);
 
             let mut temperature = params.temperature;
             let mut tokens_cur = Vec::new();
@@ -429,9 +425,8 @@ impl WhisperContext {
                         greedy_pipeline.add(SuppressNonSpeechFilter::new(nst_indices));
                     }
                     if params.repetition_penalty > 1.0 {
-                        greedy_pipeline.add(RepetitionPenaltyFilter::new(
-                            params.repetition_penalty,
-                        ));
+                        greedy_pipeline
+                            .add(RepetitionPenaltyFilter::new(params.repetition_penalty));
                     }
                     greedy_pipeline.add(TimestampLogitFilter::new(
                         beg as usize,
@@ -543,7 +538,14 @@ impl WhisperContext {
                 };
                 for chunk in tokens_cur.chunks(max_tok) {
                     let t1 = (seek_time + 30.0).min(total_audio_sec);
-                    let seg = self.build_segment(seek_time, t1, chunk, avg_logprob, no_speech_prob, avg_entropy);
+                    let seg = self.build_segment(
+                        seek_time,
+                        t1,
+                        chunk,
+                        avg_logprob,
+                        no_speech_prob,
+                        avg_entropy,
+                    );
                     if !seg.text.trim().is_empty() {
                         if let Some(ref cb) = params.on_new_segment {
                             cb(&seg);
@@ -609,8 +611,14 @@ impl WhisperContext {
                 }
                 if !seg_tokens.is_empty() {
                     let t1 = (seek_time + 30.0).min(total_audio_sec);
-                    let seg =
-                        self.build_segment(seg_t0, t1, &seg_tokens, avg_logprob, no_speech_prob, avg_entropy);
+                    let seg = self.build_segment(
+                        seg_t0,
+                        t1,
+                        &seg_tokens,
+                        avg_logprob,
+                        no_speech_prob,
+                        avg_entropy,
+                    );
                     if !seg.text.trim().is_empty() {
                         if let Some(ref cb) = params.on_new_segment {
                             cb(&seg);
@@ -786,7 +794,7 @@ impl<'a> WindowPromptBuilder<'a> {
             let prev_tokens_slice = if history_tokens.len() > 224 {
                 &history_tokens[history_tokens.len() - 224..]
             } else {
-                &history_tokens[..]
+                history_tokens
             };
 
             if !prev_tokens_slice.is_empty() {

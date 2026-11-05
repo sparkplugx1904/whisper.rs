@@ -128,7 +128,7 @@ pub fn get_non_speech_tokens(vocab: &whisper_model::Vocab) -> Vec<usize> {
                 || tok_str.contains("laughter")
                 || tok_str.contains("applause")
             {
-                tokens.push(i as usize);
+                tokens.push(i);
             }
         }
     }

@@ -34,13 +34,19 @@ jobs:
         run: cd bindings/javascript && wasm-pack build --target web --out-dir ../../examples/wasm-dist
 
       - name: Setup Pages
+        id: pages
         uses: actions/configure-pages@v5
+        with:
+          enablement: true
+        continue-on-error: true
 
       - name: Upload Artifact
+        if: steps.pages.outcome == 'success'
         uses: actions/upload-pages-artifact@v3
         with:
           path: 'examples/wasm-dist'
 
       - name: Deploy to GitHub Pages
+        if: steps.pages.outcome == 'success'
         id: deployment
         uses: actions/deploy-pages@v4
