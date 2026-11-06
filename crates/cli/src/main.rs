@@ -94,9 +94,22 @@ pub struct Args {
     pub word_timestamps: bool,
 
     /// Enable tinydiarize speaker turn detection
-    #[arg(long = "tinydiarize", alias = "tdrz", default_value_t = false)]
+    #[arg(
+        long = "tinydiarize",
+        alias = "tdrz",
+        conflicts_with = "diarize",
+        default_value_t = false
+    )]
     pub tinydiarize: bool,
 
+    /// Enable stereo speaker diarization (mutually exclusive with tinydiarize)
+    #[arg(
+        long = "diarize",
+        alias = "di",
+        conflicts_with = "tinydiarize",
+        default_value_t = false
+    )]
+    pub diarize: bool,
     /// Export karaoke subtitle format with word-level timing tags (.karaoke.vtt / .karaoke.srt)
     #[arg(long = "karaoke", alias = "ok", default_value_t = false)]
     pub karaoke: bool,
@@ -167,6 +180,7 @@ impl Default for Args {
             output_file: None,
             word_timestamps: false,
             tinydiarize: false,
+            diarize: false,
             karaoke: false,
             no_prints: false,
             offset_t: 0,
@@ -208,6 +222,7 @@ where
             "-bs" => out.push("--beam-size".to_string()),
             "-wt" => out.push("--word-timestamps".to_string()),
             "-tdrz" => out.push("--tinydiarize".to_string()),
+            "-di" => out.push("--diarize".to_string()),
             "-ok" => out.push("--karaoke".to_string()),
             "-ocsv" => out.push("--output-csv".to_string()),
             "-olrc" => out.push("--output-lrc".to_string()),
@@ -242,7 +257,88 @@ impl From<&Args> for OutputFormatOptions {
             output_wts: args.output_words,
             font_path: args.font_path.clone(),
             input_file: args.file.clone(),
+            diarize: args.diarize,
         }
+    }
+}
+
+/// Estimate speaker ID ("0", "1", or "?") for a stereo segment by computing
+/// absolute amplitude energy across channel 0 (left) and channel 1 (right).
+///
+/// Matching whisper.cpp `cli.cpp:325-350`:
+/// E0 = sum_{j=start}^{end} |pcm0[j]|
+/// E1 = sum_{j=start}^{end} |pcm1[j]|
+/// If E0 > 1.1 * E1 => "0"; if E1 > 1.1 * E0 => "1"; else "?"
+pub fn estimate_diarization_speaker(
+    pcm_channels: &[Vec<f32>],
+    t0_sec: f64,
+    t1_sec: f64,
+    sample_rate: u32,
+) -> &'static str {
+    if pcm_channels.len() < 2 {
+        return "?";
+    }
+    let n_samples = pcm_channels[0].len().min(pcm_channels[1].len());
+    if n_samples == 0 {
+        return "?";
+    }
+
+    let t0 = if t0_sec.is_finite() && t0_sec >= 0.0 {
+        t0_sec
+    } else {
+        0.0
+    };
+    let t1 = if t1_sec.is_finite() && t1_sec >= 0.0 {
+        t1_sec
+    } else {
+        0.0
+    };
+
+    let is0 = ((t0 * sample_rate as f64).round() as usize).min(n_samples.saturating_sub(1));
+    let is1 = ((t1 * sample_rate as f64).round() as usize).min(n_samples);
+
+    let start = is0.min(is1);
+    let end = is1.max(start);
+
+    if start >= end {
+        return "?";
+    }
+
+    let ch0 = &pcm_channels[0][start..end];
+    let ch1 = &pcm_channels[1][start..end];
+
+    let mut e0_sum0 = 0.0f64;
+    let mut e0_sum1 = 0.0f64;
+    let mut e1_sum0 = 0.0f64;
+    let mut e1_sum1 = 0.0f64;
+
+    let (chunks0, rem0) = ch0.as_chunks::<8>();
+    let (chunks1, rem1) = ch1.as_chunks::<8>();
+
+    for (c0, c1) in chunks0.iter().zip(chunks1.iter()) {
+        for i in 0..4 {
+            e0_sum0 += c0[i].abs() as f64;
+            e1_sum0 += c1[i].abs() as f64;
+        }
+        for i in 4..8 {
+            e0_sum1 += c0[i].abs() as f64;
+            e1_sum1 += c1[i].abs() as f64;
+        }
+    }
+    for (&s0, &s1) in rem0.iter().zip(rem1.iter()) {
+        e0_sum0 += s0.abs() as f64;
+        e1_sum0 += s1.abs() as f64;
+    }
+
+    let energy0 = e0_sum0 + e0_sum1;
+    let energy1 = e1_sum0 + e1_sum1;
+
+    if energy0 > 1.1 * energy1 {
+        "0"
+    } else if energy1 > 1.1 * energy0 {
+        "1"
+    } else {
+        "?"
     }
 }
 
@@ -371,11 +467,29 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let t_trans = Instant::now();
-    let segments = ctx
+    let mut segments = ctx
         .transcribe_file(&args.file, &params)
         .map_err(|e| format!("transcription failed: {}", e))?;
     let proc_dur = t_trans.elapsed();
 
+    if args.diarize {
+        if audio.channel_samples.len() == 2 {
+            for seg in &mut segments {
+                let spk = estimate_diarization_speaker(
+                    &audio.channel_samples,
+                    seg.t0,
+                    seg.t1,
+                    audio.sample_rate,
+                );
+                seg.speaker = Some(spk.to_string());
+            }
+        } else {
+            eprintln!(
+                "warning: --diarize requires stereo audio with 2 channels, but audio has {}",
+                audio.channel_samples.len()
+            );
+        }
+    }
     for seg in &segments {
         if args.word_timestamps && !seg.words.is_empty() {
             for w in &seg.words {
@@ -403,6 +517,10 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        let speaker_tag = match &seg.speaker {
+            Some(spk) => format!("(speaker {}) ", spk),
+            None => String::new(),
+        };
         let formatted_text = if args.print_colors {
             format_segment_colors(seg)
         } else if args.print_confidence {
@@ -410,9 +528,9 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             seg.text.trim().to_string()
         };
-
+        let display_text = format!("{}{}", speaker_tag, formatted_text);
         if args.no_timestamps {
-            println!("\n {}", formatted_text);
+            println!("\n {}", display_text);
         } else {
             let t0 = if seg.t0.is_finite() && seg.t0 >= 0.0 {
                 seg.t0
@@ -432,7 +550,7 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 (t1 / 3600.0) as u32,
                 ((t1 % 3600.0) / 60.0) as u32,
                 t1 % 60.0,
-                formatted_text
+                display_text
             );
         }
     }
@@ -946,6 +1064,145 @@ mod tests {
         assert!(wts_content.contains("speech_sample.wav.mp4"));
 
         // Clean up temp dir
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_normalize_cli_args_diarize() {
+        let input = vec!["whisper-cli", "-m", "model.bin", "-f", "audio.wav", "-di"];
+        let normalized = normalize_cli_args(input);
+        assert_eq!(
+            normalized,
+            vec![
+                "whisper-cli",
+                "-m",
+                "model.bin",
+                "-f",
+                "audio.wav",
+                "--diarize",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_diarize_conflicts_with_tinydiarize() {
+        let input = vec![
+            "whisper-cli",
+            "-m",
+            "model.bin",
+            "-f",
+            "audio.wav",
+            "--diarize",
+            "--tinydiarize",
+        ];
+        let res = Args::try_parse_from(input);
+        assert!(
+            res.is_err(),
+            "Should conflict: diarize and tinydiarize together"
+        );
+    }
+
+    #[test]
+    fn test_estimate_diarization_speaker_cases() {
+        let sr = 16000;
+        let n_samples = 16000; // 1 second
+
+        // Channel 0 dominant
+        let ch0 = vec![1.0f32; n_samples];
+        let ch1 = vec![0.1f32; n_samples];
+        let pcm = vec![ch0, ch1];
+        let spk = estimate_diarization_speaker(&pcm, 0.0, 1.0, sr);
+        assert_eq!(spk, "0");
+
+        // Channel 1 dominant
+        let ch0 = vec![0.2f32; n_samples];
+        let ch1 = vec![0.8f32; n_samples];
+        let pcm = vec![ch0, ch1];
+        let spk = estimate_diarization_speaker(&pcm, 0.0, 1.0, sr);
+        assert_eq!(spk, "1");
+
+        // Balanced energy (1.0 vs 1.05 -> within 1.1x ratio -> "?")
+        let ch0 = vec![1.0f32; n_samples];
+        let ch1 = vec![1.05f32; n_samples];
+        let pcm = vec![ch0, ch1];
+        let spk = estimate_diarization_speaker(&pcm, 0.0, 1.0, sr);
+        assert_eq!(spk, "?");
+
+        // Silence (0.0 vs 0.0) -> "?"
+        let ch0 = vec![0.0f32; n_samples];
+        let ch1 = vec![0.0f32; n_samples];
+        let pcm = vec![ch0, ch1];
+        let spk = estimate_diarization_speaker(&pcm, 0.0, 1.0, sr);
+        assert_eq!(spk, "?");
+
+        // Sub-range segment test:
+        // First 0.5s channel 0 has energy, second 0.5s channel 1 has energy
+        let mut ch0 = vec![0.0f32; n_samples];
+        let mut ch1 = vec![0.0f32; n_samples];
+        ch0[..8000].fill(1.0);
+        ch1[8000..16000].fill(1.0);
+        let pcm = vec![ch0, ch1];
+        let spk_first_half = estimate_diarization_speaker(&pcm, 0.0, 0.5, sr);
+        let spk_second_half = estimate_diarization_speaker(&pcm, 0.5, 1.0, sr);
+        assert_eq!(spk_first_half, "0");
+        assert_eq!(spk_second_half, "1");
+    }
+
+    #[test]
+    fn test_write_output_files_diarized() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "whisper_cli_test_diarize_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_dir).expect("Create temp dir");
+        let base = temp_dir.join("test_diarize_out");
+        let base_str = base.to_str().unwrap();
+
+        let args = Args {
+            output_srt: true,
+            output_vtt: true,
+            output_csv: true,
+            output_json: true,
+            diarize: true,
+            output_file: Some(base_str.to_string()),
+            no_prints: true,
+            ..Default::default()
+        };
+
+        let segments = vec![
+            whisper_rs::Segment::new(0.0, 2.0, "Speaker zero talking".to_string(), vec![1])
+                .with_speaker("0"),
+            whisper_rs::Segment::new(2.0, 4.0, "Speaker one replying".to_string(), vec![2])
+                .with_speaker("1"),
+        ];
+
+        write_output_files(&args, base_str, &segments).expect("Write diarized files");
+
+        // Verify SRT
+        let srt_content = fs::read_to_string(format!("{}.srt", base_str)).expect("Read srt");
+        assert!(srt_content.contains("(speaker 0) Speaker zero talking"));
+        assert!(srt_content.contains("(speaker 1) Speaker one replying"));
+
+        // Verify VTT
+        let vtt_content = fs::read_to_string(format!("{}.vtt", base_str)).expect("Read vtt");
+        assert!(vtt_content.contains("<v Speaker0>Speaker zero talking"));
+        assert!(vtt_content.contains("<v Speaker1>Speaker one replying"));
+
+        // Verify CSV
+        let csv_content = fs::read_to_string(format!("{}.csv", base_str)).expect("Read csv");
+        assert!(csv_content.contains("start,end,speaker,text"));
+        assert!(csv_content.contains("0,2000,0,\"Speaker zero talking\""));
+        assert!(csv_content.contains("2000,4000,1,\"Speaker one replying\""));
+
+        // Verify JSON
+        let json_content = fs::read_to_string(format!("{}.json", base_str)).expect("Read json");
+        assert!(json_content.contains("\"speaker\": \"0\""));
+        assert!(json_content.contains("\"speaker\": \"1\""));
+
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }
