@@ -7,13 +7,15 @@ pub mod download;
 pub use download::{download_model, get_model_download_url};
 pub mod format;
 pub use format::{
-    export_segments_to_file, JsonFormatter, KaraokeVttFormatter, OutputFormatOptions,
-    OutputFormatter, SrtFormatter, TxtFormatter, VttFormatter,
+    color_for_prob, confidence_style, export_segments_to_file, format_colored_token,
+    format_confidence_token, format_segment_colors, format_segment_confidence, rgb2xterm256,
+    CsvFormatter, JsonFormatter, KaraokeVttFormatter, LrcFormatter, OutputFormatOptions,
+    OutputFormatter, SrtFormatter, TxtFormatter, VttFormatter, WtsFormatter,
 };
 use whisper_rs::model::WhisperModel;
 use whisper_rs::{WhisperContext, WhisperParams};
 
-#[derive(Parser, Debug, Clone, PartialEq, Eq)]
+#[derive(Parser, Debug, Clone, PartialEq)]
 #[command(
     author,
     version,
@@ -101,6 +103,83 @@ pub struct Args {
     /// Do not print anything other than the results
     #[arg(long = "no-prints", alias = "np", default_value_t = false)]
     pub no_prints: bool,
+
+    /// Time offset in milliseconds
+    #[arg(long = "offset-t", alias = "ot", default_value_t = 0)]
+    pub offset_t: i32,
+
+    /// Duration of audio to process in milliseconds (0 = all)
+    #[arg(short = 'd', long = "duration", default_value_t = 0)]
+    pub duration: i32,
+
+    /// Maximum initial timestamp at step 0 (in seconds)
+    #[arg(long = "max-initial-ts", default_value_t = 1.0)]
+    pub max_initial_ts: f32,
+
+    /// Force single segment output
+    #[arg(long = "single-segment", alias = "ss", default_value_t = false)]
+    pub single_segment: bool,
+
+    /// Regular expression matching tokens to suppress
+    #[arg(long = "suppress-regex")]
+    pub suppress_regex: Option<String>,
+
+    /// Print tokens with ANSI 256-color confidence gradient
+    #[arg(long = "print-colors", alias = "pc", default_value_t = false)]
+    pub print_colors: bool,
+
+    /// Print confidence text styles: underline/dim/highlight
+    #[arg(long = "print-confidence", default_value_t = false)]
+    pub print_confidence: bool,
+
+    /// Output script for generating karaoke video (.wts.sh)
+    #[arg(long = "output-words", alias = "owts", default_value_t = false)]
+    pub output_words: bool,
+
+    /// Path to a monospace TTF font for karaoke video script
+    #[arg(
+        long = "font-path",
+        alias = "fp",
+        default_value = "/System/Library/Fonts/Supplemental/Courier New Bold.ttf"
+    )]
+    pub font_path: String,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            download: None,
+            file: String::new(),
+            language: "auto".to_string(),
+            threads: 4,
+            translate: false,
+            beam_size: 1,
+            prompt: None,
+            no_timestamps: false,
+            info: false,
+            output_txt: false,
+            output_srt: false,
+            output_vtt: false,
+            output_json: false,
+            output_csv: false,
+            output_lrc: false,
+            output_file: None,
+            word_timestamps: false,
+            tinydiarize: false,
+            karaoke: false,
+            no_prints: false,
+            offset_t: 0,
+            duration: 0,
+            max_initial_ts: 1.0,
+            single_segment: false,
+            suppress_regex: None,
+            print_colors: false,
+            print_confidence: false,
+            output_words: false,
+            font_path: "/System/Library/Fonts/Supplemental/Courier New Bold.ttf".to_string(),
+        }
+    }
 }
 
 /// Preprocess command-line arguments to support whisper.cpp style flags such as
@@ -133,8 +212,17 @@ where
             "-ocsv" => out.push("--output-csv".to_string()),
             "-olrc" => out.push("--output-lrc".to_string()),
             "-np" => out.push("--no-prints".to_string()),
+            "-ot" => out.push("--offset-t".to_string()),
+            "-d" => out.push("--duration".to_string()),
+            "-ss" => out.push("--single-segment".to_string()),
+            "-pc" => out.push("--print-colors".to_string()),
+            "-owts" => out.push("--output-words".to_string()),
+            "-fp" => out.push("--font-path".to_string()),
             s if s.starts_with("-of=") => out.push(format!("--output-file={}", &s[4..])),
             s if s.starts_with("-bs=") => out.push(format!("--beam-size={}", &s[4..])),
+            s if s.starts_with("-ot=") => out.push(format!("--offset-t={}", &s[4..])),
+            s if s.starts_with("-d=") => out.push(format!("--duration={}", &s[3..])),
+            s if s.starts_with("-fp=") => out.push(format!("--font-path={}", &s[4..])),
             _ => out.push(arg),
         }
     }
@@ -151,6 +239,9 @@ impl From<&Args> for OutputFormatOptions {
             output_csv: args.output_csv,
             output_lrc: args.output_lrc,
             karaoke: args.karaoke,
+            output_wts: args.output_words,
+            font_path: args.font_path.clone(),
+            input_file: args.file.clone(),
         }
     }
 }
@@ -229,6 +320,10 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("failed to initialize whisper context: {}", e))?;
     let load_dur = t0.elapsed();
 
+    if args.output_words {
+        args.word_timestamps = true;
+    }
+
     let params = WhisperParams {
         language: args.language.clone(),
         translate: args.translate,
@@ -237,6 +332,11 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         no_timestamps: args.no_timestamps,
         n_threads: args.threads,
         tdrz_enable: args.tinydiarize,
+        offset_ms: args.offset_t,
+        duration_ms: args.duration,
+        max_initial_ts: args.max_initial_ts,
+        single_segment: args.single_segment,
+        suppress_regex: args.suppress_regex.clone(),
         ..Default::default()
     };
 
@@ -279,14 +379,40 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
     for seg in &segments {
         if args.word_timestamps && !seg.words.is_empty() {
             for w in &seg.words {
-                println!(
-                    "  [word {:05.2}s --> {:05.2}s] \"{}\" (p={:.2})",
-                    w.t0, w.t1, w.word, w.probability
-                );
+                if args.print_colors {
+                    println!(
+                        "  [word {:05.2}s --> {:05.2}s] \"{}\" (p={:.2})",
+                        w.t0,
+                        w.t1,
+                        format_colored_token(&w.word, w.probability),
+                        w.probability
+                    );
+                } else if args.print_confidence {
+                    println!(
+                        "  [word {:05.2}s --> {:05.2}s] \"{}\" (p={:.2})",
+                        w.t0,
+                        w.t1,
+                        format_confidence_token(&w.word, w.probability),
+                        w.probability
+                    );
+                } else {
+                    println!(
+                        "  [word {:05.2}s --> {:05.2}s] \"{}\" (p={:.2})",
+                        w.t0, w.t1, w.word, w.probability
+                    );
+                }
             }
         }
+        let formatted_text = if args.print_colors {
+            format_segment_colors(seg)
+        } else if args.print_confidence {
+            format_segment_confidence(seg)
+        } else {
+            seg.text.trim().to_string()
+        };
+
         if args.no_timestamps {
-            println!("\n {}", seg.text.trim());
+            println!("\n {}", formatted_text);
         } else {
             let t0 = if seg.t0.is_finite() && seg.t0 >= 0.0 {
                 seg.t0
@@ -306,7 +432,7 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 (t1 / 3600.0) as u32,
                 ((t1 % 3600.0) / 60.0) as u32,
                 t1 % 60.0,
-                seg.text.trim()
+                formatted_text
             );
         }
     }
@@ -599,11 +725,6 @@ mod tests {
             file: "audio.wav".to_string(),
             language: "en".to_string(),
             threads: 4,
-            translate: false,
-            beam_size: 1,
-            prompt: None,
-            no_timestamps: false,
-            info: false,
             output_txt: true,
             output_srt: true,
             output_vtt: true,
@@ -611,11 +732,8 @@ mod tests {
             output_csv: true,
             output_lrc: true,
             output_file: Some(base_str.to_string()),
-            word_timestamps: false,
-            tinydiarize: false,
-            karaoke: false,
-            download: None,
             no_prints: true,
+            ..Default::default()
         };
 
         let segments = vec![
@@ -673,25 +791,9 @@ mod tests {
         let args = Args {
             model: "non_existent_model_file_12345.bin".to_string(),
             file: "audio.wav".to_string(),
-            language: "auto".to_string(),
             threads: 1,
-            translate: false,
-            beam_size: 1,
-            prompt: None,
-            no_timestamps: false,
-            info: false,
-            output_txt: false,
-            output_srt: false,
-            output_vtt: false,
-            output_json: false,
-            output_csv: false,
-            output_lrc: false,
-            output_file: None,
-            word_timestamps: false,
-            tinydiarize: false,
-            karaoke: false,
-            download: None,
             no_prints: true,
+            ..Default::default()
         };
         let res = run(args);
         assert!(res.is_err());
@@ -704,27 +806,146 @@ mod tests {
         let args = Args {
             model: "non_existent_model_file_12345.bin".to_string(),
             file: "".to_string(),
-            language: "auto".to_string(),
             threads: 1,
-            translate: false,
-            beam_size: 1,
-            prompt: None,
-            no_timestamps: false,
-            info: false,
-            output_txt: false,
-            output_srt: false,
-            output_vtt: false,
-            output_json: false,
-            output_csv: false,
-            output_lrc: false,
-            output_file: None,
-            word_timestamps: false,
-            tinydiarize: false,
-            karaoke: false,
-            download: None,
             no_prints: true,
+            ..Default::default()
         };
         let res = run(args);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_normalize_cli_args_parity_flags() {
+        let input = vec![
+            "whisper-cli",
+            "-ot",
+            "1500",
+            "-d",
+            "5000",
+            "-ss",
+            "-pc",
+            "-owts",
+            "-fp",
+            "/path/to/my_font.ttf",
+        ];
+        let normalized = normalize_cli_args(input);
+        assert_eq!(
+            normalized,
+            vec![
+                "whisper-cli",
+                "--offset-t",
+                "1500",
+                "--duration",
+                "5000",
+                "--single-segment",
+                "--print-colors",
+                "--output-words",
+                "--font-path",
+                "/path/to/my_font.ttf",
+            ]
+        );
+
+        let input_eq = vec![
+            "whisper-cli",
+            "-ot=2000",
+            "-d=8000",
+            "-fp=/another/font.ttf",
+        ];
+        let normalized_eq = normalize_cli_args(input_eq);
+        assert_eq!(
+            normalized_eq,
+            vec![
+                "whisper-cli",
+                "--offset-t=2000",
+                "--duration=8000",
+                "--font-path=/another/font.ttf",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_args_with_parity_flags() {
+        let input = vec![
+            "whisper-cli",
+            "-m",
+            "tiny.bin",
+            "-f",
+            "speech.wav",
+            "-ot",
+            "1200",
+            "-d",
+            "6500",
+            "--max-initial-ts",
+            "2.5",
+            "-ss",
+            "--suppress-regex",
+            "[0-9]+",
+            "-pc",
+            "--print-confidence",
+            "-owts",
+            "-fp",
+            "/fonts/mono.ttf",
+        ];
+        let normalized = normalize_cli_args(input);
+        let args = Args::try_parse_from(normalized).expect("Parse parity flags");
+        assert_eq!(args.offset_t, 1200);
+        assert_eq!(args.duration, 6500);
+        assert_eq!(args.max_initial_ts, 2.5);
+        assert!(args.single_segment);
+        assert_eq!(args.suppress_regex.as_deref(), Some("[0-9]+"));
+        assert!(args.print_colors);
+        assert!(args.print_confidence);
+        assert!(args.output_words);
+        assert_eq!(args.font_path, "/fonts/mono.ttf");
+    }
+
+    #[test]
+    fn test_write_output_files_with_wts() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "whisper_cli_test_wts_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_dir).expect("Create temp dir");
+        let base = temp_dir.join("test_wts_out");
+        let base_str = base.to_str().unwrap();
+
+        let args = Args {
+            output_words: true,
+            font_path: "/fonts/Courier.ttf".to_string(),
+            file: "speech_sample.wav".to_string(),
+            output_file: Some(base_str.to_string()),
+            no_prints: true,
+            ..Default::default()
+        };
+
+        let words = vec![
+            whisper_rs::WordTiming::new("Hello", 0.0, 0.5, 0.95),
+            whisper_rs::WordTiming::new("world!", 0.5, 1.2, 0.98),
+        ];
+        let segments = vec![whisper_rs::Segment::with_words(
+            0.0,
+            1.2,
+            "Hello world!".to_string(),
+            vec![1, 2],
+            words,
+        )];
+
+        write_output_files(&args, base_str, &segments).expect("Write output files with wts");
+
+        let wts_path = format!("{}.wts.sh", base_str);
+        let wts_content = fs::read_to_string(&wts_path).expect("Read wts.sh");
+        assert!(wts_content.starts_with("#!/bin/bash\n"));
+        assert!(wts_content.contains("ffmpeg -i speech_sample.wav"));
+        assert!(wts_content.contains("fontfile='/fonts/Courier.ttf'"));
+        assert!(wts_content.contains("fontcolor=lightgreen"));
+        assert!(wts_content.contains("text='> Hello world!'"));
+        assert!(wts_content.contains("speech_sample.wav.mp4"));
+
+        // Clean up temp dir
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
