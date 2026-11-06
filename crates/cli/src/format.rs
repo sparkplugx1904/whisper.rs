@@ -34,9 +34,42 @@ impl OutputFormatter for TxtFormatter {
     }
 }
 
+pub(crate) fn speaker_id(s: &str) -> &str {
+    let s = s.trim();
+    if let Some(rest) = s
+        .strip_prefix("(speaker ")
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        rest.trim()
+    } else if let Some(rest) = s
+        .strip_prefix("Speaker ")
+        .or_else(|| s.strip_prefix("speaker "))
+    {
+        rest.trim()
+    } else if let Some(rest) = s
+        .strip_prefix("<v Speaker")
+        .and_then(|r| r.strip_suffix('>'))
+    {
+        rest.trim()
+    } else {
+        s
+    }
+}
+
 /// SubRip (.srt) subtitle formatter.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SrtFormatter;
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SrtFormatter {
+    pub diarize: bool,
+}
+
+impl SrtFormatter {
+    pub const fn new(diarize: bool) -> Self {
+        Self { diarize }
+    }
+}
+
+#[allow(non_upper_case_globals)]
+pub const SrtFormatter: SrtFormatter = SrtFormatter { diarize: false };
 
 impl OutputFormatter for SrtFormatter {
     fn name(&self) -> &'static str {
@@ -49,15 +82,40 @@ impl OutputFormatter for SrtFormatter {
 
     fn write_segments(&self, segments: &[Segment], writer: &mut dyn Write) -> std::io::Result<()> {
         for (i, s) in segments.iter().enumerate() {
-            write!(writer, "{}", s.to_srt(i + 1))?;
+            let speaker_prefix = match &s.speaker {
+                Some(spk) if self.diarize || !spk.is_empty() => {
+                    format!("(speaker {}) ", speaker_id(spk))
+                }
+                None if self.diarize => "(speaker ?) ".to_string(),
+                _ => String::new(),
+            };
+            write!(
+                writer,
+                "{}\n{} --> {}\n{}{}\n\n",
+                i + 1,
+                whisper_rs::segment::fmt_time_srt(s.t0),
+                whisper_rs::segment::fmt_time_srt(s.t1),
+                speaker_prefix,
+                s.text.trim()
+            )?;
         }
         Ok(())
     }
 }
-
 /// WebVTT (.vtt) subtitle formatter.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct VttFormatter;
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VttFormatter {
+    pub diarize: bool,
+}
+
+impl VttFormatter {
+    pub const fn new(diarize: bool) -> Self {
+        Self { diarize }
+    }
+}
+
+#[allow(non_upper_case_globals)]
+pub const VttFormatter: VttFormatter = VttFormatter { diarize: false };
 
 impl OutputFormatter for VttFormatter {
     fn name(&self) -> &'static str {
@@ -71,15 +129,40 @@ impl OutputFormatter for VttFormatter {
     fn write_segments(&self, segments: &[Segment], writer: &mut dyn Write) -> std::io::Result<()> {
         writeln!(writer, "WEBVTT\n")?;
         for s in segments {
-            write!(writer, "{}", s.to_vtt())?;
+            let speaker_prefix = match &s.speaker {
+                Some(spk) if self.diarize || !spk.is_empty() => {
+                    format!("<v Speaker{}>", speaker_id(spk))
+                }
+                None if self.diarize => "<v Speaker?>".to_string(),
+                _ => String::new(),
+            };
+            write!(
+                writer,
+                "{} --> {}\n{}{}\n\n",
+                whisper_rs::segment::fmt_time_vtt(s.t0),
+                whisper_rs::segment::fmt_time_vtt(s.t1),
+                speaker_prefix,
+                s.text.trim()
+            )?;
         }
         Ok(())
     }
 }
 
 /// JSON (.json) segment array formatter.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct JsonFormatter;
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct JsonFormatter {
+    pub diarize: bool,
+}
+
+impl JsonFormatter {
+    pub const fn new(diarize: bool) -> Self {
+        Self { diarize }
+    }
+}
+
+#[allow(non_upper_case_globals)]
+pub const JsonFormatter: JsonFormatter = JsonFormatter { diarize: false };
 
 impl OutputFormatter for JsonFormatter {
     fn name(&self) -> &'static str {
@@ -94,7 +177,65 @@ impl OutputFormatter for JsonFormatter {
         writeln!(writer, "[")?;
         for (i, s) in segments.iter().enumerate() {
             let comma = if i + 1 < segments.len() { "," } else { "" };
-            writeln!(writer, "  {}{}", s.to_json(), comma)?;
+            let t0 = if s.t0.is_finite() && s.t0 >= 0.0 {
+                s.t0
+            } else {
+                0.0
+            };
+            let t1 = if s.t1.is_finite() && s.t1 >= 0.0 {
+                s.t1
+            } else {
+                0.0
+            };
+            let spk = s.speaker.as_deref().map(speaker_id).or(if self.diarize {
+                Some("?")
+            } else {
+                None
+            });
+            let speaker_field = match spk {
+                Some(id) => format!(
+                    ", \"speaker\": \"{}\"",
+                    whisper_rs::segment::escape_json(id)
+                ),
+                None => String::new(),
+            };
+            let json_body = if s.words.is_empty() {
+                format!(
+                    "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}{}}}",
+                    t0,
+                    t1,
+                    whisper_rs::segment::escape_json(s.text.trim()),
+                    s.avg_logprob,
+                    s.no_speech_prob,
+                    speaker_field
+                )
+            } else {
+                let words_json = s
+                    .words
+                    .iter()
+                    .map(|w| {
+                        format!(
+                            "{{\"word\": \"{}\", \"start\": {:.3}, \"end\": {:.3}, \"probability\": {:.4}}}",
+                            whisper_rs::segment::escape_json(&w.word),
+                            w.t0,
+                            w.t1,
+                            w.probability
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}, \"words\": [{}]{}}}",
+                    t0,
+                    t1,
+                    whisper_rs::segment::escape_json(s.text.trim()),
+                    s.avg_logprob,
+                    s.no_speech_prob,
+                    words_json,
+                    speaker_field
+                )
+            };
+            writeln!(writer, "  {}{}", json_body, comma)?;
         }
         writeln!(writer, "]")?;
         Ok(())
@@ -124,8 +265,19 @@ impl OutputFormatter for KaraokeVttFormatter {
 }
 
 /// Comma-Separated Values (.csv) subtitle formatter matching whisper.cpp format.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct CsvFormatter;
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CsvFormatter {
+    pub diarize: bool,
+}
+
+impl CsvFormatter {
+    pub const fn new(diarize: bool) -> Self {
+        Self { diarize }
+    }
+}
+
+#[allow(non_upper_case_globals)]
+pub const CsvFormatter: CsvFormatter = CsvFormatter { diarize: false };
 
 impl OutputFormatter for CsvFormatter {
     fn name(&self) -> &'static str {
@@ -137,12 +289,22 @@ impl OutputFormatter for CsvFormatter {
     }
 
     fn write_segments(&self, segments: &[Segment], writer: &mut dyn Write) -> std::io::Result<()> {
-        writeln!(writer, "start,end,text")?;
+        let diarize_active = self.diarize || segments.iter().any(|s| s.speaker.is_some());
+        if diarize_active {
+            writeln!(writer, "start,end,speaker,text")?;
+        } else {
+            writeln!(writer, "start,end,text")?;
+        }
         for s in segments {
             let t0_ms = (s.t0.max(0.0) * 1000.0).round() as u64;
             let t1_ms = (s.t1.max(0.0) * 1000.0).round() as u64;
             let escaped = s.text.trim().replace('"', "\"\"");
-            writeln!(writer, "{},{},\"{}\"", t0_ms, t1_ms, escaped)?;
+            if diarize_active {
+                let spk = s.speaker.as_deref().map(speaker_id).unwrap_or("?");
+                writeln!(writer, "{},{},{},\"{}\"", t0_ms, t1_ms, spk, escaped)?;
+            } else {
+                writeln!(writer, "{},{},\"{}\"", t0_ms, t1_ms, escaped)?;
+            }
         }
         Ok(())
     }
@@ -381,6 +543,7 @@ pub struct OutputFormatOptions {
     pub output_wts: bool,
     pub font_path: String,
     pub input_file: String,
+    pub diarize: bool,
 }
 
 impl Default for OutputFormatOptions {
@@ -396,6 +559,7 @@ impl Default for OutputFormatOptions {
             output_wts: false,
             font_path: "/System/Library/Fonts/Supplemental/Courier New Bold.ttf".to_string(),
             input_file: "audio.wav".to_string(),
+            diarize: false,
         }
     }
 }
@@ -408,16 +572,24 @@ impl OutputFormatOptions {
             list.push(Box::new(TxtFormatter));
         }
         if self.output_srt {
-            list.push(Box::new(SrtFormatter));
+            list.push(Box::new(SrtFormatter {
+                diarize: self.diarize,
+            }));
         }
         if self.output_vtt {
-            list.push(Box::new(VttFormatter));
+            list.push(Box::new(VttFormatter {
+                diarize: self.diarize,
+            }));
         }
         if self.output_json {
-            list.push(Box::new(JsonFormatter));
+            list.push(Box::new(JsonFormatter {
+                diarize: self.diarize,
+            }));
         }
         if self.output_csv {
-            list.push(Box::new(CsvFormatter));
+            list.push(Box::new(CsvFormatter {
+                diarize: self.diarize,
+            }));
         }
         if self.output_lrc {
             list.push(Box::new(LrcFormatter));
@@ -705,5 +877,86 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].name(), "Karaoke Video Script");
         assert_eq!(active[0].file_extension(), "wts.sh");
+    }
+
+    #[test]
+    fn test_diarized_srt_formatting() {
+        let segments = vec![
+            Segment::new(0.0, 2.5, " Hello there! ".to_string(), vec![]).with_speaker("0"),
+            Segment::new(2.5, 5.0, " General Kenobi! ".to_string(), vec![]).with_speaker("1"),
+            Segment::new(5.0, 7.5, " Both speaking ".to_string(), vec![]).with_speaker("?"),
+        ];
+        let mut buf = Vec::new();
+        SrtFormatter::new(true)
+            .write_segments(&segments, &mut buf)
+            .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("1\n00:00:00,000 --> 00:00:02,500\n(speaker 0) Hello there!\n\n"));
+        assert!(s.contains("2\n00:00:02,500 --> 00:00:05,000\n(speaker 1) General Kenobi!\n\n"));
+        assert!(s.contains("3\n00:00:05,000 --> 00:00:07,500\n(speaker ?) Both speaking\n\n"));
+    }
+
+    #[test]
+    fn test_diarized_vtt_formatting() {
+        let segments = vec![
+            Segment::new(0.0, 3.0, " First speaker ".to_string(), vec![]).with_speaker("0"),
+            Segment::new(3.0, 6.0, " Second speaker ".to_string(), vec![]).with_speaker("1"),
+        ];
+        let mut buf = Vec::new();
+        VttFormatter::new(true)
+            .write_segments(&segments, &mut buf)
+            .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with("WEBVTT\n\n"));
+        assert!(s.contains("00:00:00.000 --> 00:00:03.000\n<v Speaker0>First speaker\n\n"));
+        assert!(s.contains("00:00:03.000 --> 00:00:06.000\n<v Speaker1>Second speaker\n\n"));
+    }
+
+    #[test]
+    fn test_diarized_csv_formatting() {
+        let segments = vec![
+            Segment::new(0.0, 1.5, " Intro ".to_string(), vec![]).with_speaker("0"),
+            Segment::new(1.5, 3.25, " Response with \"quotes\" ".to_string(), vec![])
+                .with_speaker("1"),
+        ];
+        let mut buf = Vec::new();
+        CsvFormatter::new(true)
+            .write_segments(&segments, &mut buf)
+            .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines[0], "start,end,speaker,text");
+        assert_eq!(lines[1], "0,1500,0,\"Intro\"");
+        assert_eq!(lines[2], "1500,3250,1,\"Response with \"\"quotes\"\"\"");
+    }
+
+    #[test]
+    fn test_diarized_json_formatting() {
+        let segments = vec![
+            Segment::new(0.0, 2.0, " JSON speaker test ".to_string(), vec![]).with_speaker("0"),
+        ];
+        let mut buf = Vec::new();
+        JsonFormatter::new(true)
+            .write_segments(&segments, &mut buf)
+            .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("\"speaker\": \"0\""));
+        assert!(s.contains("\"start\": 0.000"));
+        assert!(s.contains("\"end\": 2.000"));
+        assert!(s.contains("\"text\": \"JSON speaker test\""));
+    }
+
+    #[test]
+    fn test_active_formatters_with_diarize() {
+        let opts = OutputFormatOptions {
+            output_srt: true,
+            output_vtt: true,
+            output_json: true,
+            output_csv: true,
+            diarize: true,
+            ..Default::default()
+        };
+        let active = opts.active_formatters();
+        assert_eq!(active.len(), 4);
     }
 }
