@@ -12,6 +12,7 @@ pub struct BeamCandidate {
 pub struct BeamSearch {
     pub beam_size: usize,
     pub candidates: Vec<BeamCandidate>,
+    pub suppress_indices: Vec<usize>,
 }
 
 impl BeamSearch {
@@ -27,6 +28,7 @@ impl BeamSearch {
         Self {
             beam_size,
             candidates: vec![root],
+            suppress_indices: Vec::new(),
         }
     }
 
@@ -86,6 +88,13 @@ impl BeamSearch {
             } else if let Some(last_ts) = cand.last_timestamp {
                 if (last_ts as usize) > (beg as usize) {
                     step_logits[(beg as usize)..(last_ts as usize)].fill(f32::NEG_INFINITY);
+                }
+            }
+
+            // Suppress regex / custom token indices
+            for &idx in &self.suppress_indices {
+                if idx < step_logits.len() {
+                    step_logits[idx] = f32::NEG_INFINITY;
                 }
             }
 

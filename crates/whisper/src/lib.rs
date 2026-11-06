@@ -19,8 +19,8 @@ pub use encoder::{EncoderBlockWeights, EncoderWeights, WhisperEncoder};
 pub use filter::{
     apply_repetition_penalty, apply_suppress_blank, apply_suppress_non_speech, compression_ratio,
     compute_distribution_entropy, compute_token_logprob, GrammarLogitFilter, LogitFilter,
-    LogitFilterContext, LogitFilterPipeline, RepetitionPenaltyFilter, SuppressBlankFilter,
-    SuppressNonSpeechFilter, TimestampLogitFilter,
+    LogitFilterContext, LogitFilterPipeline, RegexFilter, RepetitionPenaltyFilter,
+    SuppressBlankFilter, SuppressNonSpeechFilter, TimestampLogitFilter,
 };
 pub use params::{AbortCallback, FullParamsBuilder, SamplingStrategy, WhisperParams};
 pub use segment::{

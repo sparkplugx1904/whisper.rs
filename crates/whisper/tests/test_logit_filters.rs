@@ -74,3 +74,115 @@ fn test_logit_filter_pipeline_combination() {
     // Token 2 untouched
     assert_eq!(logits[2], 1.0);
 }
+
+#[test]
+fn test_regex_filter() {
+    use whisper_rs::filter::{LogitFilter, LogitFilterContext, RegexFilter};
+
+    let mut vocab = Vocab::new();
+    let id_hello = vocab.add_token("hello");
+    let id_world = vocab.add_token("world");
+    let id_music = vocab.add_token("[MUSIC]");
+    let id_applause = vocab.add_token("[APPLAUSE]");
+    let id_num = vocab.add_token("123");
+
+    let filter = RegexFilter::new(r"^\[.*\]$", &vocab).expect("regex compile failed");
+    assert!(filter.indices.contains(&(id_music as usize)));
+    assert!(filter.indices.contains(&(id_applause as usize)));
+    assert!(!filter.indices.contains(&(id_hello as usize)));
+    assert!(!filter.indices.contains(&(id_world as usize)));
+    assert!(!filter.indices.contains(&(id_num as usize)));
+
+    let mut logits = vec![1.0f32; 10];
+    let ctx = LogitFilterContext {
+        step: 0,
+        tokens_cur: &[],
+        last_timestamp_token: None,
+    };
+    filter.apply(&mut logits, &ctx);
+
+    assert_eq!(logits[id_music as usize], f32::NEG_INFINITY);
+    assert_eq!(logits[id_applause as usize], f32::NEG_INFINITY);
+    assert_eq!(logits[id_hello as usize], 1.0);
+    assert_eq!(logits[id_world as usize], 1.0);
+    assert_eq!(logits[id_num as usize], 1.0);
+}
+
+#[test]
+#[allow(clippy::needless_range_loop)]
+fn test_timestamp_logit_filter_max_initial_ts() {
+    use whisper_rs::filter::{LogitFilter, LogitFilterContext, TimestampLogitFilter};
+
+    let beg = 50;
+    let n_vocab = 100;
+    let max_initial_ts = 0.5f32; // 0.5s / 0.02 = 25 tokens. Max initial ts token = 50 + 25 = 75.
+    let filter = TimestampLogitFilter::with_max_initial_ts(beg, n_vocab, false, max_initial_ts);
+
+    let mut logits = vec![1.0f32; 100];
+    let ctx_step0 = LogitFilterContext {
+        step: 0,
+        tokens_cur: &[],
+        last_timestamp_token: None,
+    };
+    filter.apply(&mut logits, &ctx_step0);
+
+    // Tokens <= 75 should not be suppressed
+    for i in beg..=75 {
+        assert_eq!(logits[i], 1.0, "Token {} should not be suppressed", i);
+    }
+    // Tokens > 75 should be suppressed to -f32::INFINITY
+    for i in 76..100 {
+        assert_eq!(
+            logits[i],
+            f32::NEG_INFINITY,
+            "Token {} should be suppressed",
+            i
+        );
+    }
+
+    // At step 1, initial ts suppression is not applied
+    let mut logits_step1 = vec![1.0f32; 100];
+    let ctx_step1 = LogitFilterContext {
+        step: 1,
+        tokens_cur: &[70],
+        last_timestamp_token: Some(60),
+    };
+    filter.apply(&mut logits_step1, &ctx_step1);
+    // Timestamps prior to last_timestamp (beg..60) suppressed so timestamps cannot regress
+    for i in beg..60 {
+        assert_eq!(logits_step1[i], f32::NEG_INFINITY);
+    }
+    // Timestamps >= 60 remain unsuppressed at step 1
+    for i in 60..100 {
+        assert_eq!(logits_step1[i], 1.0);
+    }
+}
+
+#[test]
+fn test_params_parity_fields() {
+    use whisper_rs::{FullParamsBuilder, SamplingStrategy, WhisperParams};
+
+    let default_params = WhisperParams::default();
+    assert_eq!(default_params.offset_ms, 0);
+    assert_eq!(default_params.duration_ms, 0);
+    assert_eq!(default_params.max_initial_ts, 1.0);
+    assert!(!default_params.single_segment);
+    assert_eq!(default_params.suppress_regex, None);
+    assert_eq!(default_params.audio_ctx, 0);
+
+    let params = FullParamsBuilder::new(SamplingStrategy::Greedy { best_of: 1 })
+        .offset_ms(1500)
+        .duration_ms(3000)
+        .max_initial_ts(0.5)
+        .single_segment(true)
+        .suppress_regex(r"^\[.*\]$")
+        .audio_ctx(750)
+        .build();
+
+    assert_eq!(params.offset_ms, 1500);
+    assert_eq!(params.duration_ms, 3000);
+    assert_eq!(params.max_initial_ts, 0.5);
+    assert!(params.single_segment);
+    assert_eq!(params.suppress_regex.as_deref(), Some(r"^\[.*\]$"));
+    assert_eq!(params.audio_ctx, 750);
+}

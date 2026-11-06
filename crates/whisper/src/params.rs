@@ -64,6 +64,18 @@ pub struct WhisperParams {
     pub entropy_thold: f32,
     /// Callback to abort processing early (return true to abort)
     pub abort_callback: Option<AbortCallback>,
+    /// Start time offset in audio processing (in ms, default: 0)
+    pub offset_ms: i32,
+    /// Duration of audio to process (in ms, default: 0 = full audio)
+    pub duration_ms: i32,
+    /// Timestamp token limit at step 0 (default: 1.0s)
+    pub max_initial_ts: f32,
+    /// Force single segment output, useful for streaming (default: false)
+    pub single_segment: bool,
+    /// Regular expression matching tokens to suppress (default: None)
+    pub suppress_regex: Option<String>,
+    /// Override audio context length (default: 0 = 1500)
+    pub audio_ctx: usize,
 }
 impl std::fmt::Debug for WhisperParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -75,6 +87,12 @@ impl std::fmt::Debug for WhisperParams {
             .field("no_timestamps", &self.no_timestamps)
             .field("flash_attn", &self.flash_attn)
             .field("tdrz_enable", &self.tdrz_enable)
+            .field("offset_ms", &self.offset_ms)
+            .field("duration_ms", &self.duration_ms)
+            .field("max_initial_ts", &self.max_initial_ts)
+            .field("single_segment", &self.single_segment)
+            .field("suppress_regex", &self.suppress_regex)
+            .field("audio_ctx", &self.audio_ctx)
             .finish()
     }
 }
@@ -111,6 +129,12 @@ impl Default for WhisperParams {
             on_new_segment: None,
             on_progress: None,
             abort_callback: None,
+            offset_ms: 0,
+            duration_ms: 0,
+            max_initial_ts: 1.0,
+            single_segment: false,
+            suppress_regex: None,
+            audio_ctx: 0,
         }
     }
 }
@@ -251,6 +275,30 @@ impl FullParamsBuilder {
         F: Fn() -> bool + Send + Sync + 'static,
     {
         self.params.abort_callback = Some(Arc::new(cb));
+        self
+    }
+    pub fn offset_ms(mut self, offset_ms: i32) -> Self {
+        self.params.offset_ms = offset_ms;
+        self
+    }
+    pub fn duration_ms(mut self, duration_ms: i32) -> Self {
+        self.params.duration_ms = duration_ms;
+        self
+    }
+    pub fn max_initial_ts(mut self, max_initial_ts: f32) -> Self {
+        self.params.max_initial_ts = max_initial_ts;
+        self
+    }
+    pub fn single_segment(mut self, single_segment: bool) -> Self {
+        self.params.single_segment = single_segment;
+        self
+    }
+    pub fn suppress_regex(mut self, regex: impl Into<String>) -> Self {
+        self.params.suppress_regex = Some(regex.into());
+        self
+    }
+    pub fn audio_ctx(mut self, audio_ctx: usize) -> Self {
+        self.params.audio_ctx = audio_ctx;
         self
     }
     pub fn build(self) -> WhisperParams {

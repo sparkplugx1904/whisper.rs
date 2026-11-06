@@ -2,7 +2,7 @@ use crate::beam::BeamSearch;
 use crate::decoder::{DecoderKvCache, WhisperDecoder};
 use crate::encoder::WhisperEncoder;
 use crate::filter::{
-    compression_ratio, GrammarLogitFilter, LogitFilterContext, LogitFilterPipeline,
+    compression_ratio, GrammarLogitFilter, LogitFilterContext, LogitFilterPipeline, RegexFilter,
     RepetitionPenaltyFilter, SuppressBlankFilter, SuppressNonSpeechFilter, TimestampLogitFilter,
 };
 use crate::params::WhisperParams;
@@ -225,7 +225,11 @@ impl WhisperContext {
         state: &mut WhisperState,
     ) -> Vec<Segment> {
         let is_multilingual = self.model.hparams.is_multilingual();
-        let n_audio_ctx = self.model.hparams.n_audio_ctx as usize;
+        let n_audio_ctx = if params.audio_ctx > 0 {
+            params.audio_ctx
+        } else {
+            self.model.hparams.n_audio_ctx as usize
+        };
 
         // Precompute chunk 0 encoder output so we never compute it twice
         let mel_chunk_0 = mel.get_chunk(0, n_audio_ctx);
@@ -282,22 +286,33 @@ impl WhisperContext {
         }
 
         let mut segments = Vec::new();
-        let mut seek_frame = 0;
-        let n_audio_ctx = self.model.hparams.n_audio_ctx as usize;
+        let seek_start = (params.offset_ms / 10).max(0) as usize;
+        let mut seek_frame = seek_start;
+        let seek_end = if params.duration_ms > 0 {
+            (seek_start + (params.duration_ms / 10).max(0) as usize).min(mel.n_len_org)
+        } else {
+            mel.n_len_org
+        };
         let chunk_frames = 2 * n_audio_ctx; // 3000 frames = 30 seconds
         let total_audio_sec = mel.n_len_org as f64 * 0.01;
         let mut history_tokens: Vec<i32> = Vec::new();
+        let regex_filter = params
+            .suppress_regex
+            .as_deref()
+            .and_then(|pattern| RegexFilter::new(pattern, &self.model.vocab).ok());
 
-        while seek_frame < mel.n_len_org {
+        while seek_frame < seek_end {
             if params.abort_callback.as_ref().is_some_and(|cb| cb()) {
                 break;
             }
             if let Some(ref cb) = params.on_progress {
-                let pct = ((seek_frame as f64 / mel.n_len_org.max(1) as f64) * 100.0)
+                let total_frames = seek_end.saturating_sub(seek_start).max(1);
+                let pct = (((seek_frame.saturating_sub(seek_start)) as f64 / total_frames as f64)
+                    * 100.0)
                     .clamp(0.0, 100.0) as i32;
                 cb(pct);
             }
-            if seek_frame + 10 >= mel.n_len_org {
+            if seek_frame + 10 >= seek_end {
                 break;
             }
             let seek_time = seek_frame as f64 * 0.01;
@@ -352,8 +367,15 @@ impl WhisperContext {
                     if params.suppress_blank {
                         beam_pipeline.add(SuppressBlankFilter::new(220, eot));
                     }
-                    if params.no_timestamps {
-                        beam_pipeline.add(TimestampLogitFilter::new(beg as usize, n_vocab, true));
+                    beam_pipeline.add(TimestampLogitFilter::with_max_initial_ts(
+                        beg as usize,
+                        n_vocab,
+                        params.no_timestamps,
+                        params.max_initial_ts,
+                    ));
+                    if let Some(rf) = &regex_filter {
+                        beam_pipeline.add(rf.clone());
+                        beam.suppress_indices = rf.indices.clone();
                     }
                     if let Some(gbnf) = gbnf_grammar.clone() {
                         beam_pipeline.add(GrammarLogitFilter::new(
@@ -431,14 +453,18 @@ impl WhisperContext {
                         let nst_indices = crate::filter::get_non_speech_tokens(&self.model.vocab);
                         greedy_pipeline.add(SuppressNonSpeechFilter::new(nst_indices));
                     }
+                    if let Some(rf) = &regex_filter {
+                        greedy_pipeline.add(rf.clone());
+                    }
                     if params.repetition_penalty > 1.0 {
                         greedy_pipeline
                             .add(RepetitionPenaltyFilter::new(params.repetition_penalty));
                     }
-                    greedy_pipeline.add(TimestampLogitFilter::new(
+                    greedy_pipeline.add(TimestampLogitFilter::with_max_initial_ts(
                         beg as usize,
                         n_vocab,
                         params.no_timestamps,
+                        params.max_initial_ts,
                     ));
                     if let Some(gbnf) = gbnf_grammar.clone() {
                         greedy_pipeline.add(GrammarLogitFilter::new(
@@ -557,13 +583,19 @@ impl WhisperContext {
                         avg_entropy,
                     );
                     if !seg.text.trim().is_empty() {
-                        if let Some(ref cb) = params.on_new_segment {
+                        if let Some(cb) = &params.on_new_segment {
                             cb(&seg);
                         }
                         segments.push(seg);
+                        if params.single_segment {
+                            break;
+                        }
                     }
                 }
                 seek_frame += chunk_frames;
+                if params.single_segment && !segments.is_empty() {
+                    break;
+                }
             } else {
                 let mut seg_tokens = Vec::new();
                 let mut seg_t0 = seek_time;
@@ -586,10 +618,14 @@ impl WhisperContext {
                                 avg_entropy,
                             );
                             if !seg.text.trim().is_empty() {
-                                if let Some(ref cb) = params.on_new_segment {
+                                if let Some(cb) = &params.on_new_segment {
                                     cb(&seg);
                                 }
                                 segments.push(seg);
+                                if params.single_segment {
+                                    seg_tokens.clear();
+                                    break;
+                                }
                             }
                             seg_tokens.clear();
                             seg_t0 = abs_sec;
@@ -609,17 +645,21 @@ impl WhisperContext {
                                 avg_entropy,
                             );
                             if !seg.text.trim().is_empty() {
-                                if let Some(ref cb) = params.on_new_segment {
+                                if let Some(cb) = &params.on_new_segment {
                                     cb(&seg);
                                 }
                                 segments.push(seg);
+                                if params.single_segment {
+                                    seg_tokens.clear();
+                                    break;
+                                }
                             }
                             seg_tokens.clear();
                             seg_t0 = t_mid;
                         }
                     }
                 }
-                if !seg_tokens.is_empty() {
+                if !seg_tokens.is_empty() && (!params.single_segment || segments.is_empty()) {
                     let t1 = (seek_time + 30.0).min(total_audio_sec);
                     let seg = self.build_segment(
                         seg_t0,
@@ -630,12 +670,18 @@ impl WhisperContext {
                         avg_entropy,
                     );
                     if !seg.text.trim().is_empty() {
-                        if let Some(ref cb) = params.on_new_segment {
+                        if let Some(cb) = &params.on_new_segment {
                             cb(&seg);
                         }
                         segments.push(seg);
                     }
                     last_end_time = t1;
+                }
+
+                if params.single_segment && !segments.is_empty() {
+                    seek_frame += chunk_frames;
+                    let _ = seek_frame;
+                    break;
                 }
 
                 let advanced_frames = ((last_end_time - seek_time) / 0.01).round() as usize;
@@ -648,7 +694,7 @@ impl WhisperContext {
             }
         }
 
-        if let Some(ref cb) = params.on_progress {
+        if let Some(cb) = &params.on_progress {
             cb(100);
         }
 

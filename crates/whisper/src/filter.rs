@@ -242,12 +242,55 @@ impl LogitFilter for RepetitionPenaltyFilter {
     }
 }
 
+/// Filter that suppresses tokens matching a regular expression.
+#[derive(Debug, Clone)]
+pub struct RegexFilter {
+    pub indices: Vec<usize>,
+}
+
+impl RegexFilter {
+    /// Create a new `RegexFilter` by compiling a regex pattern and pre-identifying matching token IDs in the vocabulary.
+    pub fn new(pattern: &str, vocab: &whisper_model::Vocab) -> Result<Self, regex::Error> {
+        let re = regex::Regex::new(pattern)?;
+        let mut indices = Vec::new();
+        for (idx, token_str) in vocab.id_to_token.iter().enumerate() {
+            if re.is_match(token_str) {
+                indices.push(idx);
+            }
+        }
+        Ok(Self { indices })
+    }
+
+    /// Create a new `RegexFilter` from a pre-compiled `Regex` and vocabulary.
+    pub fn from_regex(regex: &regex::Regex, vocab: &whisper_model::Vocab) -> Self {
+        let mut indices = Vec::new();
+        for (idx, token_str) in vocab.id_to_token.iter().enumerate() {
+            if regex.is_match(token_str) {
+                indices.push(idx);
+            }
+        }
+        Self { indices }
+    }
+
+    /// Create a new `RegexFilter` from pre-computed matching token indices.
+    pub fn from_indices(indices: Vec<usize>) -> Self {
+        Self { indices }
+    }
+}
+
+impl LogitFilter for RegexFilter {
+    fn apply(&self, logits: &mut [f32], _ctx: &LogitFilterContext) {
+        apply_suppress_non_speech_indices(logits, &self.indices);
+    }
+}
+
 /// Filter that constrains timestamp token generation order or suppresses timestamps altogether.
 #[derive(Debug, Clone, Copy)]
 pub struct TimestampLogitFilter {
     pub beg: usize,
     pub n_vocab: usize,
     pub no_timestamps: bool,
+    pub max_initial_ts: f32,
 }
 
 impl TimestampLogitFilter {
@@ -256,6 +299,21 @@ impl TimestampLogitFilter {
             beg,
             n_vocab,
             no_timestamps,
+            max_initial_ts: 1.0,
+        }
+    }
+
+    pub fn with_max_initial_ts(
+        beg: usize,
+        n_vocab: usize,
+        no_timestamps: bool,
+        max_initial_ts: f32,
+    ) -> Self {
+        Self {
+            beg,
+            n_vocab,
+            no_timestamps,
+            max_initial_ts,
         }
     }
 }
@@ -267,10 +325,19 @@ impl LogitFilter for TimestampLogitFilter {
             if self.beg < limit {
                 logits[self.beg..limit].fill(f32::NEG_INFINITY);
             }
-        } else if let Some(last_ts) = ctx.last_timestamp_token {
-            let ts_idx = (last_ts as usize).min(limit);
-            if ts_idx > self.beg {
-                logits[self.beg..ts_idx].fill(f32::NEG_INFINITY);
+        } else {
+            if ctx.step == 0 && self.max_initial_ts >= 0.0 {
+                let max_ts_idx = self.beg + (self.max_initial_ts / 0.02).round() as usize;
+                let start_suppress = (max_ts_idx + 1).max(self.beg);
+                if start_suppress < limit {
+                    logits[start_suppress..limit].fill(f32::NEG_INFINITY);
+                }
+            }
+            if let Some(last_ts) = ctx.last_timestamp_token {
+                let ts_idx = (last_ts as usize).min(limit);
+                if ts_idx > self.beg {
+                    logits[self.beg..ts_idx].fill(f32::NEG_INFINITY);
+                }
             }
         }
     }
