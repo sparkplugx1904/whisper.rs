@@ -71,3 +71,4 @@ models/*.bin
 !tests/fixtures/*.bin
 whisper.cpp
 *.local
+.whisper-reference

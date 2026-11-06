@@ -493,7 +493,7 @@ cargo test --release --workspace
 This project stands on the shoulders of giants in the open-source speech recognition community. Sincere gratitude and respect to the following projects and maintainers:
 
 - **[whisper.cpp (ggml-org)](https://github.com/ggml-org/whisper.cpp)**: Georgi Gerganov and the ggml-org community for the pioneering C/C++ inference implementation, the GGML model format, quantization algorithms, and setting the gold standard for lightweight edge ASR.
-- **[whisper-rs by tazz](https://codeberg.org/tazz/whisper-rs)** (also on [GitHub](https://github.com/tazz4843/whisper-rs)): tazz4843 for creating the original Rust bindings ecosystem for whisper.cpp, providing idiomatic Rust wrappers and inspiring pure-Rust ASR exploration.
+- **[whisper-rs by tazz](https://codeberg.org/tazz4843/whisper-rs)** (also on [GitHub](https://github.com/tazz4843/whisper-rs)): tazz4843 for creating the original Rust bindings ecosystem for whisper.cpp, providing idiomatic Rust wrappers and inspiring pure-Rust ASR exploration.
 - **[faster-whisper (SYSTRAN)](https://github.com/SYSTRAN/faster-whisper)**: Guillaume Klein and the SYSTRAN team for the high-performance CTranslate2 reimplementation of Whisper, establishing benchmarks in batched CPU/GPU throughput and memory efficiency.
 - **[OpenAI Whisper](https://github.com/openai/whisper)**: Radford et al. and the OpenAI research team for open-sourcing the revolutionary Whisper model architecture and foundational weights.
 
