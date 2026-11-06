@@ -10,6 +10,7 @@ pub struct Segment {
     pub avg_logprob: f32,
     pub no_speech_prob: f32,
     pub avg_entropy: f32,
+    pub speaker: Option<String>,
 }
 
 impl Segment {
@@ -23,6 +24,7 @@ impl Segment {
             avg_logprob: -0.2,
             no_speech_prob: 0.01,
             avg_entropy: 0.5,
+            speaker: None,
         }
     }
 
@@ -42,6 +44,7 @@ impl Segment {
             avg_logprob: -0.2,
             no_speech_prob: 0.01,
             avg_entropy: 0.5,
+            speaker: None,
         }
     }
 
@@ -65,7 +68,13 @@ impl Segment {
             avg_logprob,
             no_speech_prob,
             avg_entropy,
+            speaker: None,
         }
+    }
+
+    pub fn with_speaker(mut self, speaker: impl Into<String>) -> Self {
+        self.speaker = Some(speaker.into());
+        self
     }
 
     /// Format as SRT subtitle entry (delegates to `format_srt`).
@@ -95,7 +104,7 @@ impl Segment {
 }
 
 /// Format a timestamp in seconds to `HH:MM:SS,mmm` (SRT style).
-fn fmt_time_srt(secs: f64) -> String {
+pub fn fmt_time_srt(secs: f64) -> String {
     let s_clamped = if secs.is_finite() && secs >= 0.0 {
         secs
     } else {
@@ -112,7 +121,7 @@ fn fmt_time_srt(secs: f64) -> String {
 }
 
 /// Format a timestamp in seconds to `HH:MM:SS.mmm` (VTT style).
-fn fmt_time_vtt(secs: f64) -> String {
+pub fn fmt_time_vtt(secs: f64) -> String {
     let s_clamped = if secs.is_finite() && secs >= 0.0 {
         secs
     } else {
@@ -130,21 +139,31 @@ fn fmt_time_vtt(secs: f64) -> String {
 
 /// Render segment as SRT subtitle string.
 pub fn format_srt(segment: &Segment, index: usize) -> String {
+    let speaker_prefix = match &segment.speaker {
+        Some(s) => format!("(speaker {}) ", s),
+        None => String::new(),
+    };
     format!(
-        "{}\n{} --> {}\n{}\n\n",
+        "{}\n{} --> {}\n{}{}\n\n",
         index,
         fmt_time_srt(segment.t0),
         fmt_time_srt(segment.t1),
+        speaker_prefix,
         segment.text.trim()
     )
 }
 
 /// Render segment as VTT subtitle string.
 pub fn format_vtt(segment: &Segment) -> String {
+    let speaker_prefix = match &segment.speaker {
+        Some(s) => format!("<v Speaker{}>", s),
+        None => String::new(),
+    };
     format!(
-        "{} --> {}\n{}\n\n",
+        "{} --> {}\n{}{}\n\n",
         fmt_time_vtt(segment.t0),
         fmt_time_vtt(segment.t1),
+        speaker_prefix,
         segment.text.trim()
     )
 }
@@ -206,14 +225,19 @@ pub fn format_json(segment: &Segment) -> String {
     } else {
         0.0
     };
+    let speaker_json = match &segment.speaker {
+        Some(s) => format!(", \"speaker\": \"{}\"", escape_json(s)),
+        None => String::new(),
+    };
     if segment.words.is_empty() {
         format!(
-            "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}}}",
+            "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}{}}}",
             t0,
             t1,
             escape_json(segment.text.trim()),
             segment.avg_logprob,
-            segment.no_speech_prob
+            segment.no_speech_prob,
+            speaker_json
         )
     } else {
         let words_json = segment
@@ -231,13 +255,14 @@ pub fn format_json(segment: &Segment) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}, \"words\": [{}]}}",
+            "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}, \"words\": [{}]{}}}",
             t0,
             t1,
             escape_json(segment.text.trim()),
             segment.avg_logprob,
             segment.no_speech_prob,
-            words_json
+            words_json,
+            speaker_json
         )
     }
 }
