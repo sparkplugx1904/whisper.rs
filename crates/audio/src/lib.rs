@@ -15,7 +15,10 @@ pub use mel::{
 };
 pub use resample::resample_to_16k;
 use thiserror::Error;
-pub use wav::{WavAudio, WHISPER_SAMPLE_RATE};
+pub use wav::{
+    WavAudio, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE,
+    WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_PCM, WHISPER_SAMPLE_RATE,
+};
 
 #[derive(Error, Debug)]
 pub enum AudioError {

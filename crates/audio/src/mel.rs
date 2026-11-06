@@ -149,8 +149,15 @@ pub fn compute_log_mel_spectrogram(
     }
 
     let n_len = (samples_padded.len() - frame_size) / frame_step;
-    let n_len_org = if n_samples + stage_2_pad >= frame_size {
-        1 + (n_samples + stage_2_pad - frame_size) / frame_step
+    // Calculate original frame length matching whisper.cpp:
+    // (n_samples + stage_2_pad - frame_size) / frame_step + 1
+    // For 40 <= n < 200 samples, ensure n_len_org evaluates to at least 1,
+    // while for n < 40 (such as empty audio), n_len_org is 0.
+    let n_len_org = if n_samples >= 40 {
+        let raw = (n_samples as isize + stage_2_pad as isize - frame_size as isize)
+            / frame_step as isize
+            + 1;
+        raw.max(1) as usize
     } else {
         0
     };
@@ -161,10 +168,11 @@ pub fn compute_log_mel_spectrogram(
 
     const N_FFT_BINS: usize = 1 + N_FFT / 2;
 
+    let fft = Fft400::shared();
+
     let active_mel: Vec<Vec<f32>> = (0..active_frames)
         .into_par_iter()
         .map(|i| {
-            let fft = Fft400::new();
             let mut fft_in = [0.0f32; N_FFT];
             let mut fft_out = [0.0f32; N_FFT * 2];
             let mut power = [0.0f32; N_FFT_BINS];

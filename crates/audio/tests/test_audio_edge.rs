@@ -1,7 +1,9 @@
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::f32::consts::PI;
 use whisper_audio::{
-    compute_log_mel_spectrogram, resample_to_16k, WavAudio, N_MELS, WHISPER_SAMPLE_RATE,
+    compute_log_mel_spectrogram, resample_to_16k, AudioError, WavAudio,
+    KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, KSDATAFORMAT_SUBTYPE_PCM, N_MELS, WAVE_FORMAT_EXTENSIBLE,
+    WHISPER_SAMPLE_RATE,
 };
 
 /// Helper to generate synthetic mel filterbank for testing [n_mels, 201].
@@ -47,6 +49,49 @@ fn create_wav_bytes(
     let block_align = channels * (bits_per_sample / 8);
     out.extend_from_slice(&block_align.to_le_bytes());
     out.extend_from_slice(&bits_per_sample.to_le_bytes());
+
+    // data chunk
+    out.extend_from_slice(b"data");
+    let data_len = data.len() as u32;
+    out.extend_from_slice(&data_len.to_le_bytes());
+    out.extend_from_slice(data);
+
+    out
+}
+
+/// Helper to create a well-formed WAVE_FORMAT_EXTENSIBLE in-memory byte buffer.
+fn create_extensible_wav_bytes(
+    channels: u16,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    sub_format: &[u8; 16],
+    data: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"RIFF");
+    let fmt_chunk_size = 40u32;
+    let file_size = 12u32 + (8u32 + fmt_chunk_size) + (8u32 + data.len() as u32);
+    out.extend_from_slice(&(file_size - 8).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+
+    // fmt chunk (WAVE_FORMAT_EXTENSIBLE)
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&fmt_chunk_size.to_le_bytes());
+    out.extend_from_slice(&WAVE_FORMAT_EXTENSIBLE.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    let byte_rate = sample_rate * (channels as u32) * (bits_per_sample as u32 / 8);
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    let block_align = channels * (bits_per_sample / 8);
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&bits_per_sample.to_le_bytes());
+    let cb_size = 22u16;
+    out.extend_from_slice(&cb_size.to_le_bytes());
+    let valid_bits = bits_per_sample;
+    out.extend_from_slice(&valid_bits.to_le_bytes());
+    let channel_mask = if channels == 2 { 0x3u32 } else { 0x4u32 };
+    out.extend_from_slice(&channel_mask.to_le_bytes());
+    out.extend_from_slice(sub_format);
 
     // data chunk
     out.extend_from_slice(b"data");
@@ -381,4 +426,190 @@ fn test_short_audio_slices() {
             );
         }
     }
+}
+
+#[test]
+fn test_sub_200_samples_audio_handling() {
+    let filters = make_dummy_filters(N_MELS);
+
+    // Sub-40 samples must have n_len_org == 0
+    for &n in &[0, 1, 10, 20, 39] {
+        let audio = vec![0.1f32; n];
+        let mel = compute_log_mel_spectrogram(&audio, &filters, N_MELS);
+        assert_eq!(mel.n_len_org, 0, "n_len_org for {} samples must be 0", n);
+    }
+
+    // 40 <= n < 200 samples must have n_len_org >= 1 (specifically 1)
+    for &n in &[40, 41, 50, 100, 150, 199] {
+        let audio = vec![0.1f32; n];
+        let mel = compute_log_mel_spectrogram(&audio, &filters, N_MELS);
+        assert!(
+            mel.n_len_org >= 1,
+            "n_len_org for {} samples must be >= 1, got {}",
+            n,
+            mel.n_len_org
+        );
+        assert_eq!(
+            mel.n_len_org, 1,
+            "n_len_org for {} samples must be 1, got {}",
+            n, mel.n_len_org
+        );
+    }
+
+    // n >= 200 samples: matches 1 + (n + stage_2_pad - frame_size) / frame_step
+    for &n in &[200, 359, 360, 400, 520] {
+        let audio = vec![0.1f32; n];
+        let mel = compute_log_mel_spectrogram(&audio, &filters, N_MELS);
+        let expected = 1 + (n + 200 - 400) / 160;
+        assert_eq!(
+            mel.n_len_org, expected,
+            "n_len_org for {} samples: expected {}, got {}",
+            n, expected, mel.n_len_org
+        );
+    }
+}
+
+#[test]
+fn test_8bit_unsigned_pcm_wav() {
+    // 8-bit unsigned PCM: 128 is center/silence, 255 is ~+1.0, 0 is -1.0
+    let mono_data = vec![128u8, 255u8, 0u8, 192u8, 64u8];
+    let wav = create_wav_bytes(1, 16000, 8, 1, &mono_data);
+    let audio = WavAudio::load_from_bytes(&wav).expect("Load 8-bit mono WAV");
+    assert_eq!(audio.sample_rate, 16000);
+    assert_eq!(audio.channels, 1);
+    assert_eq!(audio.samples.len(), 5);
+
+    assert!((audio.samples[0] - 0.0).abs() < 1e-5);
+    assert!((audio.samples[1] - (127.0 / 128.0)).abs() < 1e-5);
+    assert!((audio.samples[2] - (-1.0)).abs() < 1e-5);
+    assert!((audio.samples[3] - 0.5).abs() < 1e-5);
+    assert!((audio.samples[4] - (-0.5)).abs() < 1e-5);
+
+    // 8-bit stereo: Left 192 (+0.5), Right 64 (-0.5) -> avg 0.0
+    let stereo_data = vec![192u8, 64u8, 255u8, 128u8];
+    let stereo_wav = create_wav_bytes(2, 16000, 8, 1, &stereo_data);
+    let audio_st = WavAudio::load_from_bytes(&stereo_wav).expect("Load 8-bit stereo WAV");
+    assert_eq!(audio_st.channels, 2);
+    assert_eq!(audio_st.samples.len(), 2);
+    assert!(audio_st.samples[0].abs() < 1e-5);
+    let expected_frame1 = ((127.0 / 128.0) + 0.0) / 2.0;
+    assert!((audio_st.samples[1] - expected_frame1).abs() < 1e-5);
+}
+
+#[test]
+fn test_24bit_signed_pcm_wav() {
+    // 24-bit little endian:
+    // 0: [0x00, 0x00, 0x00] -> 0.0
+    // +8388607: [0xFF, 0xFF, 0x7F] -> 8388607 / 8388608.0
+    // -8388608: [0x00, 0x00, 0x80] -> -1.0
+    // +4194304: [0x00, 0x00, 0x40] -> 0.5
+    // -4194304: [0x00, 0x00, 0xC0] -> -0.5
+    let mut data = Vec::new();
+    data.extend_from_slice(&[0x00, 0x00, 0x00]);
+    data.extend_from_slice(&[0xFF, 0xFF, 0x7F]);
+    data.extend_from_slice(&[0x00, 0x00, 0x80]);
+    data.extend_from_slice(&[0x00, 0x00, 0x40]);
+    data.extend_from_slice(&[0x00, 0x00, 0xC0]);
+
+    let wav = create_wav_bytes(1, 16000, 24, 1, &data);
+    let audio = WavAudio::load_from_bytes(&wav).expect("Load 24-bit mono WAV");
+    assert_eq!(audio.sample_rate, 16000);
+    assert_eq!(audio.channels, 1);
+    assert_eq!(audio.samples.len(), 5);
+
+    assert!((audio.samples[0] - 0.0).abs() < 1e-6);
+    assert!((audio.samples[1] - (8388607.0 / 8388608.0)).abs() < 1e-6);
+    assert!((audio.samples[2] - (-1.0)).abs() < 1e-6);
+    assert!((audio.samples[3] - 0.5).abs() < 1e-6);
+    assert!((audio.samples[4] - (-0.5)).abs() < 1e-6);
+
+    // 24-bit stereo
+    let mut stereo_data = Vec::new();
+    // L: +4194304 (+0.5), R: -4194304 (-0.5) -> avg 0.0
+    stereo_data.extend_from_slice(&[0x00, 0x00, 0x40]);
+    stereo_data.extend_from_slice(&[0x00, 0x00, 0xC0]);
+    let stereo_wav = create_wav_bytes(2, 16000, 24, 1, &stereo_data);
+    let audio_st = WavAudio::load_from_bytes(&stereo_wav).expect("Load 24-bit stereo WAV");
+    assert_eq!(audio_st.channels, 2);
+    assert_eq!(audio_st.samples.len(), 1);
+    assert!(audio_st.samples[0].abs() < 1e-6);
+}
+
+#[test]
+fn test_32bit_signed_pcm_wav() {
+    let mut data = Vec::new();
+    data.write_i32::<LittleEndian>(0).unwrap();
+    data.write_i32::<LittleEndian>(1073741824).unwrap();
+    data.write_i32::<LittleEndian>(-1073741824).unwrap();
+    data.write_i32::<LittleEndian>(2147483647).unwrap();
+    data.write_i32::<LittleEndian>(i32::MIN).unwrap();
+
+    let wav = create_wav_bytes(1, 16000, 32, 1, &data);
+    let audio = WavAudio::load_from_bytes(&wav).expect("Load 32-bit signed PCM WAV");
+    assert_eq!(audio.sample_rate, 16000);
+    assert_eq!(audio.channels, 1);
+    assert_eq!(audio.samples.len(), 5);
+
+    assert!((audio.samples[0] - 0.0).abs() < 1e-6);
+    assert!((audio.samples[1] - 0.5).abs() < 1e-6);
+    assert!((audio.samples[2] - (-0.5)).abs() < 1e-6);
+    assert!((audio.samples[3] - (2147483647.0 / 2147483648.0)).abs() < 1e-6);
+    assert!((audio.samples[4] - (-1.0)).abs() < 1e-6);
+}
+
+#[test]
+fn test_wave_format_extensible_pcm_and_float() {
+    // 1. 16-bit PCM Extensible
+    let mut pcm16_data = Vec::new();
+    pcm16_data.write_i16::<LittleEndian>(16384).unwrap();
+    pcm16_data.write_i16::<LittleEndian>(-16384).unwrap();
+    let wav16 = create_extensible_wav_bytes(1, 16000, 16, &KSDATAFORMAT_SUBTYPE_PCM, &pcm16_data);
+    let a16 = WavAudio::load_from_bytes(&wav16).expect("Load 16-bit extensible PCM");
+    assert_eq!(a16.samples.len(), 2);
+    assert!((a16.samples[0] - 0.5).abs() < 1e-4);
+    assert!((a16.samples[1] - (-0.5)).abs() < 1e-4);
+
+    // 2. 24-bit PCM Extensible
+    let mut pcm24_data = Vec::new();
+    pcm24_data.extend_from_slice(&[0x00, 0x00, 0x40]); // +0.5
+    pcm24_data.extend_from_slice(&[0x00, 0x00, 0xC0]); // -0.5
+    let wav24 = create_extensible_wav_bytes(1, 16000, 24, &KSDATAFORMAT_SUBTYPE_PCM, &pcm24_data);
+    let a24 = WavAudio::load_from_bytes(&wav24).expect("Load 24-bit extensible PCM");
+    assert_eq!(a24.samples.len(), 2);
+    assert!((a24.samples[0] - 0.5).abs() < 1e-6);
+    assert!((a24.samples[1] - (-0.5)).abs() < 1e-6);
+
+    // 3. 32-bit PCM Extensible
+    let mut pcm32_data = Vec::new();
+    pcm32_data.write_i32::<LittleEndian>(1073741824).unwrap();
+    pcm32_data.write_i32::<LittleEndian>(-1073741824).unwrap();
+    let wav32 = create_extensible_wav_bytes(1, 16000, 32, &KSDATAFORMAT_SUBTYPE_PCM, &pcm32_data);
+    let a32 = WavAudio::load_from_bytes(&wav32).expect("Load 32-bit extensible PCM");
+    assert_eq!(a32.samples.len(), 2);
+    assert!((a32.samples[0] - 0.5).abs() < 1e-6);
+    assert!((a32.samples[1] - (-0.5)).abs() < 1e-6);
+
+    // 4. 32-bit IEEE Float Extensible
+    let mut float32_data = Vec::new();
+    float32_data.write_f32::<LittleEndian>(0.75).unwrap();
+    float32_data.write_f32::<LittleEndian>(-0.25).unwrap();
+    let wav_float = create_extensible_wav_bytes(
+        1,
+        16000,
+        32,
+        &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+        &float32_data,
+    );
+    let a_float = WavAudio::load_from_bytes(&wav_float).expect("Load 32-bit extensible Float");
+    assert_eq!(a_float.samples.len(), 2);
+    assert!((a_float.samples[0] - 0.75).abs() < 1e-6);
+    assert!((a_float.samples[1] - (-0.25)).abs() < 1e-6);
+}
+
+#[test]
+fn test_wave_format_extensible_errors() {
+    let unknown_guid = [0xFFu8; 16];
+    let bad_guid_wav = create_extensible_wav_bytes(1, 16000, 16, &unknown_guid, &[0u8; 4]);
+    let res = WavAudio::load_from_bytes(&bad_guid_wav);
+    assert!(matches!(res, Err(AudioError::UnsupportedFormat(_))));
 }

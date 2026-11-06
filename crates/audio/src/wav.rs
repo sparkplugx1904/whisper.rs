@@ -5,7 +5,21 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
 pub const WHISPER_SAMPLE_RATE: u32 = 16000;
+pub const WAVE_FORMAT_PCM: u16 = 1;
+pub const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+pub const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
+/// GUID for PCM audio in WAVE_FORMAT_EXTENSIBLE:
+/// 00000001-0000-0010-8000-00AA00389B71
+pub const KSDATAFORMAT_SUBTYPE_PCM: [u8; 16] = [
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
+];
+
+/// GUID for IEEE float audio in WAVE_FORMAT_EXTENSIBLE:
+/// 00000003-0000-0010-8000-00AA00389B71
+pub const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: [u8; 16] = [
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
+];
 #[derive(Debug, Clone)]
 pub struct WavAudio {
     pub sample_rate: u32,
@@ -40,6 +54,7 @@ impl WavAudio {
         }
 
         let mut audio_format = 0u16;
+        let mut effective_format = 0u16;
         let mut channels = 0u16;
         let mut sample_rate = 0u32;
         let mut bits_per_sample = 0u16;
@@ -55,6 +70,9 @@ impl WavAudio {
 
             match &chunk_id {
                 b"fmt " => {
+                    if chunk_size < 16 {
+                        return Err(AudioError::InvalidWav("fmt chunk too small".to_string()));
+                    }
                     audio_format = reader.read_u16::<LittleEndian>()?;
                     channels = reader.read_u16::<LittleEndian>()?;
                     sample_rate = reader.read_u32::<LittleEndian>()?;
@@ -62,20 +80,69 @@ impl WavAudio {
                     let _block_align = reader.read_u16::<LittleEndian>()?;
                     bits_per_sample = reader.read_u16::<LittleEndian>()?;
 
-                    if chunk_size > 16 {
-                        reader.seek(SeekFrom::Current((chunk_size - 16) as i64))?;
+                    if audio_format == WAVE_FORMAT_EXTENSIBLE {
+                        if chunk_size < 40 {
+                            return Err(AudioError::InvalidWav(
+                                "fmt chunk too small for WAVE_FORMAT_EXTENSIBLE".to_string(),
+                            ));
+                        }
+                        let cb_size = reader.read_u16::<LittleEndian>()?;
+                        if cb_size < 22 {
+                            return Err(AudioError::InvalidWav(
+                                "cbSize too small for WAVE_FORMAT_EXTENSIBLE".to_string(),
+                            ));
+                        }
+                        let _valid_bits_per_sample = reader.read_u16::<LittleEndian>()?;
+                        let _channel_mask = reader.read_u32::<LittleEndian>()?;
+                        let mut sub_format_guid = [0u8; 16];
+                        reader.read_exact(&mut sub_format_guid)?;
+
+                        if sub_format_guid == KSDATAFORMAT_SUBTYPE_PCM {
+                            effective_format = WAVE_FORMAT_PCM;
+                        } else if sub_format_guid == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {
+                            effective_format = WAVE_FORMAT_IEEE_FLOAT;
+                        } else {
+                            return Err(AudioError::UnsupportedFormat(format!(
+                                "Unsupported WAVE_FORMAT_EXTENSIBLE sub-format GUID: {:02x?}",
+                                sub_format_guid
+                            )));
+                        }
+
+                        if chunk_size > 40 {
+                            reader.seek(SeekFrom::Current((chunk_size - 40) as i64))?;
+                        }
+                    } else {
+                        effective_format = audio_format;
+                        if chunk_size > 16 {
+                            reader.seek(SeekFrom::Current((chunk_size - 16) as i64))?;
+                        }
                     }
                 }
                 b"data" => {
-                    if channels == 0 || sample_rate == 0 {
+                    if channels == 0 || sample_rate == 0 || effective_format == 0 {
                         return Err(AudioError::InvalidWav(
                             "fmt chunk missing before data".to_string(),
                         ));
                     }
 
                     let num_channels = channels as usize;
-                    match (audio_format, bits_per_sample) {
-                        (1, 16) => {
+                    match (effective_format, bits_per_sample) {
+                        (WAVE_FORMAT_PCM, 8) => {
+                            // 8-bit unsigned PCM
+                            let num_samples = chunk_size;
+                            let total_frames = num_samples / num_channels;
+                            samples.reserve(total_frames);
+
+                            for _ in 0..total_frames {
+                                let mut sum = 0.0f32;
+                                for _ in 0..num_channels {
+                                    let s = reader.read_u8()? as f32;
+                                    sum += (s - 128.0) / 128.0;
+                                }
+                                samples.push(sum / num_channels as f32);
+                            }
+                        }
+                        (WAVE_FORMAT_PCM, 16) => {
                             // 16-bit signed PCM
                             let num_samples = chunk_size / 2;
                             let total_frames = num_samples / num_channels;
@@ -90,7 +157,44 @@ impl WavAudio {
                                 samples.push(sum / num_channels as f32);
                             }
                         }
-                        (3, 32) => {
+                        (WAVE_FORMAT_PCM, 24) => {
+                            // 24-bit signed PCM (packed 3 bytes per sample)
+                            let num_samples = chunk_size / 3;
+                            let total_frames = num_samples / num_channels;
+                            samples.reserve(total_frames);
+
+                            for _ in 0..total_frames {
+                                let mut sum = 0.0f32;
+                                for _ in 0..num_channels {
+                                    let mut b = [0u8; 3];
+                                    reader.read_exact(&mut b)?;
+                                    let val = i32::from_le_bytes([
+                                        b[0],
+                                        b[1],
+                                        b[2],
+                                        if b[2] & 0x80 != 0 { 0xFF } else { 0x00 },
+                                    ]);
+                                    sum += val as f32 / 8388608.0;
+                                }
+                                samples.push(sum / num_channels as f32);
+                            }
+                        }
+                        (WAVE_FORMAT_PCM, 32) => {
+                            // 32-bit signed PCM
+                            let num_samples = chunk_size / 4;
+                            let total_frames = num_samples / num_channels;
+                            samples.reserve(total_frames);
+
+                            for _ in 0..total_frames {
+                                let mut sum = 0.0f32;
+                                for _ in 0..num_channels {
+                                    let s = reader.read_i32::<LittleEndian>()? as f32;
+                                    sum += s / 2147483648.0;
+                                }
+                                samples.push(sum / num_channels as f32);
+                            }
+                        }
+                        (WAVE_FORMAT_IEEE_FLOAT, 32) => {
                             // 32-bit IEEE float
                             let num_samples = chunk_size / 4;
                             let total_frames = num_samples / num_channels;
@@ -105,10 +209,25 @@ impl WavAudio {
                                 samples.push(sum / num_channels as f32);
                             }
                         }
+                        (WAVE_FORMAT_IEEE_FLOAT, 64) => {
+                            // 64-bit IEEE float
+                            let num_samples = chunk_size / 8;
+                            let total_frames = num_samples / num_channels;
+                            samples.reserve(total_frames);
+
+                            for _ in 0..total_frames {
+                                let mut sum = 0.0f32;
+                                for _ in 0..num_channels {
+                                    let s = reader.read_f64::<LittleEndian>()? as f32;
+                                    sum += s;
+                                }
+                                samples.push(sum / num_channels as f32);
+                            }
+                        }
                         _ => {
                             return Err(AudioError::UnsupportedFormat(format!(
-                                "Format {}, {} bits per sample not supported",
-                                audio_format, bits_per_sample
+                                "Format {} (effective {}), {} bits per sample not supported",
+                                audio_format, effective_format, bits_per_sample
                             )));
                         }
                     }
@@ -116,7 +235,8 @@ impl WavAudio {
                 }
                 _ => {
                     // Skip unknown chunk
-                    reader.seek(SeekFrom::Current(chunk_size as i64))?;
+                    let pad = (chunk_size % 2) as i64;
+                    reader.seek(SeekFrom::Current(chunk_size as i64 + pad))?;
                 }
             }
         }

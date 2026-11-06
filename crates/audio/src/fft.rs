@@ -1,5 +1,7 @@
 use rustfft::{num_complex::Complex32, FftPlanner};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+static SHARED_FFT: LazyLock<Fft400> = LazyLock::new(Fft400::new);
 
 pub const N_FFT: usize = 400;
 
@@ -21,6 +23,11 @@ impl Fft400 {
         Self { fft }
     }
 
+    /// Returns a reference to a globally cached `Fft400` instance, avoiding repeated planning.
+    pub fn shared() -> &'static Self {
+        &SHARED_FFT
+    }
+
     /// Compute FFT on real input [N_FFT], writing complex output to [2 * N_FFT] as [re, im, re, im, ...].
     pub fn compute(&self, input: &[f32], output: &mut [f32]) {
         assert_eq!(input.len(), N_FFT);
@@ -36,6 +43,28 @@ impl Fft400 {
         for (i, c) in buffer.iter().enumerate() {
             output[2 * i] = c.re;
             output[2 * i + 1] = c.im;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fft400_shared() {
+        let fft1 = Fft400::shared();
+        let fft2 = Fft400::shared();
+        assert!(Arc::ptr_eq(&fft1.fft, &fft2.fft));
+
+        let mut input = [0.0f32; N_FFT];
+        input[0] = 1.0;
+        let mut out = [0.0f32; N_FFT * 2];
+        fft1.compute(&input, &mut out);
+
+        for i in 0..N_FFT {
+            assert!((out[2 * i] - 1.0).abs() < 1e-5);
+            assert!(out[2 * i + 1].abs() < 1e-5);
         }
     }
 }
