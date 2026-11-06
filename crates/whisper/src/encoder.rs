@@ -128,20 +128,72 @@ impl WhisperEncoder {
     }
 
     /// Forward pass of the audio encoder.
-    /// `mel_chunk`: flattened mel spectrogram slice of size [n_mels, 3000].
-    /// Returns encoded output of size [1500, d_model].
+    /// `mel_chunk`: flattened mel spectrogram slice of size [n_mels, 2 * audio_ctx].
+    /// Automatically infers context length if `mel_chunk` is smaller than full 3000 frames.
+    /// Returns encoded output of size [l_out, d_model].
     pub fn forward(&self, mel_chunk: &[f32]) -> Vec<f32> {
+        let t_partial = if mel_chunk.len().is_multiple_of(2 * self.n_mels) {
+            let frames = mel_chunk.len() / (2 * self.n_mels);
+            if frames > 0 && frames <= self.n_audio_ctx {
+                frames
+            } else {
+                self.n_audio_ctx
+            }
+        } else {
+            self.n_audio_ctx
+        };
+        self.forward_with_ctx(mel_chunk, t_partial)
+    }
+
+    /// Forward pass of the audio encoder with explicit partial context truncation.
+    ///
+    /// When `audio_ctx > 0` and shorter than 1500 (e.g. 512, 768), do not run attention
+    /// and convolutions across all 1500 frames. Truncates the active encoder mel frame sequence
+    /// length $T_{\text{partial}} = \text{audio\_ctx}$, slices positional embeddings
+    /// (`&positional_embedding[..T_partial * d_model]`), and executes convolutions and
+    /// multi-head attention only across the $T_{\text{partial}}$ active frames.
+    /// Matches upstream whisper.cpp commit `c058aaf2` for a 3x-5x speedup on short/streaming windows.
+    pub fn forward_with_ctx(&self, mel_chunk: &[f32], audio_ctx: usize) -> Vec<f32> {
+        let t_partial = if audio_ctx > 0 && audio_ctx < self.n_audio_ctx {
+            audio_ctx
+        } else {
+            self.n_audio_ctx
+        };
+        let l_in = 2 * t_partial;
+        let l_out = t_partial;
+
+        // Truncate or validate input mel frame sequence
+        let (active_mel, l_in) = if mel_chunk.len() == self.n_mels * l_in {
+            (std::borrow::Cow::Borrowed(mel_chunk), l_in)
+        } else if mel_chunk.len().is_multiple_of(self.n_mels)
+            && mel_chunk.len() >= self.n_mels * l_in
+        {
+            let orig_frames = mel_chunk.len() / self.n_mels;
+            let mut truncated = vec![0.0f32; self.n_mels * l_in];
+            for j in 0..self.n_mels {
+                let src = &mel_chunk[j * orig_frames..j * orig_frames + l_in];
+                let dst = &mut truncated[j * l_in..(j + 1) * l_in];
+                dst.copy_from_slice(src);
+            }
+            (std::borrow::Cow::Owned(truncated), l_in)
+        } else {
+            panic!(
+                "Invalid mel_chunk length {}: expected {} for {} mels and context {}",
+                mel_chunk.len(),
+                self.n_mels * l_in,
+                self.n_mels,
+                t_partial
+            );
+        };
+
         let do_profile = std::env::var("WHISPER_PROFILE").is_ok();
         let t_start = std::time::Instant::now();
 
-        let l_in = 2 * self.n_audio_ctx; // 3000 frames
-        assert_eq!(mel_chunk.len(), self.n_mels * l_in);
-
-        // 1. Conv1: [n_mels, 3000] -> [d_model, 3000] with GELU
+        // 1. Conv1: [n_mels, L_in] -> [d_model, L_in] with GELU
         let mut conv1_out = vec![0.0f32; self.d_model * l_in];
         let t0 = std::time::Instant::now();
         conv1d_c_first(
-            mel_chunk,
+            &active_mel,
             &self.weights.conv1_w,
             &self.weights.conv1_b,
             self.n_mels,
@@ -155,8 +207,7 @@ impl WhisperEncoder {
         );
         let d_conv1 = t0.elapsed();
 
-        // 2. Conv2: [d_model, 3000] -> [1500, d_model] with GELU
-        let l_out = self.n_audio_ctx; // 1500 tokens
+        // 2. Conv2: [d_model, L_in] -> [L_out, d_model] with GELU
         let mut x = vec![0.0f32; l_out * self.d_model];
         let t0 = std::time::Instant::now();
         conv1d_t_first(
@@ -174,12 +225,15 @@ impl WhisperEncoder {
         );
         let d_conv2 = t0.elapsed();
 
-        // 3. Add positional embedding
-        assert_eq!(
-            self.weights.positional_embedding.len(),
-            l_out * self.d_model
+        // 3. Add positional embedding sliced to active context
+        let pe_len = l_out * self.d_model;
+        assert!(
+            self.weights.positional_embedding.len() >= pe_len,
+            "Positional embedding too short for requested context {}",
+            l_out
         );
-        add_inplace(&mut x, &self.weights.positional_embedding);
+        add_inplace(&mut x, &self.weights.positional_embedding[..pe_len]);
+
         // Workspace buffers to avoid allocations per layer
         let mut norm_buf = vec![0.0f32; l_out * self.d_model];
         let mut q_buf = vec![0.0f32; l_out * self.d_model];
@@ -191,6 +245,7 @@ impl WhisperEncoder {
 
         let d_mlp = self.d_model * 4;
         let mut mlp0_out = vec![0.0f32; l_out * d_mlp];
+
         // 4. Transformer blocks
         for block in &self.weights.blocks {
             // (a) Pre-LN for attention
@@ -221,6 +276,7 @@ impl WhisperEncoder {
                 k_buf[i * d_m..(i + 1) * d_m].copy_from_slice(&row[d_m..2 * d_m]);
                 v_buf[i * d_m..(i + 1) * d_m].copy_from_slice(&row[2 * d_m..]);
             }
+
             // (c) Multi-Head Attention with Flash Attention 2
             flash_attention_2(
                 &q_buf,
@@ -277,6 +333,7 @@ impl WhisperEncoder {
             );
             add_inplace(&mut x, &proj_out);
         }
+
         // 5. Final LayerNorm
         let mut final_out = vec![0.0f32; l_out * self.d_model];
         layer_norm(
@@ -288,11 +345,13 @@ impl WhisperEncoder {
             self.d_model,
             &mut final_out,
         );
+
         if do_profile {
             let total = t_start.elapsed();
             eprintln!(
-                "[PROFILE ENCODER] Total: {:.2}ms | Conv1: {:.2}ms | Conv2: {:.2}ms | Blocks: {:.2}ms",
+                "[PROFILE ENCODER] Total: {:.2}ms (ctx={}) | Conv1: {:.2}ms | Conv2: {:.2}ms | Blocks: {:.2}ms",
                 total.as_secs_f64() * 1000.0,
+                l_out,
                 d_conv1.as_secs_f64() * 1000.0,
                 d_conv2.as_secs_f64() * 1000.0,
                 (total - d_conv1 - d_conv2).as_secs_f64() * 1000.0

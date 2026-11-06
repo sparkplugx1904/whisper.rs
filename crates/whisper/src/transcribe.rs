@@ -225,15 +225,16 @@ impl WhisperContext {
         state: &mut WhisperState,
     ) -> Vec<Segment> {
         let is_multilingual = self.model.hparams.is_multilingual();
-        let n_audio_ctx = if params.audio_ctx > 0 {
-            params.audio_ctx
-        } else {
-            self.model.hparams.n_audio_ctx as usize
-        };
+        let n_audio_ctx =
+            if params.audio_ctx > 0 && params.audio_ctx < self.model.hparams.n_audio_ctx as usize {
+                params.audio_ctx
+            } else {
+                self.model.hparams.n_audio_ctx as usize
+            };
 
         // Precompute chunk 0 encoder output so we never compute it twice
         let mel_chunk_0 = mel.get_chunk(0, n_audio_ctx);
-        let enc_out_0 = self.encoder.forward(&mel_chunk_0);
+        let enc_out_0 = self.encoder.forward_with_ctx(&mel_chunk_0, n_audio_ctx);
 
         if params.abort_callback.as_ref().is_some_and(|cb| cb()) {
             return Vec::new();
@@ -320,7 +321,7 @@ impl WhisperContext {
                 enc_out_0.clone()
             } else {
                 let mel_chunk = mel.get_chunk(seek_frame, n_audio_ctx);
-                self.encoder.forward(&mel_chunk)
+                self.encoder.forward_with_ctx(&mel_chunk, n_audio_ctx)
             };
             state.encoder_output = enc_out.clone();
 
@@ -572,8 +573,9 @@ impl WhisperContext {
                 } else {
                     tokens_cur.len().max(1)
                 };
+                let chunk_sec = chunk_frames as f64 * 0.01;
                 for chunk in tokens_cur.chunks(max_tok) {
-                    let t1 = (seek_time + 30.0).min(total_audio_sec);
+                    let t1 = (seek_time + chunk_sec).min(total_audio_sec);
                     let seg = self.build_segment(
                         seek_time,
                         t1,
