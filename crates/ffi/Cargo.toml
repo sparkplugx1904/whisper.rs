@@ -10,4 +10,5 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 whisper-rs = { path = "../whisper" }
+whisper-vad = { path = "../vad" }
 rayon = { workspace = true }

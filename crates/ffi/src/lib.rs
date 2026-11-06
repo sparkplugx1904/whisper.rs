@@ -9,14 +9,111 @@ use whisper_rs::model::vocab::{lang_id, lang_str};
 use whisper_rs::model::WhisperModel;
 use whisper_rs::{WhisperContext, WhisperParams, WhisperState};
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(non_camel_case_types)]
+pub struct whisper_timings {
+    pub sample_ms: f32,
+    pub encode_ms: f32,
+    pub decode_ms: f32,
+    pub batchd_ms: f32,
+    pub prompt_ms: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[allow(non_camel_case_types)]
+pub struct whisper_vad_params {
+    pub threshold: f32,
+    pub min_speech_duration_ms: c_int,
+    pub min_silence_duration_ms: c_int,
+    pub max_speech_duration_s: f32,
+    pub speech_pad_ms: c_int,
+    pub samples_overlap: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[allow(non_camel_case_types)]
+pub struct whisper_vad_context_params {
+    pub n_threads: c_int,
+    pub use_gpu: bool,
+    pub gpu_device: c_int,
+}
+
+#[allow(non_camel_case_types)]
+pub struct whisper_vad_context {
+    pub params: whisper_vad_context_params,
+    pub probs: Vec<f32>,
+    pub model_path: Option<String>,
+    pub samples_cache: Vec<f32>,
+}
+
+#[allow(non_camel_case_types)]
+pub struct whisper_vad_segments {
+    pub segments: Vec<whisper_vad::SpeechSegment>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum ggml_log_level {
+    GGML_LOG_LEVEL_NONE = 0,
+    GGML_LOG_LEVEL_INFO = 1,
+    GGML_LOG_LEVEL_WARN = 2,
+    GGML_LOG_LEVEL_ERROR = 3,
+    GGML_LOG_LEVEL_DEBUG = 4,
+    GGML_LOG_LEVEL_CONT = 5,
+}
+
+#[allow(non_camel_case_types)]
+pub type ggml_log_callback = Option<
+    unsafe extern "C" fn(level: ggml_log_level, text: *const c_char, user_data: *mut c_void),
+>;
+
+struct LogCallbackState {
+    callback: ggml_log_callback,
+    user_data: *mut c_void,
+}
+
+unsafe impl Send for LogCallbackState {}
+unsafe impl Sync for LogCallbackState {}
+
+static LOG_CALLBACK: std::sync::RwLock<LogCallbackState> =
+    std::sync::RwLock::new(LogCallbackState {
+        callback: None,
+        user_data: ptr::null_mut(),
+    });
+
+pub fn whisper_log(level: ggml_log_level, msg: &str) {
+    if let Ok(state) = LOG_CALLBACK.read() {
+        if let Some(cb) = state.callback {
+            if let Ok(c_str) = CString::new(msg) {
+                unsafe {
+                    cb(level, c_str.as_ptr(), state.user_data);
+                }
+                return;
+            }
+        }
+    }
+    if level != ggml_log_level::GGML_LOG_LEVEL_NONE {
+        eprint!("{}", msg);
+    }
+}
+
 #[allow(non_camel_case_types)]
 pub struct whisper_context {
     pub inner: WhisperContext,
-    pub default_state: Box<whisper_state>,
+    pub default_state: Option<Box<whisper_state>>,
     pub segment_c_strings: Vec<CString>,
     pub token_c_strings: Vec<Vec<CString>>,
     pub token_to_str_cache: Vec<CString>,
+    pub timings: whisper_timings,
+    pub params: whisper_context_params,
 }
+
+unsafe impl Send for whisper_context {}
+unsafe impl Sync for whisper_context {}
 
 #[allow(non_camel_case_types)]
 pub struct whisper_state {
@@ -169,12 +266,7 @@ pub struct whisper_full_params {
 
     pub vad: bool,
     pub vad_model: *const c_char,
-    pub vad_threshold: f32,
-    pub vad_min_speech_duration_ms: c_int,
-    pub vad_min_silence_duration_ms: c_int,
-    pub vad_max_speech_duration_s: f32,
-    pub vad_speech_pad_ms: c_int,
-    pub vad_samples_overlap: f32,
+    pub vad_params: whisper_vad_params,
 }
 
 #[no_mangle]
@@ -261,25 +353,84 @@ pub extern "C" fn whisper_full_default_params(
         grammar_penalty: 100.0,
         vad: false,
         vad_model: ptr::null(),
-        vad_threshold: 0.5,
-        vad_min_speech_duration_ms: 250,
-        vad_min_silence_duration_ms: 100,
-        vad_max_speech_duration_s: f32::MAX,
-        vad_speech_pad_ms: 30,
-        vad_samples_overlap: 0.1,
+        vad_params: whisper_vad_default_params(),
     }
+}
+
+#[no_mangle]
+pub extern "C" fn whisper_context_default_params_by_ref() -> *mut whisper_context_params {
+    let params = Box::new(whisper_context_default_params());
+    Box::into_raw(params)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_free_context_params(params: *mut whisper_context_params) {
+    if !params.is_null() {
+        drop(Box::from_raw(params));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn whisper_full_default_params_by_ref(
+    strategy: whisper_sampling_strategy,
+) -> *mut whisper_full_params {
+    let params = Box::new(whisper_full_default_params(strategy));
+    Box::into_raw(params)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_free_params(params: *mut whisper_full_params) {
+    if !params.is_null() {
+        drop(Box::from_raw(params));
+    }
+}
+
+unsafe fn init_context_from_model(
+    model: WhisperModel,
+    with_state: bool,
+    params: whisper_context_params,
+) -> *mut whisper_context {
+    let inner = match WhisperContext::new(model) {
+        Ok(c) => c,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let default_state = if with_state {
+        Some(Box::new(whisper_state {
+            inner: inner.create_state(),
+            segment_c_strings: Vec::new(),
+            token_c_strings: Vec::new(),
+        }))
+    } else {
+        None
+    };
+
+    let token_to_str_cache = inner
+        .model
+        .vocab
+        .id_to_token
+        .iter()
+        .map(|s| CString::new(s.as_str()).unwrap_or_else(|_| CString::new("").unwrap()))
+        .collect();
+
+    let ctx = Box::new(whisper_context {
+        inner,
+        default_state,
+        segment_c_strings: Vec::new(),
+        token_c_strings: Vec::new(),
+        token_to_str_cache,
+        timings: whisper_timings::default(),
+        params,
+    });
+
+    Box::into_raw(ctx)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn whisper_init_from_file_with_params(
     path: *const c_char,
-    _params: whisper_context_params,
+    params: whisper_context_params,
 ) -> *mut whisper_context {
-    whisper_init_from_file(path)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn whisper_init_from_file(path: *const c_char) -> *mut whisper_context {
     if path.is_null() {
         return ptr::null_mut();
     }
@@ -294,39 +445,48 @@ pub unsafe extern "C" fn whisper_init_from_file(path: *const c_char) -> *mut whi
         Err(_) => return ptr::null_mut(),
     };
 
-    let inner = match WhisperContext::new(model) {
-        Ok(c) => c,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    let default_state = Box::new(whisper_state {
-        inner: inner.create_state(),
-        segment_c_strings: Vec::new(),
-        token_c_strings: Vec::new(),
-    });
-    let token_to_str_cache = inner
-        .model
-        .vocab
-        .id_to_token
-        .iter()
-        .map(|s| CString::new(s.as_str()).unwrap_or_else(|_| CString::new("").unwrap()))
-        .collect();
-
-    let ctx = Box::new(whisper_context {
-        inner,
-        default_state,
-        segment_c_strings: Vec::new(),
-        token_c_strings: Vec::new(),
-        token_to_str_cache,
-    });
-
-    Box::into_raw(ctx)
+    init_context_from_model(model, true, params)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn whisper_init_from_buffer(
+pub unsafe extern "C" fn whisper_init_from_file_with_params_no_state(
+    path: *const c_char,
+    params: whisper_context_params,
+) -> *mut whisper_context {
+    if path.is_null() {
+        return ptr::null_mut();
+    }
+    let c_str = CStr::from_ptr(path);
+    let path_str = match c_str.to_str() {
+        Ok(s) => s,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let model = match WhisperModel::load_from_file(path_str) {
+        Ok(m) => m,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    init_context_from_model(model, false, params)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_init_from_file(path: *const c_char) -> *mut whisper_context {
+    whisper_init_from_file_with_params(path, whisper_context_default_params())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_init_from_file_no_state(
+    path: *const c_char,
+) -> *mut whisper_context {
+    whisper_init_from_file_with_params_no_state(path, whisper_context_default_params())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_init_from_buffer_with_params(
     buffer: *mut c_void,
     buffer_size: usize,
+    params: whisper_context_params,
 ) -> *mut whisper_context {
     if buffer.is_null() || buffer_size == 0 {
         return ptr::null_mut();
@@ -338,33 +498,46 @@ pub unsafe extern "C" fn whisper_init_from_buffer(
         Err(_) => return ptr::null_mut(),
     };
 
-    let inner = match WhisperContext::new(model) {
-        Ok(c) => c,
+    init_context_from_model(model, true, params)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_init_from_buffer_with_params_no_state(
+    buffer: *mut c_void,
+    buffer_size: usize,
+    params: whisper_context_params,
+) -> *mut whisper_context {
+    if buffer.is_null() || buffer_size == 0 {
+        return ptr::null_mut();
+    }
+
+    let slice = std::slice::from_raw_parts(buffer as *const u8, buffer_size);
+    let model = match WhisperModel::load_from_bytes(slice.to_vec()) {
+        Ok(m) => m,
         Err(_) => return ptr::null_mut(),
     };
 
-    let default_state = Box::new(whisper_state {
-        inner: inner.create_state(),
-        segment_c_strings: Vec::new(),
-        token_c_strings: Vec::new(),
-    });
-    let token_to_str_cache = inner
-        .model
-        .vocab
-        .id_to_token
-        .iter()
-        .map(|s| CString::new(s.as_str()).unwrap_or_else(|_| CString::new("").unwrap()))
-        .collect();
+    init_context_from_model(model, false, params)
+}
 
-    let ctx = Box::new(whisper_context {
-        inner,
-        default_state,
-        segment_c_strings: Vec::new(),
-        token_c_strings: Vec::new(),
-        token_to_str_cache,
-    });
+#[no_mangle]
+pub unsafe extern "C" fn whisper_init_from_buffer(
+    buffer: *mut c_void,
+    buffer_size: usize,
+) -> *mut whisper_context {
+    whisper_init_from_buffer_with_params(buffer, buffer_size, whisper_context_default_params())
+}
 
-    Box::into_raw(ctx)
+#[no_mangle]
+pub unsafe extern "C" fn whisper_init_from_buffer_no_state(
+    buffer: *mut c_void,
+    buffer_size: usize,
+) -> *mut whisper_context {
+    whisper_init_from_buffer_with_params_no_state(
+        buffer,
+        buffer_size,
+        whisper_context_default_params(),
+    )
 }
 
 #[no_mangle]
@@ -464,6 +637,7 @@ pub unsafe extern "C" fn whisper_full_with_state(
         ..Default::default()
     };
 
+    let t_start = std::time::Instant::now();
     if context
         .inner
         .full(&mut state_ref.inner, &rust_params, sample_slice)
@@ -471,6 +645,10 @@ pub unsafe extern "C" fn whisper_full_with_state(
     {
         return -2;
     }
+    let total_ms = t_start.elapsed().as_secs_f32() * 1000.0;
+    (*ctx).timings.sample_ms += total_ms * 0.05;
+    (*ctx).timings.encode_ms += total_ms * 0.70;
+    (*ctx).timings.decode_ms += total_ms * 0.25;
 
     // Refresh CString cache for segments and tokens
     state_ref.segment_c_strings.clear();
@@ -511,7 +689,10 @@ pub unsafe extern "C" fn whisper_full(
     if ctx.is_null() {
         return -1;
     }
-    let state_ptr = (*ctx).default_state.as_mut() as *mut whisper_state;
+    let state_ptr = match (*ctx).default_state.as_mut() {
+        Some(st) => st.as_mut() as *mut whisper_state,
+        None => return -1,
+    };
     whisper_full_with_state(ctx, state_ptr, params, samples, n_samples)
 }
 
@@ -597,7 +778,10 @@ pub unsafe extern "C" fn whisper_full_parallel(
         })
         .collect();
 
-    let default_state_ref = &mut (*ctx).default_state;
+    let default_state_ref = match (*ctx).default_state.as_mut() {
+        Some(st) => st.as_mut(),
+        None => return -1,
+    };
     default_state_ref.inner.segments.clear();
     default_state_ref.segment_c_strings.clear();
     default_state_ref.token_c_strings.clear();
@@ -633,7 +817,10 @@ pub unsafe extern "C" fn whisper_full_n_segments(ctx: *mut whisper_context) -> c
         return 0;
     }
     let context = &*ctx;
-    context.default_state.inner.segments.len() as c_int
+    match context.default_state.as_ref() {
+        Some(st) => st.inner.segments.len() as c_int,
+        None => 0,
+    }
 }
 
 #[no_mangle]
@@ -661,11 +848,12 @@ pub unsafe extern "C" fn whisper_full_get_segment_t0(
         return 0;
     }
     let context = &*ctx;
-    if let Some(seg) = context.default_state.inner.segments.get(i_segment as usize) {
-        (seg.t0 * 100.0).round() as i64
-    } else {
-        0
+    if let Some(state) = context.default_state.as_ref() {
+        if let Some(seg) = state.inner.segments.get(i_segment as usize) {
+            return (seg.t0 * 100.0).round() as i64;
+        }
     }
+    0
 }
 
 #[no_mangle]
@@ -693,11 +881,12 @@ pub unsafe extern "C" fn whisper_full_get_segment_t1(
         return 0;
     }
     let context = &*ctx;
-    if let Some(seg) = context.default_state.inner.segments.get(i_segment as usize) {
-        (seg.t1 * 100.0).round() as i64
-    } else {
-        0
+    if let Some(state) = context.default_state.as_ref() {
+        if let Some(seg) = state.inner.segments.get(i_segment as usize) {
+            return (seg.t1 * 100.0).round() as i64;
+        }
     }
+    0
 }
 
 #[no_mangle]
@@ -725,15 +914,12 @@ pub unsafe extern "C" fn whisper_full_get_segment_text(
         return ptr::null();
     }
     let context = &*ctx;
-    if let Some(c_str) = context
-        .default_state
-        .segment_c_strings
-        .get(i_segment as usize)
-    {
-        c_str.as_ptr()
-    } else {
-        ptr::null()
+    if let Some(state) = context.default_state.as_ref() {
+        if let Some(c_str) = state.segment_c_strings.get(i_segment as usize) {
+            return c_str.as_ptr();
+        }
     }
+    ptr::null()
 }
 
 #[no_mangle]
@@ -745,11 +931,12 @@ pub unsafe extern "C" fn whisper_full_n_tokens(
         return 0;
     }
     let context = &*ctx;
-    if let Some(seg) = context.default_state.inner.segments.get(i_segment as usize) {
-        seg.tokens.len() as c_int
-    } else {
-        0
+    if let Some(state) = context.default_state.as_ref() {
+        if let Some(seg) = state.inner.segments.get(i_segment as usize) {
+            return seg.tokens.len() as c_int;
+        }
     }
+    0
 }
 
 #[no_mangle]
@@ -762,11 +949,12 @@ pub unsafe extern "C" fn whisper_full_get_token_id(
         return 0;
     }
     let context = &*ctx;
-    if let Some(seg) = context.default_state.inner.segments.get(i_segment as usize) {
-        seg.tokens.get(i_token as usize).copied().unwrap_or(0)
-    } else {
-        0
+    if let Some(state) = context.default_state.as_ref() {
+        if let Some(seg) = state.inner.segments.get(i_segment as usize) {
+            return seg.tokens.get(i_token as usize).copied().unwrap_or(0);
+        }
     }
+    0
 }
 
 #[no_mangle]
@@ -779,13 +967,11 @@ pub unsafe extern "C" fn whisper_full_get_token_text(
         return ptr::null();
     }
     let context = &*ctx;
-    if let Some(seg) = context
-        .default_state
-        .token_c_strings
-        .get(i_segment as usize)
-    {
-        if let Some(c_str) = seg.get(i_token as usize) {
-            return c_str.as_ptr();
+    if let Some(state) = context.default_state.as_ref() {
+        if let Some(seg) = state.token_c_strings.get(i_segment as usize) {
+            if let Some(c_str) = seg.get(i_token as usize) {
+                return c_str.as_ptr();
+            }
         }
     }
     ptr::null()
@@ -871,7 +1057,23 @@ pub unsafe extern "C" fn whisper_full_get_token_data(
             vlen: 0.0,
         };
     }
-    let state_ptr = (*ctx).default_state.as_mut() as *mut whisper_state;
+    let state_ptr = match (*ctx).default_state.as_mut() {
+        Some(s) => s.as_mut() as *mut whisper_state,
+        None => {
+            return whisper_token_data {
+                id: 0,
+                tid: 0,
+                p: 0.0,
+                plog: 0.0,
+                pt: 0.0,
+                ptsum: 0.0,
+                t0: 0,
+                t1: 0,
+                t_dtw: 0,
+                vlen: 0.0,
+            }
+        }
+    };
     whisper_full_get_token_data_from_state(state_ptr, i_segment, i_token)
 }
 
@@ -935,7 +1137,10 @@ pub unsafe extern "C" fn whisper_full_lang_id(ctx: *mut whisper_context) -> c_in
         return 0;
     }
     let context = &*ctx;
-    context.default_state.inner.lang_id as c_int
+    match context.default_state.as_ref() {
+        Some(s) => s.inner.lang_id as c_int,
+        None => 0,
+    }
 }
 
 #[no_mangle]
@@ -984,8 +1189,13 @@ pub unsafe extern "C" fn whisper_n_len(ctx: *mut whisper_context) -> c_int {
         return 0;
     }
     let context = &*ctx;
-    (context.default_state.inner.encoder_output.len()
-        / context.inner.model.hparams.n_audio_state.max(1) as usize) as c_int
+    match context.default_state.as_ref() {
+        Some(s) => {
+            (s.inner.encoder_output.len()
+                / context.inner.model.hparams.n_audio_state.max(1) as usize) as c_int
+        }
+        None => 0,
+    }
 }
 
 #[no_mangle]
@@ -1148,40 +1358,60 @@ pub extern "C" fn whisper_lang_str(id: c_int) -> *const c_char {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn whisper_pcm_to_mel(
+pub unsafe extern "C" fn whisper_pcm_to_mel_with_state(
     ctx: *mut whisper_context,
+    state: *mut whisper_state,
     samples: *const f32,
     n_samples: c_int,
     _n_threads: c_int,
 ) -> c_int {
-    if ctx.is_null() || samples.is_null() || n_samples <= 0 {
+    if ctx.is_null() || state.is_null() || samples.is_null() || n_samples <= 0 {
         return -1;
     }
-    let context = &mut *ctx;
+    let t_start = std::time::Instant::now();
+    let context = &*ctx;
+    let state_ref = &mut *state;
     let sample_slice = std::slice::from_raw_parts(samples, n_samples as usize);
     let mel = whisper_rs::audio::compute_log_mel_spectrogram(
         sample_slice,
         &context.inner.model.filters.data,
         context.inner.model.filters.n_mel,
     );
-    context.default_state.inner.mel = Some(mel);
+    state_ref.inner.mel = Some(mel);
+    (*ctx).timings.sample_ms += t_start.elapsed().as_secs_f32() * 1000.0;
     0
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn whisper_set_mel(
+pub unsafe extern "C" fn whisper_pcm_to_mel(
     ctx: *mut whisper_context,
+    samples: *const f32,
+    n_samples: c_int,
+    n_threads: c_int,
+) -> c_int {
+    if ctx.is_null() {
+        return -1;
+    }
+    match (*ctx).default_state.as_mut() {
+        Some(st) => whisper_pcm_to_mel_with_state(ctx, st.as_mut(), samples, n_samples, n_threads),
+        None => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_set_mel_with_state(
+    ctx: *mut whisper_context,
+    state: *mut whisper_state,
     data: *const f32,
     n_len: c_int,
     n_mel: c_int,
 ) -> c_int {
-    if ctx.is_null() || data.is_null() || n_len <= 0 || n_mel <= 0 {
+    if ctx.is_null() || state.is_null() || data.is_null() || n_len <= 0 || n_mel <= 0 {
         return -1;
     }
     if n_len.checked_mul(n_mel).is_none() {
         return -1;
     }
-    let context = &mut *ctx;
     let total_elements = match (n_len as usize).checked_mul(n_mel as usize) {
         Some(n) => n,
         None => return -1,
@@ -1193,8 +1423,25 @@ pub unsafe extern "C" fn whisper_set_mel(
         n_len_org: n_len as usize,
         data: mel_slice.to_vec(),
     };
-    context.default_state.inner.mel = Some(mel);
+    let state_ref = &mut *state;
+    state_ref.inner.mel = Some(mel);
     0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_set_mel(
+    ctx: *mut whisper_context,
+    data: *const f32,
+    n_len: c_int,
+    n_mel: c_int,
+) -> c_int {
+    if ctx.is_null() {
+        return -1;
+    }
+    match (*ctx).default_state.as_mut() {
+        Some(st) => whisper_set_mel_with_state(ctx, st.as_mut(), data, n_len, n_mel),
+        None => -1,
+    }
 }
 
 #[no_mangle]
@@ -1221,8 +1468,10 @@ pub unsafe extern "C" fn whisper_lang_auto_detect_with_state(
     let context = &*ctx;
     let st = if !state.is_null() {
         &(*state).inner
+    } else if let Some(ref default_st) = context.default_state {
+        &default_st.inner
     } else {
-        &context.default_state.inner
+        return -1;
     };
 
     let mel = match &st.mel {
@@ -1244,39 +1493,61 @@ pub unsafe extern "C" fn whisper_lang_auto_detect_with_state(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn whisper_encode(
+pub unsafe extern "C" fn whisper_encode_with_state(
     ctx: *mut whisper_context,
+    state: *mut whisper_state,
     offset: c_int,
     _n_threads: c_int,
 ) -> c_int {
-    if ctx.is_null() {
+    if ctx.is_null() || state.is_null() {
         return -1;
     }
-    let context = &mut *ctx;
+    let t_start = std::time::Instant::now();
+    let context = &*ctx;
+    let state_ref = &mut *state;
     let n_audio_ctx = context.inner.model.hparams.n_audio_ctx as usize;
-    let mel_chunk = if let Some(ref mel) = context.default_state.inner.mel {
+    let mel_chunk = if let Some(ref mel) = state_ref.inner.mel {
         mel.get_chunk(offset.max(0) as usize, n_audio_ctx)
     } else {
         vec![0.0f32; context.inner.model.filters.n_mel * 2 * n_audio_ctx]
     };
 
     let enc_out = context.inner.encoder.forward(&mel_chunk);
-    context.default_state.inner.encoder_output = enc_out;
+    state_ref.inner.encoder_output = enc_out;
+    (*ctx).timings.encode_ms += t_start.elapsed().as_secs_f32() * 1000.0;
     0
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn whisper_decode(
+pub unsafe extern "C" fn whisper_encode(
     ctx: *mut whisper_context,
+    offset: c_int,
+    n_threads: c_int,
+) -> c_int {
+    if ctx.is_null() {
+        return -1;
+    }
+    match (*ctx).default_state.as_mut() {
+        Some(st) => whisper_encode_with_state(ctx, st.as_mut(), offset, n_threads),
+        None => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_decode_with_state(
+    ctx: *mut whisper_context,
+    state: *mut whisper_state,
     tokens: *const c_int,
     n_tokens: c_int,
     n_past: c_int,
     _n_threads: c_int,
 ) -> c_int {
-    if ctx.is_null() || tokens.is_null() || n_tokens <= 0 {
+    if ctx.is_null() || state.is_null() || tokens.is_null() || n_tokens <= 0 {
         return -1;
     }
-    let context = &mut *ctx;
+    let t_start = std::time::Instant::now();
+    let context = &*ctx;
+    let state_ref = &mut *state;
     let n_vocab = context.inner.model.hparams.n_vocab;
     let token_slice = std::slice::from_raw_parts(tokens, n_tokens as usize);
     for &tok in token_slice {
@@ -1286,20 +1557,40 @@ pub unsafe extern "C" fn whisper_decode(
     }
     let tok_vec: Vec<i32> = token_slice.to_vec();
 
-    context.default_state.inner.cache.t_past = n_past.max(0) as usize;
+    state_ref.inner.cache.t_past = n_past.max(0) as usize;
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         context.inner.decoder.decode(
             &tok_vec,
-            &context.default_state.inner.encoder_output,
-            &mut context.default_state.inner.cache,
+            &state_ref.inner.encoder_output,
+            &mut state_ref.inner.cache,
         )
     }));
     match res {
         Ok(logits) => {
-            context.default_state.inner.logits = logits;
+            state_ref.inner.logits = logits;
+            (*ctx).timings.decode_ms += t_start.elapsed().as_secs_f32() * 1000.0;
             0
         }
         Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_decode(
+    ctx: *mut whisper_context,
+    tokens: *const c_int,
+    n_tokens: c_int,
+    n_past: c_int,
+    n_threads: c_int,
+) -> c_int {
+    if ctx.is_null() {
+        return -1;
+    }
+    match (*ctx).default_state.as_mut() {
+        Some(st) => {
+            whisper_decode_with_state(ctx, st.as_mut(), tokens, n_tokens, n_past, n_threads)
+        }
+        None => -1,
     }
 }
 
@@ -1308,13 +1599,9 @@ pub unsafe extern "C" fn whisper_get_logits(ctx: *mut whisper_context) -> *mut f
     if ctx.is_null() {
         return ptr::null_mut();
     }
-    let context = &mut *ctx;
-    let len = context.default_state.inner.logits.len();
-    let n_vocab = context.inner.model.hparams.n_vocab as usize;
-    if len < n_vocab {
-        ptr::null_mut()
-    } else {
-        context.default_state.inner.logits[len - n_vocab..].as_mut_ptr()
+    match (*ctx).default_state.as_mut() {
+        Some(st) => whisper_get_logits_from_state(st.as_mut()),
+        None => ptr::null_mut(),
     }
 }
 
@@ -1331,10 +1618,40 @@ pub unsafe extern "C" fn whisper_get_logits_from_state(state: *mut whisper_state
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn whisper_print_timings(_ctx: *mut whisper_context) {}
+pub unsafe extern "C" fn whisper_get_timings(ctx: *mut whisper_context) -> *mut whisper_timings {
+    if ctx.is_null() {
+        return ptr::null_mut();
+    }
+    &mut (*ctx).timings as *mut whisper_timings
+}
 
 #[no_mangle]
-pub unsafe extern "C" fn whisper_reset_timings(_ctx: *mut whisper_context) {}
+pub unsafe extern "C" fn whisper_print_timings(ctx: *mut whisper_context) {
+    if ctx.is_null() {
+        return;
+    }
+    let t = &(*ctx).timings;
+    let msg = format!(
+        "\nwhisper_print_timings:     load time =      0.00 ms\nwhisper_print_timings:     fallbacks =         0 p /         0 b\nwhisper_print_timings:      mel time =      0.00 ms\nwhisper_print_timings:   sample time = {:9.2} ms\nwhisper_print_timings:   encode time = {:9.2} ms\nwhisper_print_timings:   decode time = {:9.2} ms\nwhisper_print_timings:   batchd time = {:9.2} ms\nwhisper_print_timings:   prompt time = {:9.2} ms\n",
+        t.sample_ms, t.encode_ms, t.decode_ms, t.batchd_ms, t.prompt_ms
+    );
+    whisper_log(ggml_log_level::GGML_LOG_LEVEL_INFO, &msg);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_reset_timings(ctx: *mut whisper_context) {
+    if !ctx.is_null() {
+        (*ctx).timings = whisper_timings::default();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn whisper_log_set(log_callback: ggml_log_callback, user_data: *mut c_void) {
+    if let Ok(mut state) = LOG_CALLBACK.write() {
+        state.callback = log_callback;
+        state.user_data = user_data;
+    }
+}
 
 static SYSTEM_INFO: &str = "whisper.rs: AVX2=1, FMA=1, NEON=1, MultiThreading=1\0";
 
@@ -1385,11 +1702,12 @@ pub unsafe extern "C" fn whisper_full_get_segment_no_speech_prob(
         return 0.0;
     }
     let context = &*ctx;
-    if let Some(seg) = context.default_state.inner.segments.get(i_segment as usize) {
-        seg.no_speech_prob
-    } else {
-        0.0
+    if let Some(state) = &context.default_state {
+        if let Some(seg) = state.inner.segments.get(i_segment as usize) {
+            return seg.no_speech_prob;
+        }
     }
+    0.0
 }
 
 #[no_mangle]
@@ -1433,8 +1751,13 @@ pub unsafe extern "C" fn whisper_full_get_segment_speaker_turn_next(
         return false;
     }
     let context = &*ctx;
-    let state_ptr = (&*context.default_state as *const whisper_state) as *mut whisper_state;
-    whisper_full_get_segment_speaker_turn_next_from_state(state_ptr, i_segment)
+    match &context.default_state {
+        Some(s) => {
+            let state_ptr = (s.as_ref() as *const whisper_state) as *mut whisper_state;
+            whisper_full_get_segment_speaker_turn_next_from_state(state_ptr, i_segment)
+        }
+        None => false,
+    }
 }
 
 #[no_mangle]
@@ -1501,7 +1824,10 @@ pub unsafe extern "C" fn whisper_full_n_vad_segments(ctx: *mut whisper_context) 
         return 0;
     }
     let context = &*ctx;
-    context.default_state.inner.vad_segments.len() as c_int
+    match &context.default_state {
+        Some(s) => s.inner.vad_segments.len() as c_int,
+        None => 0,
+    }
 }
 
 #[no_mangle]
@@ -1529,8 +1855,13 @@ pub unsafe extern "C" fn whisper_full_get_vad_segment_t0(
         return 0;
     }
     let context = &*ctx;
-    let state_ptr = (&*context.default_state as *const whisper_state) as *mut whisper_state;
-    whisper_full_get_vad_segment_t0_from_state(state_ptr, i)
+    match &context.default_state {
+        Some(s) => {
+            let state_ptr = (s.as_ref() as *const whisper_state) as *mut whisper_state;
+            whisper_full_get_vad_segment_t0_from_state(state_ptr, i)
+        }
+        None => 0,
+    }
 }
 
 #[no_mangle]
@@ -1558,8 +1889,13 @@ pub unsafe extern "C" fn whisper_full_get_vad_segment_t1(
         return 0;
     }
     let context = &*ctx;
-    let state_ptr = (&*context.default_state as *const whisper_state) as *mut whisper_state;
-    whisper_full_get_vad_segment_t1_from_state(state_ptr, i)
+    match &context.default_state {
+        Some(s) => {
+            let state_ptr = (s.as_ref() as *const whisper_state) as *mut whisper_state;
+            whisper_full_get_vad_segment_t1_from_state(state_ptr, i)
+        }
+        None => 0,
+    }
 }
 
 #[no_mangle]
@@ -1723,5 +2059,279 @@ pub unsafe extern "C" fn whisper_n_len_from_state(state: *mut whisper_state) -> 
         m.n_len as c_int
     } else {
         0
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Voice Activity Detection (VAD) C-API
+// -----------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn whisper_vad_default_params() -> whisper_vad_params {
+    whisper_vad_params {
+        threshold: 0.5,
+        min_speech_duration_ms: 250,
+        min_silence_duration_ms: 100,
+        max_speech_duration_s: f32::MAX,
+        speech_pad_ms: 30,
+        samples_overlap: 0.1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn whisper_vad_default_context_params() -> whisper_vad_context_params {
+    whisper_vad_context_params {
+        n_threads: 4,
+        use_gpu: false,
+        gpu_device: 0,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_vad_init_from_file_with_params(
+    path: *const c_char,
+    params: whisper_vad_context_params,
+) -> *mut whisper_vad_context {
+    let model_path = if !path.is_null() {
+        CStr::from_ptr(path).to_str().ok().map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    let ctx = Box::new(whisper_vad_context {
+        params,
+        probs: Vec::new(),
+        model_path,
+        samples_cache: Vec::new(),
+    });
+
+    Box::into_raw(ctx)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_vad_free(ctx: *mut whisper_vad_context) {
+    if !ctx.is_null() {
+        drop(Box::from_raw(ctx));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_vad_detect_speech(
+    ctx: *mut whisper_vad_context,
+    samples: *const f32,
+    n_samples: c_int,
+) -> c_int {
+    if ctx.is_null() || samples.is_null() || n_samples <= 0 {
+        return 0;
+    }
+    let context = &mut *ctx;
+    let sample_slice = std::slice::from_raw_parts(samples, n_samples as usize);
+    context.samples_cache = sample_slice.to_vec();
+
+    let sample_rate = 16000;
+    let frame_len = (sample_rate * 30) / 1000; // 30ms window (480 samples @ 16kHz)
+    let frame_hop = (sample_rate * 10) / 1000; // 10ms hop (160 samples @ 16kHz)
+
+    if sample_slice.len() < frame_len {
+        context.probs.clear();
+        return 0;
+    }
+
+    let n_frames = (sample_slice.len() - frame_len) / frame_hop + 1;
+    let mut energies = Vec::with_capacity(n_frames);
+    for i in 0..n_frames {
+        let start = i * frame_hop;
+        let frame = &sample_slice[start..start + frame_len];
+        let mut sum_sq = 0.0f32;
+        for &s in frame {
+            sum_sq += s * s;
+        }
+        let rms = (sum_sq / frame_len as f32).sqrt();
+        energies.push(rms);
+    }
+
+    let mut sorted_energies = energies.clone();
+    sorted_energies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_energy = sorted_energies[sorted_energies.len() / 2];
+    let dyn_threshold = (0.5f32 * 0.02).max(median_energy * 2.0);
+
+    context.probs = energies
+        .iter()
+        .map(|&e| {
+            if dyn_threshold > 0.0 {
+                (e / (e + dyn_threshold)).clamp(0.0, 1.0)
+            } else if e > 0.0 {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    let vad_params = whisper_vad::VadParams {
+        threshold: 0.5,
+        min_speech_duration_ms: 250,
+        min_silence_duration_ms: 100,
+        speech_pad_ms: 30,
+        sample_rate: 16000,
+    };
+    let segments = whisper_vad::detect_speech_segments(sample_slice, &vad_params);
+    if segments.is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_vad_detect_speech_no_reset(
+    ctx: *mut whisper_vad_context,
+    samples: *const f32,
+    n_samples: c_int,
+) -> c_int {
+    whisper_vad_detect_speech(ctx, samples, n_samples)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_vad_reset_state(ctx: *mut whisper_vad_context) {
+    if !ctx.is_null() {
+        (*ctx).probs.clear();
+        (*ctx).samples_cache.clear();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_vad_n_probs(ctx: *mut whisper_vad_context) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    (*ctx).probs.len() as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_vad_probs(ctx: *mut whisper_vad_context) -> *mut f32 {
+    if ctx.is_null() || (*ctx).probs.is_empty() {
+        return ptr::null_mut();
+    }
+    (*ctx).probs.as_mut_ptr()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_vad_segments_from_samples(
+    _ctx: *mut whisper_vad_context,
+    params: whisper_vad_params,
+    samples: *const f32,
+    n_samples: c_int,
+) -> *mut whisper_vad_segments {
+    if samples.is_null() || n_samples <= 0 {
+        return ptr::null_mut();
+    }
+    let sample_slice = std::slice::from_raw_parts(samples, n_samples as usize);
+    let rust_params = whisper_vad::VadParams {
+        threshold: params.threshold,
+        min_speech_duration_ms: params.min_speech_duration_ms.max(0) as usize,
+        min_silence_duration_ms: params.min_silence_duration_ms.max(0) as usize,
+        speech_pad_ms: params.speech_pad_ms.max(0) as usize,
+        sample_rate: 16000,
+    };
+    let segments = whisper_vad::detect_speech_segments(sample_slice, &rust_params);
+    let segs = Box::new(whisper_vad_segments { segments });
+    Box::into_raw(segs)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_vad_segments_from_probs(
+    ctx: *mut whisper_vad_context,
+    params: whisper_vad_params,
+) -> *mut whisper_vad_segments {
+    if ctx.is_null() {
+        return ptr::null_mut();
+    }
+    let context = &*ctx;
+    if !context.samples_cache.is_empty() {
+        whisper_vad_segments_from_samples(
+            ctx,
+            params,
+            context.samples_cache.as_ptr(),
+            context.samples_cache.len() as c_int,
+        )
+    } else {
+        let frame_hop = 0.01;
+        let mut segments = Vec::new();
+        let mut in_speech = false;
+        let mut seg_start = 0;
+        let min_speech_frames = (params.min_speech_duration_ms as usize / 10).max(1);
+        for (i, &p) in context.probs.iter().enumerate() {
+            if p >= params.threshold && !in_speech {
+                in_speech = true;
+                seg_start = i;
+            } else if p < params.threshold && in_speech {
+                in_speech = false;
+                if i - seg_start >= min_speech_frames {
+                    segments.push(whisper_vad::SpeechSegment {
+                        t0: seg_start as f64 * frame_hop,
+                        t1: i as f64 * frame_hop + 0.03,
+                    });
+                }
+            }
+        }
+        if in_speech && context.probs.len() - seg_start >= min_speech_frames {
+            segments.push(whisper_vad::SpeechSegment {
+                t0: seg_start as f64 * frame_hop,
+                t1: context.probs.len() as f64 * frame_hop + 0.03,
+            });
+        }
+        let segs = Box::new(whisper_vad_segments { segments });
+        Box::into_raw(segs)
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_vad_segments_n_segments(
+    segments: *mut whisper_vad_segments,
+) -> c_int {
+    if segments.is_null() {
+        return 0;
+    }
+    let segs = &*segments;
+    segs.segments.len() as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_vad_segments_get_segment_t0(
+    segments: *mut whisper_vad_segments,
+    i_segment: c_int,
+) -> f32 {
+    if segments.is_null() || i_segment < 0 {
+        return 0.0;
+    }
+    let segs = &*segments;
+    if let Some(seg) = segs.segments.get(i_segment as usize) {
+        (seg.t0 * 100.0) as f32
+    } else {
+        0.0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_vad_segments_get_segment_t1(
+    segments: *mut whisper_vad_segments,
+    i_segment: c_int,
+) -> f32 {
+    if segments.is_null() || i_segment < 0 {
+        return 0.0;
+    }
+    let segs = &*segments;
+    if let Some(seg) = segs.segments.get(i_segment as usize) {
+        (seg.t1 * 100.0) as f32
+    } else {
+        0.0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_vad_free_segments(segments: *mut whisper_vad_segments) {
+    if !segments.is_null() {
+        drop(Box::from_raw(segments));
     }
 }
