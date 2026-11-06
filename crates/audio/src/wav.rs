@@ -25,6 +25,7 @@ pub struct WavAudio {
     pub sample_rate: u32,
     pub channels: u16,
     pub samples: Vec<f32>,
+    pub channel_samples: Vec<Vec<f32>>,
 }
 
 impl WavAudio {
@@ -60,7 +61,7 @@ impl WavAudio {
         let mut bits_per_sample = 0u16;
         let mut data_found = false;
         let mut samples = Vec::new();
-
+        let mut channel_samples: Vec<Vec<f32>> = Vec::new();
         while !data_found {
             let mut chunk_id = [0u8; 4];
             if reader.read_exact(&mut chunk_id).is_err() {
@@ -130,14 +131,19 @@ impl WavAudio {
                         (WAVE_FORMAT_PCM, 8) => {
                             // 8-bit unsigned PCM
                             let num_samples = chunk_size;
-                            let total_frames = num_samples / num_channels;
+                            let total_frames = num_samples.checked_div(num_channels).unwrap_or(0);
                             samples.reserve(total_frames);
+                            channel_samples = (0..num_channels)
+                                .map(|_| Vec::with_capacity(total_frames))
+                                .collect();
 
                             for _ in 0..total_frames {
                                 let mut sum = 0.0f32;
-                                for _ in 0..num_channels {
+                                for ch_vec in &mut channel_samples {
                                     let s = reader.read_u8()? as f32;
-                                    sum += (s - 128.0) / 128.0;
+                                    let val = (s - 128.0) / 128.0;
+                                    sum += val;
+                                    ch_vec.push(val);
                                 }
                                 samples.push(sum / num_channels as f32);
                             }
@@ -145,14 +151,19 @@ impl WavAudio {
                         (WAVE_FORMAT_PCM, 16) => {
                             // 16-bit signed PCM
                             let num_samples = chunk_size / 2;
-                            let total_frames = num_samples / num_channels;
+                            let total_frames = num_samples.checked_div(num_channels).unwrap_or(0);
                             samples.reserve(total_frames);
+                            channel_samples = (0..num_channels)
+                                .map(|_| Vec::with_capacity(total_frames))
+                                .collect();
 
                             for _ in 0..total_frames {
                                 let mut sum = 0.0f32;
-                                for _ in 0..num_channels {
+                                for ch_vec in &mut channel_samples {
                                     let s = reader.read_i16::<LittleEndian>()? as f32;
-                                    sum += s / 32768.0;
+                                    let val = s / 32768.0;
+                                    sum += val;
+                                    ch_vec.push(val);
                                 }
                                 samples.push(sum / num_channels as f32);
                             }
@@ -160,21 +171,26 @@ impl WavAudio {
                         (WAVE_FORMAT_PCM, 24) => {
                             // 24-bit signed PCM (packed 3 bytes per sample)
                             let num_samples = chunk_size / 3;
-                            let total_frames = num_samples / num_channels;
+                            let total_frames = num_samples.checked_div(num_channels).unwrap_or(0);
                             samples.reserve(total_frames);
+                            channel_samples = (0..num_channels)
+                                .map(|_| Vec::with_capacity(total_frames))
+                                .collect();
 
                             for _ in 0..total_frames {
                                 let mut sum = 0.0f32;
-                                for _ in 0..num_channels {
+                                for ch_vec in &mut channel_samples {
                                     let mut b = [0u8; 3];
                                     reader.read_exact(&mut b)?;
-                                    let val = i32::from_le_bytes([
+                                    let val_i = i32::from_le_bytes([
                                         b[0],
                                         b[1],
                                         b[2],
                                         if b[2] & 0x80 != 0 { 0xFF } else { 0x00 },
                                     ]);
-                                    sum += val as f32 / 8388608.0;
+                                    let val = val_i as f32 / 8388608.0;
+                                    sum += val;
+                                    ch_vec.push(val);
                                 }
                                 samples.push(sum / num_channels as f32);
                             }
@@ -182,14 +198,19 @@ impl WavAudio {
                         (WAVE_FORMAT_PCM, 32) => {
                             // 32-bit signed PCM
                             let num_samples = chunk_size / 4;
-                            let total_frames = num_samples / num_channels;
+                            let total_frames = num_samples.checked_div(num_channels).unwrap_or(0);
                             samples.reserve(total_frames);
+                            channel_samples = (0..num_channels)
+                                .map(|_| Vec::with_capacity(total_frames))
+                                .collect();
 
                             for _ in 0..total_frames {
                                 let mut sum = 0.0f32;
-                                for _ in 0..num_channels {
+                                for ch_vec in &mut channel_samples {
                                     let s = reader.read_i32::<LittleEndian>()? as f32;
-                                    sum += s / 2147483648.0;
+                                    let val = s / 2147483648.0;
+                                    sum += val;
+                                    ch_vec.push(val);
                                 }
                                 samples.push(sum / num_channels as f32);
                             }
@@ -197,14 +218,18 @@ impl WavAudio {
                         (WAVE_FORMAT_IEEE_FLOAT, 32) => {
                             // 32-bit IEEE float
                             let num_samples = chunk_size / 4;
-                            let total_frames = num_samples / num_channels;
+                            let total_frames = num_samples.checked_div(num_channels).unwrap_or(0);
                             samples.reserve(total_frames);
+                            channel_samples = (0..num_channels)
+                                .map(|_| Vec::with_capacity(total_frames))
+                                .collect();
 
                             for _ in 0..total_frames {
                                 let mut sum = 0.0f32;
-                                for _ in 0..num_channels {
+                                for ch_vec in &mut channel_samples {
                                     let s = reader.read_f32::<LittleEndian>()?;
                                     sum += s;
+                                    ch_vec.push(s);
                                 }
                                 samples.push(sum / num_channels as f32);
                             }
@@ -212,14 +237,18 @@ impl WavAudio {
                         (WAVE_FORMAT_IEEE_FLOAT, 64) => {
                             // 64-bit IEEE float
                             let num_samples = chunk_size / 8;
-                            let total_frames = num_samples / num_channels;
+                            let total_frames = num_samples.checked_div(num_channels).unwrap_or(0);
                             samples.reserve(total_frames);
+                            channel_samples = (0..num_channels)
+                                .map(|_| Vec::with_capacity(total_frames))
+                                .collect();
 
                             for _ in 0..total_frames {
                                 let mut sum = 0.0f32;
-                                for _ in 0..num_channels {
+                                for ch_vec in &mut channel_samples {
                                     let s = reader.read_f64::<LittleEndian>()? as f32;
                                     sum += s;
+                                    ch_vec.push(s);
                                 }
                                 samples.push(sum / num_channels as f32);
                             }
@@ -249,6 +278,7 @@ impl WavAudio {
             sample_rate,
             channels,
             samples,
+            channel_samples,
         })
     }
 }

@@ -613,3 +613,49 @@ fn test_wave_format_extensible_errors() {
     let res = WavAudio::load_from_bytes(&bad_guid_wav);
     assert!(matches!(res, Err(AudioError::UnsupportedFormat(_))));
 }
+
+#[test]
+fn test_multi_channel_preservation_stereo() {
+    let left: [i16; 3] = [32767, -16384, 0];
+    let right: [i16; 3] = [0, 16384, -32768];
+    let mut pcm_bytes = Vec::new();
+    for i in 0..3 {
+        pcm_bytes.extend_from_slice(&left[i].to_le_bytes());
+        pcm_bytes.extend_from_slice(&right[i].to_le_bytes());
+    }
+
+    let wav = create_wav_bytes(2, 16000, 16, 1, &pcm_bytes);
+    let audio = WavAudio::load_from_bytes(&wav).expect("Load stereo wav");
+
+    assert_eq!(audio.channels, 2);
+    assert_eq!(audio.sample_rate, 16000);
+    assert_eq!(audio.samples.len(), 3);
+    assert_eq!(audio.channel_samples.len(), 2);
+    assert_eq!(audio.channel_samples[0].len(), 3);
+    assert_eq!(audio.channel_samples[1].len(), 3);
+
+    // Verify channel 0 (left)
+    assert!((audio.channel_samples[0][0] - 32767.0 / 32768.0).abs() < 1e-4);
+    assert!((audio.channel_samples[0][1] - (-16384.0 / 32768.0)).abs() < 1e-4);
+    assert!((audio.channel_samples[0][2] - 0.0).abs() < 1e-4);
+
+    // Verify channel 1 (right)
+    assert!((audio.channel_samples[1][0] - 0.0).abs() < 1e-4);
+    assert!((audio.channel_samples[1][1] - 16384.0 / 32768.0).abs() < 1e-4);
+    assert!((audio.channel_samples[1][2] - (-32768.0 / 32768.0)).abs() < 1e-4);
+
+    // Verify downmixed mono samples
+    let expected_mono_0 = (32767.0 / 32768.0 + 0.0) / 2.0;
+    let expected_mono_1 = (-16384.0 / 32768.0 + 16384.0 / 32768.0) / 2.0;
+    assert!((audio.samples[0] - expected_mono_0).abs() < 1e-4);
+    assert!((audio.samples[1] - expected_mono_1).abs() < 1e-4);
+
+    // Verify decoder path via load_audio_from_bytes
+    let decoded = whisper_audio::load_audio_from_bytes(&wav).expect("Decode stereo media");
+    assert_eq!(decoded.channels, 2);
+    assert_eq!(decoded.channel_samples.len(), 2);
+    assert_eq!(decoded.channel_samples[0].len(), 3);
+    assert_eq!(decoded.channel_samples[1].len(), 3);
+    assert!((decoded.channel_samples[0][0] - audio.channel_samples[0][0]).abs() < 1e-4);
+    assert!((decoded.channel_samples[1][0] - audio.channel_samples[1][0]).abs() < 1e-4);
+}

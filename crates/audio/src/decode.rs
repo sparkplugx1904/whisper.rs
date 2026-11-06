@@ -70,7 +70,7 @@ fn decode_media_source(mss: MediaSourceStream, hint: Hint) -> Result<WavAudio, A
         })?;
 
     let mut mono_samples = Vec::new();
-
+    let mut channel_samples: Vec<Vec<f32>> = Vec::new();
     loop {
         let packet: symphonia::core::formats::Packet = match format.next_packet() {
             Ok(p) => p,
@@ -91,7 +91,7 @@ fn decode_media_source(mss: MediaSourceStream, hint: Hint) -> Result<WavAudio, A
 
         match decoder.decode(&packet) {
             Ok(decoded) => {
-                append_samples_mono(&decoded, &mut mono_samples);
+                append_samples(&decoded, &mut mono_samples, &mut channel_samples);
             }
             Err(SymphoniaError::IoError(_)) => break,
             Err(SymphoniaError::DecodeError(_)) => continue,
@@ -105,90 +105,169 @@ fn decode_media_source(mss: MediaSourceStream, hint: Hint) -> Result<WavAudio, A
         ));
     }
 
-    // Auto-resample to 16 kHz if source sample rate differs
-    let final_samples = if sample_rate != WHISPER_SAMPLE_RATE {
-        resample_to_16k(&mono_samples, sample_rate)
+    let actual_channels = channel_samples.len() as u16;
+    let channels = if actual_channels > 0 {
+        actual_channels
     } else {
-        mono_samples
+        1
+    };
+
+    // Auto-resample to 16 kHz if source sample rate differs
+    let (final_samples, final_channel_samples) = if sample_rate != WHISPER_SAMPLE_RATE {
+        let mono = resample_to_16k(&mono_samples, sample_rate);
+        let chs = channel_samples
+            .iter()
+            .map(|ch| resample_to_16k(ch, sample_rate))
+            .collect();
+        (mono, chs)
+    } else {
+        (mono_samples, channel_samples)
     };
 
     Ok(WavAudio {
         sample_rate: WHISPER_SAMPLE_RATE,
-        channels: 1,
+        channels,
         samples: final_samples,
+        channel_samples: final_channel_samples,
     })
 }
 
-fn append_samples_mono(buffer: &AudioBufferRef, out: &mut Vec<f32>) {
+fn append_samples(
+    buffer: &AudioBufferRef,
+    mono_out: &mut Vec<f32>,
+    channel_out: &mut Vec<Vec<f32>>,
+) {
     match buffer {
         AudioBufferRef::F32(buf) => {
             let n_channels = buf.spec().channels.count();
             let n_frames = buf.frames();
+            if channel_out.is_empty() && n_channels > 0 {
+                *channel_out = (0..n_channels).map(|_| Vec::new()).collect();
+            }
+            mono_out.reserve(n_frames);
+            for ch in channel_out.iter_mut() {
+                ch.reserve(n_frames);
+            }
             for frame_idx in 0..n_frames {
                 let mut sum = 0.0f32;
                 for ch in 0..n_channels {
-                    sum += buf.chan(ch)[frame_idx];
+                    let s = buf.chan(ch)[frame_idx];
+                    sum += s;
+                    if ch < channel_out.len() {
+                        channel_out[ch].push(s);
+                    }
                 }
-                out.push(sum / n_channels as f32);
+                mono_out.push(sum / n_channels as f32);
             }
         }
         AudioBufferRef::U8(buf) => {
             let n_channels = buf.spec().channels.count();
             let n_frames = buf.frames();
+            if channel_out.is_empty() && n_channels > 0 {
+                *channel_out = (0..n_channels).map(|_| Vec::new()).collect();
+            }
+            mono_out.reserve(n_frames);
+            for ch in channel_out.iter_mut() {
+                ch.reserve(n_frames);
+            }
             for frame_idx in 0..n_frames {
                 let mut sum = 0.0f32;
                 for ch in 0..n_channels {
                     let s = (buf.chan(ch)[frame_idx] as f32 - 128.0) / 128.0;
                     sum += s;
+                    if ch < channel_out.len() {
+                        channel_out[ch].push(s);
+                    }
                 }
-                out.push(sum / n_channels as f32);
+                mono_out.push(sum / n_channels as f32);
             }
         }
         AudioBufferRef::S16(buf) => {
             let n_channels = buf.spec().channels.count();
             let n_frames = buf.frames();
+            if channel_out.is_empty() && n_channels > 0 {
+                *channel_out = (0..n_channels).map(|_| Vec::new()).collect();
+            }
+            mono_out.reserve(n_frames);
+            for ch in channel_out.iter_mut() {
+                ch.reserve(n_frames);
+            }
             for frame_idx in 0..n_frames {
                 let mut sum = 0.0f32;
                 for ch in 0..n_channels {
                     let s = buf.chan(ch)[frame_idx] as f32 / 32768.0;
                     sum += s;
+                    if ch < channel_out.len() {
+                        channel_out[ch].push(s);
+                    }
                 }
-                out.push(sum / n_channels as f32);
+                mono_out.push(sum / n_channels as f32);
             }
         }
         AudioBufferRef::S24(buf) => {
             let n_channels = buf.spec().channels.count();
             let n_frames = buf.frames();
+            if channel_out.is_empty() && n_channels > 0 {
+                *channel_out = (0..n_channels).map(|_| Vec::new()).collect();
+            }
+            mono_out.reserve(n_frames);
+            for ch in channel_out.iter_mut() {
+                ch.reserve(n_frames);
+            }
             for frame_idx in 0..n_frames {
                 let mut sum = 0.0f32;
                 for ch in 0..n_channels {
                     let s = buf.chan(ch)[frame_idx].0 as f32 / 8388608.0;
                     sum += s;
+                    if ch < channel_out.len() {
+                        channel_out[ch].push(s);
+                    }
                 }
-                out.push(sum / n_channels as f32);
+                mono_out.push(sum / n_channels as f32);
             }
         }
         AudioBufferRef::S32(buf) => {
             let n_channels = buf.spec().channels.count();
             let n_frames = buf.frames();
+            if channel_out.is_empty() && n_channels > 0 {
+                *channel_out = (0..n_channels).map(|_| Vec::new()).collect();
+            }
+            mono_out.reserve(n_frames);
+            for ch in channel_out.iter_mut() {
+                ch.reserve(n_frames);
+            }
             for frame_idx in 0..n_frames {
                 let mut sum = 0.0f32;
                 for ch in 0..n_channels {
                     let s = buf.chan(ch)[frame_idx] as f32 / 2147483648.0;
                     sum += s;
+                    if ch < channel_out.len() {
+                        channel_out[ch].push(s);
+                    }
                 }
-                out.push(sum / n_channels as f32);
+                mono_out.push(sum / n_channels as f32);
             }
         }
         AudioBufferRef::F64(buf) => {
             let n_channels = buf.spec().channels.count();
             let n_frames = buf.frames();
+            if channel_out.is_empty() && n_channels > 0 {
+                *channel_out = (0..n_channels).map(|_| Vec::new()).collect();
+            }
+            mono_out.reserve(n_frames);
+            for ch in channel_out.iter_mut() {
+                ch.reserve(n_frames);
+            }
             for frame_idx in 0..n_frames {
                 let mut sum = 0.0f32;
                 for ch in 0..n_channels {
-                    sum += buf.chan(ch)[frame_idx] as f32;
+                    let s = buf.chan(ch)[frame_idx] as f32;
+                    sum += s;
+                    if ch < channel_out.len() {
+                        channel_out[ch].push(s);
+                    }
                 }
-                out.push(sum / n_channels as f32);
+                mono_out.push(sum / n_channels as f32);
             }
         }
         _ => {}
