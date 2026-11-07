@@ -552,6 +552,8 @@ impl WhisperContext {
                         ));
                     }
 
+                    // `_NO_SPEECH_` id for this model's vocabulary.
+                    let no_speech_token = self.model.vocab.token_nosp;
                     for step in 0..max_steps {
                         if params.abort_callback.as_ref().is_some_and(|cb| cb()) {
                             break;
@@ -617,8 +619,15 @@ impl WhisperContext {
                         let step_entropy = crate::filter::compute_distribution_entropy(step_logits);
                         token_entropies.push(step_entropy);
 
-                        if step == 0 && n_vocab > 50362 {
-                            let ns_logit = step_logits[50362];
+                        // The no-speech probability comes from the dedicated
+                        // `_NO_SPEECH_` token, whose id differs between the
+                        // English-only and multilingual vocabularies (50361 vs
+                        // 50362 here). Reading a fixed index picked up the
+                        // `_NOT_` logit for English models, so every segment
+                        // reported a no-speech probability of ~0 even on
+                        // digital silence. The id now comes from the vocabulary.
+                        if step == 0 {
+                            let ns_logit = step_logits[no_speech_token as usize];
                             if ns_logit > f32::NEG_INFINITY {
                                 no_speech_prob = (ns_logit - lse).exp().clamp(0.0, 1.0);
                             }
