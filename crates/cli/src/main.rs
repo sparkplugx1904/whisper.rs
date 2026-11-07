@@ -921,8 +921,8 @@ mod tests {
         let expected_json = "[\n  {\"start\": 0.000, \"end\": 2.500, \"text\": \"Hello world!\", \"avg_logprob\": -0.2000, \"no_speech_prob\": 0.0100},\n  {\"start\": 2.500, \"end\": 65.123, \"text\": \"Line 2 with \\\"quotes\\\" and \\\\slash\", \"avg_logprob\": -0.2000, \"no_speech_prob\": 0.0100}\n]\n";
         // Verify CSV
         let csv_content = fs::read_to_string(format!("{}.csv", base_str)).expect("Read csv");
-        assert!(csv_content.starts_with("start,end,text\n"));
-        assert!(csv_content.contains("0,2500,\"Hello world!\"\n"));
+        assert!(csv_content.starts_with("start,end,text,avg_logprob,no_speech_prob\n"));
+        assert!(csv_content.contains("0,2500,\"Hello world!\",-0.2000,0.0100\n"));
 
         // Verify LRC
         let lrc_content = fs::read_to_string(format!("{}.lrc", base_str)).expect("Read lrc");
@@ -1224,7 +1224,7 @@ mod tests {
 
         // Verify CSV
         let csv_content = fs::read_to_string(format!("{}.csv", base_str)).expect("Read csv");
-        assert!(csv_content.contains("start,end,speaker,text"));
+        assert!(csv_content.contains("start,end,speaker,text,avg_logprob,no_speech_prob"));
         assert!(csv_content.contains("0,2000,0,\"Speaker zero talking\""));
         assert!(csv_content.contains("2000,4000,1,\"Speaker one replying\""));
 

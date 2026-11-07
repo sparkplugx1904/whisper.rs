@@ -290,10 +290,14 @@ impl OutputFormatter for CsvFormatter {
 
     fn write_segments(&self, segments: &[Segment], writer: &mut dyn Write) -> std::io::Result<()> {
         let diarize_active = self.diarize || segments.iter().any(|s| s.speaker.is_some());
+        // Confidence travels with the text: a subtitle line a human is about to
+        // edit is only useful if the file says how sure the decoder was. The
+        // terminal already color-codes this, but exported files carried none of
+        // it (ggml-org/whisper.cpp#427).
         if diarize_active {
-            writeln!(writer, "start,end,speaker,text")?;
+            writeln!(writer, "start,end,speaker,text,avg_logprob,no_speech_prob")?;
         } else {
-            writeln!(writer, "start,end,text")?;
+            writeln!(writer, "start,end,text,avg_logprob,no_speech_prob")?;
         }
         for s in segments {
             let t0_ms = (s.t0.max(0.0) * 1000.0).round() as u64;
@@ -301,9 +305,17 @@ impl OutputFormatter for CsvFormatter {
             let escaped = s.text.trim().replace('"', "\"\"");
             if diarize_active {
                 let spk = s.speaker.as_deref().map(speaker_id).unwrap_or("?");
-                writeln!(writer, "{},{},{},\"{}\"", t0_ms, t1_ms, spk, escaped)?;
+                writeln!(
+                    writer,
+                    "{},{},{},\"{}\",{:.4},{:.4}",
+                    t0_ms, t1_ms, spk, escaped, s.avg_logprob, s.no_speech_prob
+                )?;
             } else {
-                writeln!(writer, "{},{},\"{}\"", t0_ms, t1_ms, escaped)?;
+                writeln!(
+                    writer,
+                    "{},{},\"{}\",{:.4},{:.4}",
+                    t0_ms, t1_ms, escaped, s.avg_logprob, s.no_speech_prob
+                )?;
             }
         }
         Ok(())
@@ -925,9 +937,15 @@ mod tests {
             .unwrap();
         let s = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = s.lines().collect();
-        assert_eq!(lines[0], "start,end,speaker,text");
-        assert_eq!(lines[1], "0,1500,0,\"Intro\"");
-        assert_eq!(lines[2], "1500,3250,1,\"Response with \"\"quotes\"\"\"");
+        assert_eq!(
+            lines[0],
+            "start,end,speaker,text,avg_logprob,no_speech_prob"
+        );
+        assert_eq!(lines[1], "0,1500,0,\"Intro\",-0.2000,0.0100");
+        assert_eq!(
+            lines[2],
+            "1500,3250,1,\"Response with \"\"quotes\"\"\",-0.2000,0.0100"
+        );
     }
 
     #[test]
