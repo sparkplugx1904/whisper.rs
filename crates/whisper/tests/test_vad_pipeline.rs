@@ -90,3 +90,58 @@ fn test_vad_keeps_absolute_timestamps() {
         "VAD path lost the transcript: '{text}'"
     );
 }
+
+#[test]
+fn test_no_speech_gate_drops_flagged_windows() {
+    let model_path = resolve_model_path("ggml-tiny.en.bin");
+    if !model_path.exists() {
+        eprintln!("Missing model, skipping no-speech gate test");
+        return;
+    }
+
+    let ctx = WhisperContext::load_model(&model_path).expect("load model");
+
+    // Digital silence is where the decoder invents a word ("you" with
+    // tiny.en). It does not trip the default gate because this checkpoint
+    // reports a near-zero no-speech probability on synthetic silence, so the
+    // thresholds are tightened here to cross both conditions and exercise the
+    // rule: no_speech_prob > no_speech_threshold AND avg_logprob < logprob_threshold.
+    let silence = vec![0.0f32; 16_000 * 20];
+    let gated = WhisperParams {
+        no_timestamps: true,
+        no_speech_threshold: 1e-4,
+        logprob_threshold: -0.1,
+        ..Default::default()
+    };
+    let segments = ctx.transcribe_pcm(&silence, &gated);
+    let text: String = segments.iter().map(|s| s.text.as_str()).collect();
+    assert!(
+        text.trim().is_empty(),
+        "window flagged as non-speech must be dropped, got '{text}'"
+    );
+
+    // Same audio, gate disabled: the phantom tokens come back, which is what
+    // the gate exists to stop.
+    let ungated = WhisperParams {
+        no_speech_threshold: 0.0,
+        ..gated
+    };
+    let ungated_segments = ctx.transcribe_pcm(&silence, &ungated);
+    assert!(
+        !ungated_segments.is_empty(),
+        "with the gate disabled the silence should still be decoded"
+    );
+
+    // Ordinary speech must survive the default thresholds.
+    let speech = jfk_samples().expect("jfk sample");
+    let speech_params = WhisperParams {
+        no_timestamps: true,
+        ..Default::default()
+    };
+    let speech_segments = ctx.transcribe_pcm(&speech, &speech_params);
+    let speech_text: String = speech_segments.iter().map(|s| s.text.as_str()).collect();
+    assert!(
+        speech_text.contains("fellow Americans"),
+        "speech must not be classified as silence: '{speech_text}'"
+    );
+}

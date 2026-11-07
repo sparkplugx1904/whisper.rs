@@ -671,6 +671,22 @@ impl WhisperContext {
             let avg_logprob = eval.avg_logprob;
             let avg_entropy = eval.avg_entropy;
 
+            // The decoder emits a dedicated no-speech probability at step 0.
+            // When it is confident that the window holds no speech and the
+            // token log-probs are poor, the window is silence rather than
+            // quiet speech, and emitting its tokens is exactly how trailing
+            // silence becomes invented text (ggml-org/whisper.cpp#1724,
+            // #1026). The rule matches OpenAI Whisper's decoding loop: skip
+            // only when both signals agree, so whispered speech with a low
+            // no-speech score is still transcribed.
+            if params.no_speech_threshold > 0.0
+                && no_speech_prob > params.no_speech_threshold as f32
+                && (avg_logprob as f64) < params.logprob_threshold
+            {
+                seek_frame += chunk_frames;
+                continue;
+            }
+
             // Extract segments from tokens_cur
             if params.no_timestamps || tokens_cur.is_empty() {
                 let max_tok = if params.max_tokens > 0 {
