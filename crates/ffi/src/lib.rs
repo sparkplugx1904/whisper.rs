@@ -617,6 +617,27 @@ pub unsafe extern "C" fn whisper_full_with_state(
         1
     };
 
+    // `detect_language` overrides an explicit language, matching the C API
+    // contract where it forces auto-detection for this call.
+    let lang_str = if params.detect_language {
+        "auto".to_string()
+    } else {
+        lang_str
+    };
+
+    let suppress_regex = if !params.suppress_regex.is_null() {
+        CStr::from_ptr(params.suppress_regex)
+            .to_str()
+            .ok()
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    // Every field the C struct declares has to reach the engine, otherwise the
+    // caller sees a flag "accepted" and silently ignored. `max_len` and
+    // `split_on_word` used to be dropped here, which is exactly the complaint in
+    // ggml-org/whisper.cpp#460 for the Go bindings.
     let rust_params = WhisperParams {
         language: lang_str,
         translate: params.translate,
@@ -624,16 +645,39 @@ pub unsafe extern "C" fn whisper_full_with_state(
         temperature_inc: params.temperature_inc,
         beam_size: beam_sz,
         no_timestamps: params.no_timestamps,
+        suppress_blank: params.suppress_blank,
+        suppress_nst: params.suppress_nst,
+        compression_ratio_threshold: params.entropy_thold as f64,
+        logprob_threshold: params.logprob_thold as f64,
+        no_speech_threshold: params.no_speech_thold as f64,
+        entropy_thold: params.entropy_thold,
         initial_prompt: prompt_str,
         prompt_tokens: raw_prompt_tokens,
         no_context: params.no_context,
         carry_initial_prompt: params.carry_initial_prompt,
+        max_len: params.max_len.max(0) as usize,
+        split_on_word: params.split_on_word,
+        max_initial_ts: params.max_initial_ts,
+        length_penalty: params.length_penalty,
+        single_segment: params.single_segment,
+        suppress_regex,
+        audio_ctx: params.audio_ctx.max(0) as usize,
+        offset_ms: params.offset_ms,
+        duration_ms: params.duration_ms,
+        tdrz_enable: params.tdrz_enable,
         n_threads: params.n_threads.max(1) as usize,
         max_tokens: if params.max_tokens > 0 {
             params.max_tokens as usize
         } else {
             0
         },
+        vad_enable: params.vad,
+        vad_threshold: params.vad_params.threshold,
+        vad_min_speech_duration_ms: params.vad_params.min_speech_duration_ms.max(0) as usize,
+        vad_min_silence_duration_ms: params.vad_params.min_silence_duration_ms.max(0) as usize,
+        vad_speech_pad_ms: params.vad_params.speech_pad_ms.max(0) as usize,
+        // `grammar_rules` is a parsed C rule table, which this port does not
+        // consume; callers pass GBNF source through the Rust API instead.
         ..Default::default()
     };
 

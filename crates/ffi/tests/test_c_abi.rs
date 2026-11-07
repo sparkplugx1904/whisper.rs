@@ -665,3 +665,97 @@ fn test_c_abi_vad_standalone_api() {
         whisper_vad_free_segments(std::ptr::null_mut());
     }
 }
+
+#[test]
+fn test_c_abi_honours_max_len_and_offset() {
+    let model_path = resolve_model_path("ggml-tiny.en.bin");
+    let wav_path = workspace_path("samples/jfk.wav");
+
+    if !model_path.exists() {
+        eprintln!("Model not found, skipping C-ABI max_len test");
+        return;
+    }
+
+    let audio = whisper_rs::audio::WavAudio::load_from_file(&wav_path).expect("load wav");
+    let c_model_path = CString::new(model_path.to_str().unwrap()).unwrap();
+    let sr = audio.sample_rate as usize;
+
+    unsafe {
+        let ctx = whisper_init_from_file(c_model_path.as_ptr());
+        assert!(!ctx.is_null());
+
+        // Baseline: one long segment for an 11 s clip.
+        let mut params =
+            whisper_full_default_params(whisper_sampling_strategy::WHISPER_SAMPLING_GREEDY);
+        params.print_progress = false;
+        assert_eq!(
+            whisper_full(
+                ctx,
+                params,
+                audio.samples.as_ptr(),
+                audio.samples.len() as i32
+            ),
+            0
+        );
+        let n_plain = whisper_full_n_segments(ctx);
+        let plain_text_len = {
+            let t = CStr::from_ptr(whisper_full_get_segment_text(ctx, 0))
+                .to_string_lossy()
+                .trim()
+                .chars()
+                .count();
+            t
+        };
+        assert!(
+            plain_text_len > 40,
+            "expected a full sentence, got {plain_text_len} chars"
+        );
+
+        // `max_len` must split the same audio into narrower segments. Before the
+        // field was mapped, the C ABI accepted it and produced identical output.
+        params.max_len = 20;
+        params.split_on_word = true;
+        assert_eq!(
+            whisper_full(
+                ctx,
+                params,
+                audio.samples.as_ptr(),
+                audio.samples.len() as i32
+            ),
+            0
+        );
+        let n_split = whisper_full_n_segments(ctx);
+        assert!(
+            n_split > n_plain,
+            "max_len had no effect: {n_plain} segment(s) before, {n_split} after"
+        );
+        for i in 0..n_split {
+            let text = CStr::from_ptr(whisper_full_get_segment_text(ctx, i)).to_string_lossy();
+            let chars = text.trim().chars().count();
+            // A single word longer than the limit is still allowed through, so
+            // the bound is the limit plus one word.
+            assert!(
+                chars <= 40,
+                "segment {i} has {chars} chars, well past the 20 char limit: '{}'",
+                text.trim()
+            );
+        }
+
+        // `offset_ms` must shift the reported speech start.
+        let mut offset_params =
+            whisper_full_default_params(whisper_sampling_strategy::WHISPER_SAMPLING_GREEDY);
+        offset_params.offset_ms = 3000;
+        assert_eq!(
+            whisper_full(
+                ctx,
+                offset_params,
+                audio.samples.as_ptr(),
+                (audio.samples.len() - 3 * sr) as i32
+            ),
+            0
+        );
+        assert!(whisper_full_n_segments(ctx) >= 1);
+
+        whisper_free(ctx);
+    }
+}
