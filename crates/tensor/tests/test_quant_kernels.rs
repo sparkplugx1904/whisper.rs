@@ -160,3 +160,68 @@ fn test_quantized_linear_vector() {
         );
     }
 }
+
+#[test]
+fn test_quantized_linear_batched_matches_gemv() {
+    let rows = 6;
+    let cols = 64;
+    let num_tokens = 3;
+    let bytes_per_row = 68; // Q8_0: 2 blocks of 34 bytes
+    let mut weight_bytes = vec![0u8; rows * bytes_per_row];
+
+    for r in 0..rows {
+        let d_bits = f16::from_f32((r + 1) as f32 * 0.05).to_bits();
+        let row_slice = &mut weight_bytes[r * bytes_per_row..(r + 1) * bytes_per_row];
+        for blk in 0..2 {
+            let off = blk * 34;
+            row_slice[off..off + 2].copy_from_slice(&d_bits.to_le_bytes());
+            for i in 0..32 {
+                row_slice[off + 2 + i] = ((r * 11 + blk * 5 + i) % 40) as u8;
+            }
+        }
+    }
+
+    let bias: Vec<f32> = (0..rows).map(|r| r as f32 * 0.5).collect();
+    let input: Vec<f32> = (0..num_tokens * cols)
+        .map(|i| ((i % 17) as f32) * 0.03 - 0.2)
+        .collect();
+
+    let mut batched = vec![0.0f32; num_tokens * rows];
+    whisper_tensor::ops::quantized_linear(
+        &weight_bytes,
+        DType::Q8_0,
+        rows,
+        cols,
+        &input,
+        Some(&bias),
+        num_tokens,
+        &mut batched,
+    );
+
+    for t in 0..num_tokens {
+        let x_t = &input[t * cols..(t + 1) * cols];
+        let mut gemv = vec![0.0f32; rows];
+        quantized_linear_vector(
+            &weight_bytes,
+            DType::Q8_0,
+            rows,
+            cols,
+            x_t,
+            Some(&bias),
+            &mut gemv,
+            2,
+        );
+        for r in 0..rows {
+            let got = batched[t * rows + r];
+            let diff = (got - gemv[r]).abs();
+            assert!(
+                diff < 1e-4,
+                "token {} row {}: batched {} vs gemv {}",
+                t,
+                r,
+                got,
+                gemv[r]
+            );
+        }
+    }
+}

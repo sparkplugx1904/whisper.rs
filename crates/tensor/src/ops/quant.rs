@@ -144,17 +144,10 @@ pub fn quantized_linear_vector(
                 let r_abs = r_start + r_rel;
                 let row_bytes = &weight_bytes[r_abs * bytes_per_row..(r_abs + 1) * bytes_per_row];
 
-                let dot = match dtype {
-                    DType::Q8_0 => vec_dot_q8_0_f32(row_bytes, x),
-                    DType::Q4_0 => vec_dot_q4_0_f32(row_bytes, x),
-                    DType::Q4_1 => vec_dot_q4_1_f32(row_bytes, x),
-                    DType::Q5_0 => vec_dot_q5_0_f32(row_bytes, x),
-                    DType::Q5_1 => vec_dot_q5_1_f32(row_bytes, x),
-                    DType::Q4_K => vec_dot_q4_k_f32(row_bytes, x),
-                    DType::Q5_K => vec_dot_q5_k_f32(row_bytes, x),
-                    DType::Q6_K => vec_dot_q6_k_f32(row_bytes, x),
-                    _ => panic!("Unsupported quantized linear type {:?}", dtype),
-                };
+                // One dispatch table for every dtype, so the plain F32/F16 and
+                // Q8_1 byte layouts degrade to a dequantize-then-dot instead of
+                // panicking when they reach this path.
+                let dot = row_dot(dtype, row_bytes, x);
 
                 let val = if let Some(b) = bias {
                     dot + b[r_abs]
@@ -165,6 +158,177 @@ pub fn quantized_linear_vector(
                 *out_val = val;
             }
         });
+}
+
+/// Single-token quantized matrix-vector product using every available core.
+///
+/// Decoding emits one token at a time, so the weight matrix is streamed from
+/// memory once per step; spreading the row range over the available cores lets
+/// the memory controllers saturate instead of leaving the pipeline bound by one
+/// core's outstanding load queue. Kept as a thin wrapper so callers that only
+/// need the M=1 case cannot accidentally pass a mismatched `num_tokens`.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_gemv_parallel(
+    weight_bytes: &[u8],
+    dtype: DType,
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+    bias: Option<&[f32]>,
+    output: &mut [f32],
+) {
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16);
+    quantized_linear_vector(weight_bytes, dtype, rows, cols, x, bias, output, n_threads);
+}
+
+/// Quantized matrix-matrix product: `output[t * rows + r] = W[r] · x[t] + bias[r]`.
+///
+/// Prompt evaluation feeds several tokens through the same weight matrix. Doing
+/// that as N independent GEMVs re-reads every quantized row N times, which is
+/// the dominant cost because the kernels are memory-bandwidth bound, not
+/// compute bound. For `num_tokens > 1` this walks row chunks in parallel and
+/// evaluates every token against a row while its bytes are still in cache, so
+/// each quantized row is fetched once per step regardless of token count.
+///
+/// The F32, F16 and Q8_1 byte layouts are accepted here even though the loader
+/// normally dequantizes F32/F16 into `LinearWeight::F32`. Supporting them keeps
+/// a single code path for every GGML dtype, so `LinearWeight` never needs a
+/// second dispatch based on which dtype happened to survive loading.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_linear(
+    weight_bytes: &[u8],
+    dtype: DType,
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+    bias: Option<&[f32]>,
+    num_tokens: usize,
+    output: &mut [f32],
+) {
+    assert_eq!(x.len(), num_tokens * cols);
+    assert_eq!(output.len(), num_tokens * rows);
+    if let Some(b) = bias {
+        assert_eq!(b.len(), rows);
+    }
+
+    if num_tokens == 1 {
+        quantized_gemv_parallel(weight_bytes, dtype, rows, cols, x, bias, output);
+        return;
+    }
+
+    // Prompt evaluation of the encoder feeds ~1500 rows through each weight
+    // matrix. At that size the per-block dot kernels lose to a blocked GEMM:
+    // measured on tiny.en, a 1152x384 Q8_0 projection takes 141 ms with the
+    // quantized kernels and 19 ms after one 1.3 ms dequantization pass plus
+    // `sgemm`. The crossover sits well above the beam widths used during
+    // decoding, so only large batches take the dequantize path; single-token
+    // and beam steps keep streaming the compressed bytes.
+    const DEQUANT_GEMM_MIN_TOKENS: usize = 32;
+    if num_tokens >= DEQUANT_GEMM_MIN_TOKENS {
+        let dense = dtype
+            .dequantize_to_f32(weight_bytes, rows * cols)
+            .expect("validated weight bytes must dequantize");
+        crate::ops::matmul::linear(x, &dense, bias, cols, rows, num_tokens, output);
+        return;
+    }
+
+    let bytes_per_row = dtype.byte_size_for(cols);
+    assert_eq!(weight_bytes.len(), rows * bytes_per_row);
+
+    use rayon::prelude::*;
+
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16);
+    let chunk_rows = rows.div_ceil(n_threads).max(1);
+
+    // The public output is token-major, but a row's weights are reused across
+    // tokens. Accumulating row-major first keeps that reuse contiguous; the
+    // final transpose is a cheap linear copy next to the quantization math.
+    let mut row_major = vec![0.0f32; rows * num_tokens];
+    row_major
+        .par_chunks_mut(chunk_rows * num_tokens)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let r_start = chunk_idx * chunk_rows;
+            for (r_rel, row_out) in chunk.chunks_mut(num_tokens).enumerate() {
+                let r_abs = r_start + r_rel;
+                let row_bytes = &weight_bytes[r_abs * bytes_per_row..(r_abs + 1) * bytes_per_row];
+                let b = bias.map(|b| b[r_abs]);
+                for (t, out_val) in row_out.iter_mut().enumerate() {
+                    let x_t = &x[t * cols..(t + 1) * cols];
+                    let dot = row_dot(dtype, row_bytes, x_t);
+                    *out_val = if let Some(b) = b { dot + b } else { dot };
+                }
+            }
+        });
+
+    for (r, src) in row_major.chunks_exact(num_tokens).enumerate() {
+        for (t, &val) in src.iter().enumerate() {
+            output[t * rows + r] = val;
+        }
+    }
+}
+
+/// Dot product between one row of raw weight bytes and a float vector.
+///
+/// Dispatches to the hand-written quantized kernels for GGML block formats and
+/// falls back to a chunked dequantize-then-`dot_f32` for the plain types, which
+/// keeps the same numerics as the reference float path.
+fn row_dot(dtype: DType, row_bytes: &[u8], x: &[f32]) -> f32 {
+    match dtype {
+        DType::F32 => {
+            let mut sum = 0.0f32;
+            for (chunk_idx, x_chunk) in x.chunks(32).enumerate() {
+                let start = chunk_idx * 32;
+                let mut buf = [0.0f32; 32];
+                let bytes = &row_bytes[start * 4..(start + x_chunk.len()) * 4];
+                for (dst, src) in buf.iter_mut().zip(bytes.chunks_exact(4)) {
+                    *dst = f32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                }
+                sum += crate::simd::dot_f32(&buf[..x_chunk.len()], x_chunk);
+            }
+            sum
+        }
+        DType::F16 => {
+            let mut sum = 0.0f32;
+            for (chunk_idx, x_chunk) in x.chunks(32).enumerate() {
+                let start = chunk_idx * 32;
+                let mut buf = [0.0f32; 32];
+                let bytes = &row_bytes[start * 2..(start + x_chunk.len()) * 2];
+                for (dst, src) in buf.iter_mut().zip(bytes.chunks_exact(2)) {
+                    *dst = f16::from_bits(u16::from_le_bytes([src[0], src[1]])).to_f32();
+                }
+                sum += crate::simd::dot_f32(&buf[..x_chunk.len()], x_chunk);
+            }
+            sum
+        }
+        DType::Q8_1 => {
+            let mut sum = 0.0f32;
+            for (i, block) in row_bytes.chunks_exact(36).enumerate() {
+                let d = f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+                let x_block = &x[i * 32..(i + 1) * 32];
+                let mut buf = [0.0f32; 32];
+                for (j, dst) in buf.iter_mut().enumerate() {
+                    *dst = (block[4 + j] as i8 as f32) * d;
+                }
+                sum += crate::simd::dot_f32(&buf, x_block);
+            }
+            sum
+        }
+        DType::Q8_0 => vec_dot_q8_0_f32(row_bytes, x),
+        DType::Q4_0 => vec_dot_q4_0_f32(row_bytes, x),
+        DType::Q4_1 => vec_dot_q4_1_f32(row_bytes, x),
+        DType::Q5_0 => vec_dot_q5_0_f32(row_bytes, x),
+        DType::Q5_1 => vec_dot_q5_1_f32(row_bytes, x),
+        DType::Q4_K => vec_dot_q4_k_f32(row_bytes, x),
+        DType::Q5_K => vec_dot_q5_k_f32(row_bytes, x),
+        DType::Q6_K => vec_dot_q6_k_f32(row_bytes, x),
+    }
 }
 
 /// Direct dot product between Q4_K super-blocks (256 elements, 144 bytes each) and f32 slice.
