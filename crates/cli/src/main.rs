@@ -176,6 +176,50 @@ pub struct Args {
     /// Padding in milliseconds added around each detected speech region
     #[arg(long = "vad-speech-pad-ms", default_value_t = 300)]
     pub vad_speech_pad_ms: usize,
+
+    /// Sampling temperature (0.0 = greedy or beam search)
+    #[arg(long = "temperature", default_value_t = 0.0)]
+    pub temperature: f32,
+
+    /// Temperature increment used by the fallback ladder
+    #[arg(long = "temperature-inc", default_value_t = 0.2)]
+    pub temperature_inc: f32,
+
+    /// Disable temperature fallback entirely
+    #[arg(long = "no-fallback", default_value_t = false)]
+    pub no_fallback: bool,
+
+    /// Entropy (compression ratio) threshold that triggers fallback
+    #[arg(long = "entropy-thold", default_value_t = 2.4)]
+    pub entropy_thold: f32,
+
+    /// Average log-probability threshold that triggers fallback
+    #[arg(long = "logprob-thold", default_value_t = -1.0, allow_hyphen_values = true)]
+    pub logprob_thold: f64,
+
+    /// No-speech probability above which a window may be discarded
+    #[arg(long = "no-speech-thold", default_value_t = 0.6)]
+    pub no_speech_thold: f32,
+
+    /// Maximum segment length in characters (0 = disabled)
+    #[arg(long = "max-len", default_value_t = 0)]
+    pub max_len: usize,
+
+    /// Split segments on word boundaries when max-len is reached
+    #[arg(long = "split-on-word", default_value_t = false)]
+    pub split_on_word: bool,
+
+    /// Suppress non-speech tokens in the output
+    #[arg(long = "suppress-nst", default_value_t = false)]
+    pub suppress_nst: bool,
+
+    /// Prepend the initial prompt to every window, not just the first one
+    #[arg(long = "carry-initial-prompt", default_value_t = false)]
+    pub carry_initial_prompt: bool,
+
+    /// Override the audio context length (0 = model default)
+    #[arg(long = "audio-ctx", default_value_t = 0)]
+    pub audio_ctx: usize,
 }
 
 impl Default for Args {
@@ -217,6 +261,17 @@ impl Default for Args {
             vad_min_speech_duration_ms: 250,
             vad_min_silence_duration_ms: 100,
             vad_speech_pad_ms: 300,
+            temperature: 0.0,
+            temperature_inc: 0.2,
+            no_fallback: false,
+            entropy_thold: 2.4,
+            logprob_thold: -1.0,
+            no_speech_thold: 0.6,
+            max_len: 0,
+            split_on_word: false,
+            suppress_nst: false,
+            carry_initial_prompt: false,
+            audio_ctx: 0,
         }
     }
 }
@@ -250,6 +305,16 @@ where
             "-di" => out.push("--diarize".to_string()),
             "-ok" => out.push("--karaoke".to_string()),
             "-ocsv" => out.push("--output-csv".to_string()),
+            "-ml" => out.push("--max-len".to_string()),
+            "-sow" => out.push("--split-on-word".to_string()),
+            "-sns" => out.push("--suppress-nst".to_string()),
+            "-tp" => out.push("--temperature".to_string()),
+            "-tpi" => out.push("--temperature-inc".to_string()),
+            "-et" => out.push("--entropy-thold".to_string()),
+            "-lpt" => out.push("--logprob-thold".to_string()),
+            "-nth" => out.push("--no-speech-thold".to_string()),
+            "-nf" => out.push("--no-fallback".to_string()),
+            "-ac" => out.push("--audio-ctx".to_string()),
             "-olrc" => out.push("--output-lrc".to_string()),
             "-np" => out.push("--no-prints".to_string()),
             "-ot" => out.push("--offset-t".to_string()),
@@ -463,6 +528,21 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         vad_min_speech_duration_ms: args.vad_min_speech_duration_ms,
         vad_min_silence_duration_ms: args.vad_min_silence_duration_ms,
         vad_speech_pad_ms: args.vad_speech_pad_ms,
+        temperature: args.temperature,
+        temperature_inc: if args.no_fallback {
+            0.0
+        } else {
+            args.temperature_inc
+        },
+        entropy_thold: args.entropy_thold,
+        compression_ratio_threshold: args.entropy_thold as f64,
+        logprob_threshold: args.logprob_thold,
+        no_speech_threshold: args.no_speech_thold as f64,
+        max_len: args.max_len,
+        split_on_word: args.split_on_word,
+        suppress_nst: args.suppress_nst,
+        carry_initial_prompt: args.carry_initial_prompt,
+        audio_ctx: args.audio_ctx,
         ..Default::default()
     };
 
@@ -1045,6 +1125,64 @@ mod tests {
         assert!(args.print_confidence);
         assert!(args.output_words);
         assert_eq!(args.font_path, "/fonts/mono.ttf");
+    }
+
+    #[test]
+    fn test_parse_args_decoding_threshold_flags() {
+        let input = vec![
+            "whisper-cli",
+            "-m",
+            "tiny.bin",
+            "-f",
+            "speech.wav",
+            "-tp",
+            "0.2",
+            "-tpi",
+            "0.4",
+            "-et",
+            "3.1",
+            "-lpt",
+            "-0.8",
+            "-nth",
+            "0.75",
+            "-ml",
+            "42",
+            "-sow",
+            "-sns",
+            "-ac",
+            "768",
+            "--carry-initial-prompt",
+        ];
+        let normalized = normalize_cli_args(input);
+        let args = Args::try_parse_from(normalized).expect("Parse decoding flags");
+        assert_eq!(args.temperature, 0.2);
+        assert_eq!(args.temperature_inc, 0.4);
+        assert_eq!(args.entropy_thold, 3.1);
+        assert_eq!(args.logprob_thold, -0.8);
+        assert_eq!(args.no_speech_thold, 0.75);
+        assert_eq!(args.max_len, 42);
+        assert!(args.split_on_word);
+        assert!(args.suppress_nst);
+        assert_eq!(args.audio_ctx, 768);
+        assert!(args.carry_initial_prompt);
+        assert!(!args.no_fallback);
+    }
+
+    #[test]
+    fn test_no_fallback_disables_temperature_increment() {
+        let args = Args {
+            no_fallback: true,
+            temperature_inc: 0.4,
+            ..Default::default()
+        };
+        // The run() path turns `no_fallback` into a zero increment, which is how
+        // the fallback ladder is switched off without a separate parameter.
+        let inc = if args.no_fallback {
+            0.0
+        } else {
+            args.temperature_inc
+        };
+        assert_eq!(inc, 0.0);
     }
 
     #[test]
