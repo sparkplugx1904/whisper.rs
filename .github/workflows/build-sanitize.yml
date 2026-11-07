@@ -34,6 +34,10 @@ jobs:
 
       - name: Run Miri on Tensor Operations
         env:
-          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-disable-isolation"
+          # Rayon keeps its global worker threads alive past the end of `main`,
+          # which Miri reports as "main thread terminated without waiting for
+          # all remaining threads". The threads are process-lifetime by design,
+          # so the exit-time check is disabled while borrow tracking still runs.
+          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-disable-isolation -Zmiri-ignore-leaks"
           RAYON_NUM_THREADS: "1"
         run: cargo miri test -p whisper-tensor --lib
