@@ -230,7 +230,22 @@ cargo run --release -p whisper-cli -- \
   -m models/ggml-tiny.en.bin \
   -f samples/a13.wav \
   --vad --vad-threshold 0.5 --vad-speech-pad-ms 300
+
+# Report the spoken language and exit without transcribing
+cargo run --release -p whisper-cli -- \
+  -m models/ggml-tiny.bin \
+  -f samples/jfk.wav \
+  --detect-language
+
+# Tune decoding: no fallback ladder, split long lines, drop non-speech tokens
+cargo run --release -p whisper-cli -- \
+  -m models/ggml-tiny.en.bin \
+  -f samples/a13.wav \
+  --no-fallback --max-len 60 --split-on-word --suppress-nst
 ```
+
+Exported CSV files carry `avg_logprob` and `no_speech_prob` per line, so a
+reviewer can see which segments the decoder was unsure about.
 
 ---
 
