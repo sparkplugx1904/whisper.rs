@@ -220,6 +220,10 @@ pub struct Args {
     /// Override the audio context length (0 = model default)
     #[arg(long = "audio-ctx", default_value_t = 0)]
     pub audio_ctx: usize,
+
+    /// Detect the spoken language of the input and exit
+    #[arg(long = "detect-language", default_value_t = false)]
+    pub detect_language: bool,
 }
 
 impl Default for Args {
@@ -272,6 +276,7 @@ impl Default for Args {
             suppress_nst: false,
             carry_initial_prompt: false,
             audio_ctx: 0,
+            detect_language: false,
         }
     }
 }
@@ -315,6 +320,7 @@ where
             "-nth" => out.push("--no-speech-thold".to_string()),
             "-nf" => out.push("--no-fallback".to_string()),
             "-ac" => out.push("--audio-ctx".to_string()),
+            "-dl" => out.push("--detect-language".to_string()),
             "-olrc" => out.push("--output-lrc".to_string()),
             "-np" => out.push("--no-prints".to_string()),
             "-ot" => out.push("--offset-t".to_string()),
@@ -505,6 +511,21 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = WhisperContext::new(model)
         .map_err(|e| format!("failed to initialize whisper context: {}", e))?;
     let load_dur = t0.elapsed();
+
+    // Language detection is a terminal mode: it answers "what language is
+    // this?" and exits, instead of spending a full transcription to find out.
+    // Detection previously only ran as a side effect of `--language auto`
+    // (ggml-org/whisper.cpp#1104, #1242).
+    if args.detect_language {
+        let mel = whisper_rs::audio::compute_log_mel_spectrogram(
+            &audio.samples,
+            &ctx.model.filters.data,
+            ctx.model.filters.n_mel,
+        );
+        let (lang, prob) = ctx.detect_language(&mel);
+        println!("auto-detected language: {} (p = {:.6})", lang, prob);
+        return Ok(());
+    }
 
     if args.output_words {
         args.word_timestamps = true;
@@ -1152,9 +1173,11 @@ mod tests {
             "-ac",
             "768",
             "--carry-initial-prompt",
+            "-dl",
         ];
         let normalized = normalize_cli_args(input);
         let args = Args::try_parse_from(normalized).expect("Parse decoding flags");
+        assert!(args.detect_language);
         assert_eq!(args.temperature, 0.2);
         assert_eq!(args.temperature_inc, 0.4);
         assert_eq!(args.entropy_thold, 3.1);
