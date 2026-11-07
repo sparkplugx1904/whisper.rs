@@ -1,27 +1,29 @@
 use whisper_model::{ModelError, WhisperModel};
 use whisper_tensor::ops::{
     add_inplace, conv1d_c_first, conv1d_t_first, flash_attention_2, gelu_inplace, layer_norm,
-    linear,
 };
+use whisper_tensor::LinearWeight;
 
+/// Linear weights of one encoder block.
+///
+/// The projections are [`LinearWeight`] values so a quantized checkpoint is
+/// never expanded to `f32` at load time: the encoder's GEMMs read the compact
+/// block layout directly. Query, key and value are fused into
+/// `attn_qkv_w`/`attn_qkv_b` at load time instead of being stored separately,
+/// so the attention weights are not duplicated in memory.
 #[derive(Clone)]
 pub struct EncoderBlockWeights {
     pub attn_ln_w: Vec<f32>,
     pub attn_ln_b: Vec<f32>,
-    pub attn_q_w: Vec<f32>,
-    pub attn_q_b: Vec<f32>,
-    pub attn_k_w: Vec<f32>,
-    pub attn_v_w: Vec<f32>,
-    pub attn_v_b: Vec<f32>,
-    pub attn_qkv_w: Vec<f32>,
+    pub attn_qkv_w: LinearWeight,
     pub attn_qkv_b: Vec<f32>,
-    pub attn_out_w: Vec<f32>,
+    pub attn_out_w: LinearWeight,
     pub attn_out_b: Vec<f32>,
     pub mlp_ln_w: Vec<f32>,
     pub mlp_ln_b: Vec<f32>,
-    pub mlp0_w: Vec<f32>,
+    pub mlp0_w: LinearWeight,
     pub mlp0_b: Vec<f32>,
-    pub mlp2_w: Vec<f32>,
+    pub mlp2_w: LinearWeight,
     pub mlp2_b: Vec<f32>,
 }
 
@@ -50,17 +52,34 @@ impl EncoderWeights {
 
         for l in 0..n_layers {
             let prefix = format!("encoder.blocks.{}", l);
-            let attn_q_w = model.get_tensor_f32(&format!("{}.attn.query.weight", prefix))?;
+            let mut attn_q_w = model.get_linear_weight(&format!("{}.attn.query.weight", prefix))?;
             let attn_q_b = model.get_tensor_f32(&format!("{}.attn.query.bias", prefix))?;
-            let attn_k_w = model.get_tensor_f32(&format!("{}.attn.key.weight", prefix))?;
-            let attn_v_w = model.get_tensor_f32(&format!("{}.attn.value.weight", prefix))?;
+            let mut attn_k_w = model.get_linear_weight(&format!("{}.attn.key.weight", prefix))?;
+            let mut attn_v_w = model.get_linear_weight(&format!("{}.attn.value.weight", prefix))?;
             let attn_v_b = model.get_tensor_f32(&format!("{}.attn.value.bias", prefix))?;
 
             let d_model = model.hparams.n_audio_state as usize;
-            let mut attn_qkv_w = Vec::with_capacity(3 * d_model * d_model);
-            attn_qkv_w.extend_from_slice(&attn_q_w);
-            attn_qkv_w.extend_from_slice(&attn_k_w);
-            attn_qkv_w.extend_from_slice(&attn_v_w);
+            // Fusing Q/K/V keeps the single-GEMM fast path: one activation
+            // read feeds all three projections. `concat_rows` stacks whole
+            // rows, so quantized blocks stay byte-valid in the fused layout.
+            //
+            // A checkpoint that mixed quantized and floating attention tensors
+            // cannot be concatenated, so those rows are widened to f32 first.
+            // Only the offending projections pay the expansion cost.
+            if attn_q_w.dtype() != attn_k_w.dtype() || attn_k_w.dtype() != attn_v_w.dtype() {
+                let widen = |w: LinearWeight| match w {
+                    LinearWeight::F32 { .. } => w,
+                    other => {
+                        let cols = other.cols();
+                        let rows = other.rows();
+                        LinearWeight::from_f32(rows, cols, other.to_f32())
+                    }
+                };
+                attn_q_w = widen(attn_q_w);
+                attn_k_w = widen(attn_k_w);
+                attn_v_w = widen(attn_v_w);
+            }
+            let attn_qkv_w = LinearWeight::concat_rows(&[&attn_q_w, &attn_k_w, &attn_v_w]);
 
             let mut attn_qkv_b = Vec::with_capacity(3 * d_model);
             attn_qkv_b.extend_from_slice(&attn_q_b);
@@ -70,20 +89,15 @@ impl EncoderWeights {
             let block = EncoderBlockWeights {
                 attn_ln_w: model.get_tensor_f32(&format!("{}.attn_ln.weight", prefix))?,
                 attn_ln_b: model.get_tensor_f32(&format!("{}.attn_ln.bias", prefix))?,
-                attn_q_w,
-                attn_q_b,
-                attn_k_w,
-                attn_v_w,
-                attn_v_b,
                 attn_qkv_w,
                 attn_qkv_b,
-                attn_out_w: model.get_tensor_f32(&format!("{}.attn.out.weight", prefix))?,
+                attn_out_w: model.get_linear_weight(&format!("{}.attn.out.weight", prefix))?,
                 attn_out_b: model.get_tensor_f32(&format!("{}.attn.out.bias", prefix))?,
                 mlp_ln_w: model.get_tensor_f32(&format!("{}.mlp_ln.weight", prefix))?,
                 mlp_ln_b: model.get_tensor_f32(&format!("{}.mlp_ln.bias", prefix))?,
-                mlp0_w: model.get_tensor_f32(&format!("{}.mlp.0.weight", prefix))?,
+                mlp0_w: model.get_linear_weight(&format!("{}.mlp.0.weight", prefix))?,
                 mlp0_b: model.get_tensor_f32(&format!("{}.mlp.0.bias", prefix))?,
-                mlp2_w: model.get_tensor_f32(&format!("{}.mlp.2.weight", prefix))?,
+                mlp2_w: model.get_linear_weight(&format!("{}.mlp.2.weight", prefix))?,
                 mlp2_b: model.get_tensor_f32(&format!("{}.mlp.2.bias", prefix))?,
             };
             blocks.push(block);
@@ -258,15 +272,9 @@ impl WhisperEncoder {
                 self.d_model,
                 &mut norm_buf,
             );
-            linear(
-                &norm_buf,
-                &block.attn_qkv_w,
-                Some(&block.attn_qkv_b),
-                self.d_model,
-                3 * self.d_model,
-                l_out,
-                &mut qkv_buf,
-            );
+            block
+                .attn_qkv_w
+                .linear(&norm_buf, Some(&block.attn_qkv_b), l_out, &mut qkv_buf);
 
             let d_m = self.d_model;
             let chunk_qkv = 3 * d_m;
@@ -290,15 +298,9 @@ impl WhisperEncoder {
                 &mut attn_out,
             );
 
-            linear(
-                &attn_out,
-                &block.attn_out_w,
-                Some(&block.attn_out_b),
-                self.d_model,
-                self.d_model,
-                l_out,
-                &mut proj_out,
-            );
+            block
+                .attn_out_w
+                .linear(&attn_out, Some(&block.attn_out_b), l_out, &mut proj_out);
             add_inplace(&mut x, &proj_out);
 
             // (e) Pre-LN for MLP
@@ -311,26 +313,14 @@ impl WhisperEncoder {
                 self.d_model,
                 &mut norm_buf,
             );
-            linear(
-                &norm_buf,
-                &block.mlp0_w,
-                Some(&block.mlp0_b),
-                self.d_model,
-                d_mlp,
-                l_out,
-                &mut mlp0_out,
-            );
+            block
+                .mlp0_w
+                .linear(&norm_buf, Some(&block.mlp0_b), l_out, &mut mlp0_out);
             gelu_inplace(&mut mlp0_out);
 
-            linear(
-                &mlp0_out,
-                &block.mlp2_w,
-                Some(&block.mlp2_b),
-                d_mlp,
-                self.d_model,
-                l_out,
-                &mut proj_out,
-            );
+            block
+                .mlp2_w
+                .linear(&mlp0_out, Some(&block.mlp2_b), l_out, &mut proj_out);
             add_inplace(&mut x, &proj_out);
         }
 

@@ -47,12 +47,13 @@ A high-performance, **100% Pure Rust** rewrite of [whisper.cpp](https://github.c
 - **Strictly Zero C/C++ or Foreign Code**: Verified by automated architecture gate `./scripts/check_pure_rust.sh`. No `-sys` crates, no `cc`/`cmake`/`bindgen` in build scripts, no non-std FFI imports.
 - **Universal Audio Decoder**: Built-in support for WAV, MP3, FLAC, OGG, and AAC via pure Rust decoders with automatic resampling to 16 kHz mono.
 - **High Numerical Fidelity**: Validated against reference implementations (encoder cosine similarity $> 0.9999$, mel spectrogram max error $< 5 \times 10^{-5}$).
-- **Direct Quantization Kernels**: Native execution of legacy GGML quantization (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0) and modern K-quants (Q4_K, Q5_K, Q6_K) without full dequantization into RAM.
+- **Direct Quantization Kernels**: Legacy GGML quantization (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0) and modern K-quants (Q4_K, Q5_K, Q6_K) stay compressed in RAM. Quantized checkpoints load at their on-disk size instead of being expanded to `f32`, and single-token decoding streams the compact block layout through SIMD dot products.
 - **Flash Attention 2**: Tiled online softmax attention reducing peak memory and accelerating long-context encoder/decoder passes.
 - **Dynamic Time Warping (DTW) Alignment**: Precise word-level timestamps using pre-calibrated alignment head presets across all model sizes (Tiny through Large-v3-Turbo).
 - **Karaoke & Subtitle Splitting**: SubRip (.srt), WebVTT (.vtt), JSON, and Karaoke WebVTT format with per-word `<HH:MM:SS.mmm>` timing tags and length-constrained subtitle splitting.
 - **Tinydiarize Speaker Turn Detection**: Automatic detection and formatting of `[SPEAKER_TURN]` tokens for conversational audio.
 - **Constrained GBNF Grammar Decoding**: Enforce JSON schema or custom context-free grammar constraints during token generation.
+- **Voice Activity Detection**: Energy-based VAD runs on the raw samples and skips 30-second windows that contain no speech, with speech padding and absolute frame indices so timestamps stay aligned.
 - **Extensible Ecosystem**: C-ABI dynamic/static library (`whisper-ffi`), GBNF grammar parser (`whisper-grammar`), Voice Activity Detection (`whisper-vad`), OpenAI REST server, and streaming runtime.
 
 ---
@@ -82,6 +83,7 @@ The workspace is organized into modular, decoupled crates designed for high thro
 - **Separation of Concerns**: Audio preprocessing (`whisper-audio`), tensor math & SIMD dot products (`whisper-tensor`), model/vocabulary parsing (`whisper-model`, `whisper-tokenizer`), and inference runtime (`whisper-rs`) operate independently.
 - **Extensible Pipeline**: Output formatting implements the `OutputFormatter` trait, and decoding logit filters implement the `LogitFilter` pipeline, allowing new export formats and sampling constraints without touching core execution loops.
 - **Strict Memory Safety**: `#![forbid(unsafe_code)]` is enforced across frontend, tokenizer, and runtime crates. Unsafe code is strictly quarantined to performance-critical SIMD vector math with runtime CPU feature detection.
+- **Reused Decoder Buffers**: `DecoderWorkspace` owns every activation buffer and the vocabulary-sized logits row, so a decode step resizes instead of allocating. Beam search addresses the KV cache through a slot arena, which turns a branch fork into one slot copy instead of a deep clone of every layer, and evaluates all live branches in a single batched pass so the projections run as one GEMM.
 ```
                                   +-----------------------+
                                   | Audio File / In-Memory|
@@ -222,6 +224,12 @@ cargo run --release -p whisper-cli -- \
   -m models/ggml-base.bin \
   -f samples/multilingual.wav \
   -l auto --translate
+
+# Skip silent 30-second windows with voice activity detection
+cargo run --release -p whisper-cli -- \
+  -m models/ggml-tiny.en.bin \
+  -f samples/a13.wav \
+  --vad --vad-threshold 0.5 --vad-speech-pad-ms 300
 ```
 
 ---

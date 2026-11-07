@@ -76,6 +76,19 @@ pub struct WhisperParams {
     pub suppress_regex: Option<String>,
     /// Override audio context length (default: 0 = 1500)
     pub audio_ctx: usize,
+    /// Enable Voice Activity Detection (VAD) silence skipping (default: false)
+    ///
+    /// VAD runs on the raw samples; windows without speech are never encoded or
+    /// decoded, and timestamps keep their absolute position in the audio.
+    pub vad_enable: bool,
+    /// VAD sensitivity threshold (default: 0.5)
+    pub vad_threshold: f32,
+    /// Minimum speech duration in milliseconds to qualify as a speech segment (default: 250)
+    pub vad_min_speech_duration_ms: usize,
+    /// Minimum silence duration in milliseconds to split utterances (default: 100)
+    pub vad_min_silence_duration_ms: usize,
+    /// Speech padding margin in milliseconds applied before and after detected speech (default: 300)
+    pub vad_speech_pad_ms: usize,
 }
 impl std::fmt::Debug for WhisperParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -93,6 +106,17 @@ impl std::fmt::Debug for WhisperParams {
             .field("single_segment", &self.single_segment)
             .field("suppress_regex", &self.suppress_regex)
             .field("audio_ctx", &self.audio_ctx)
+            .field("vad_enable", &self.vad_enable)
+            .field("vad_threshold", &self.vad_threshold)
+            .field(
+                "vad_min_speech_duration_ms",
+                &self.vad_min_speech_duration_ms,
+            )
+            .field(
+                "vad_min_silence_duration_ms",
+                &self.vad_min_silence_duration_ms,
+            )
+            .field("vad_speech_pad_ms", &self.vad_speech_pad_ms)
             .finish()
     }
 }
@@ -135,6 +159,11 @@ impl Default for WhisperParams {
             single_segment: false,
             suppress_regex: None,
             audio_ctx: 0,
+            vad_enable: false,
+            vad_threshold: 0.5,
+            vad_min_speech_duration_ms: 250,
+            vad_min_silence_duration_ms: 100,
+            vad_speech_pad_ms: 300,
         }
     }
 }
@@ -301,7 +330,87 @@ impl FullParamsBuilder {
         self.params.audio_ctx = audio_ctx;
         self
     }
+    /// Enable Voice Activity Detection (VAD) silence skipping (default: false).
+    pub fn vad_enable(mut self, vad_enable: bool) -> Self {
+        self.params.vad_enable = vad_enable;
+        self
+    }
+    /// Set VAD sensitivity threshold (default: 0.5).
+    pub fn vad_threshold(mut self, vad_threshold: f32) -> Self {
+        self.params.vad_threshold = vad_threshold;
+        self
+    }
+    /// Set minimum speech duration in milliseconds to qualify as a speech segment (default: 250).
+    pub fn vad_min_speech_duration_ms(mut self, ms: usize) -> Self {
+        self.params.vad_min_speech_duration_ms = ms;
+        self
+    }
+    /// Set minimum silence duration in milliseconds to split utterances (default: 100).
+    pub fn vad_min_silence_duration_ms(mut self, ms: usize) -> Self {
+        self.params.vad_min_silence_duration_ms = ms;
+        self
+    }
+    /// Set speech padding margin in milliseconds applied before and after detected speech (default: 300).
+    pub fn vad_speech_pad_ms(mut self, ms: usize) -> Self {
+        self.params.vad_speech_pad_ms = ms;
+        self
+    }
     pub fn build(self) -> WhisperParams {
         self.params
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vad_params_defaults() {
+        let params = WhisperParams::default();
+        assert!(!params.vad_enable, "vad_enable should be false by default");
+        assert_eq!(
+            params.vad_threshold, 0.5,
+            "default vad_threshold should be 0.5"
+        );
+        assert_eq!(
+            params.vad_min_speech_duration_ms, 250,
+            "default vad_min_speech_duration_ms should be 250"
+        );
+        assert_eq!(
+            params.vad_min_silence_duration_ms, 100,
+            "default vad_min_silence_duration_ms should be 100"
+        );
+        assert_eq!(
+            params.vad_speech_pad_ms, 300,
+            "default vad_speech_pad_ms should be 300"
+        );
+    }
+
+    #[test]
+    fn test_vad_params_builder() {
+        let params = FullParamsBuilder::new(SamplingStrategy::Greedy { best_of: 1 })
+            .vad_enable(true)
+            .vad_threshold(0.65)
+            .vad_min_speech_duration_ms(300)
+            .vad_min_silence_duration_ms(150)
+            .vad_speech_pad_ms(400)
+            .build();
+
+        assert!(params.vad_enable);
+        assert_eq!(params.vad_threshold, 0.65);
+        assert_eq!(params.vad_min_speech_duration_ms, 300);
+        assert_eq!(params.vad_min_silence_duration_ms, 150);
+        assert_eq!(params.vad_speech_pad_ms, 400);
+    }
+
+    #[test]
+    fn test_vad_params_debug() {
+        let params = WhisperParams::default();
+        let debug_str = format!("{:?}", params);
+        assert!(debug_str.contains("vad_enable: false"));
+        assert!(debug_str.contains("vad_threshold: 0.5"));
+        assert!(debug_str.contains("vad_min_speech_duration_ms: 250"));
+        assert!(debug_str.contains("vad_min_silence_duration_ms: 100"));
+        assert!(debug_str.contains("vad_speech_pad_ms: 300"));
     }
 }

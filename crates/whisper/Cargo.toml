@@ -10,9 +10,9 @@ whisper-audio = { path = "../audio" }
 whisper-model = { path = "../model" }
 whisper-tokenizer = { path = "../tokenizer" }
 whisper-grammar = { path = "../grammar" }
+whisper-vad = { path = "../vad" }
 thiserror = { workspace = true }
 regex = "1.10"
 
 [dev-dependencies]
 byteorder = { workspace = true }
-whisper-vad = { path = "../vad" }

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Instant;
 use whisper_rs::audio::compute_log_mel_spectrogram;
 use whisper_rs::model::WhisperModel;
-use whisper_rs::{DecoderKvCache, WhisperDecoder, WhisperEncoder};
+use whisper_rs::{DecoderKvCache, DecoderWorkspace, WhisperDecoder, WhisperEncoder};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -86,14 +86,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Decoder Benchmark (per token)
     println!("\n[3/4] Benchmarking Decoder Latency (per-token generation)...");
     let enc_output = vec![0.0f32; n_audio_ctx * model.hparams.n_audio_state as usize];
-    let mut cache = DecoderKvCache::new(decoder.n_layers);
+    let mut cache = DecoderKvCache::new(decoder.n_layers, 1, decoder.d_model);
+    let mut workspace = DecoderWorkspace::new();
     decoder.precompute_cross_attn(&enc_output, &mut cache);
 
     let n_tokens_bench = 16;
     let mut dec_times = Vec::new();
     for i in 0..n_tokens_bench {
         let t = Instant::now();
-        let _ = decoder.decode(&[model.vocab.token_sot + i], &enc_output, &mut cache);
+        let _ = decoder.decode(
+            &[model.vocab.token_sot + i],
+            &enc_output,
+            &mut cache,
+            &mut workspace,
+        );
         dec_times.push(t.elapsed().as_secs_f64() * 1000.0);
     }
     let avg_dec_ms = dec_times.iter().sum::<f64>() / (dec_times.len() as f64);

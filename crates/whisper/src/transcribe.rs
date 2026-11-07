@@ -1,5 +1,5 @@
 use crate::beam::BeamSearch;
-use crate::decoder::{DecoderKvCache, WhisperDecoder};
+use crate::decoder::{DecoderKvCache, DecoderWorkspace, WhisperDecoder};
 use crate::encoder::WhisperEncoder;
 use crate::filter::{
     compression_ratio, GrammarLogitFilter, LogitFilterContext, LogitFilterPipeline, RegexFilter,
@@ -7,6 +7,7 @@ use crate::filter::{
 };
 use crate::params::WhisperParams;
 use crate::segment::Segment;
+use crate::speech_map::SpeechMap;
 use crate::state::WhisperState;
 use std::path::Path;
 use whisper_audio::mel::MelSpectrogram;
@@ -45,7 +46,7 @@ impl WhisperContext {
 
     /// Create a new reusable working state for inference.
     pub fn create_state(&self) -> WhisperState {
-        WhisperState::new(self.decoder.n_layers)
+        WhisperState::new(self.decoder.n_layers, self.decoder.d_model)
     }
 
     /// Full end-to-end transcription pipeline matching whisper.cpp: whisper_full()
@@ -59,13 +60,25 @@ impl WhisperContext {
         if samples.len() < 1600 {
             return Ok(());
         }
+
+        // Voice activity detection runs on the raw samples before the mel
+        // spectrogram is built. Silent windows then cost nothing to process,
+        // and audio that contains no speech at all returns immediately instead
+        // of letting the decoder hallucinate text over silence.
+        let speech_map = SpeechMap::from_samples(samples, params);
+        if let Some(map) = &speech_map {
+            if map.is_empty() {
+                return Ok(());
+            }
+        }
+
         let mel = whisper_audio::compute_log_mel_spectrogram(
             samples,
             &self.model.filters.data,
             self.model.filters.n_mel,
         );
 
-        state.segments = self.transcribe_internal(&mel, params, state);
+        state.segments = self.transcribe_internal(&mel, params, state, speech_map.as_ref());
         Ok(())
     }
 
@@ -113,9 +126,13 @@ impl WhisperContext {
         let mel_chunk = mel.get_chunk(0, self.model.hparams.n_audio_ctx as usize);
         let enc_out = self.encoder.forward(&mel_chunk);
 
-        let mut cache = DecoderKvCache::new(self.decoder.n_layers);
+        let mut cache = DecoderKvCache::new(self.decoder.n_layers, 1, self.decoder.d_model);
+        let mut workspace = DecoderWorkspace::new();
         let prompt = [self.tokenizer.sot()];
-        let logits = self.decoder.decode(&prompt, &enc_out, &mut cache);
+        let logits = self
+            .decoder
+            .decode(&prompt, &enc_out, &mut cache, &mut workspace);
+        let logits = &*logits;
 
         let num_langs = self.model.hparams.num_languages();
         let sot = self.tokenizer.sot();
@@ -166,9 +183,13 @@ impl WhisperContext {
             return ("en".to_string(), 1.0);
         }
 
-        let mut cache = DecoderKvCache::new(self.decoder.n_layers);
+        let mut cache = DecoderKvCache::new(self.decoder.n_layers, 1, self.decoder.d_model);
+        let mut workspace = DecoderWorkspace::new();
         let prompt = [self.tokenizer.sot()];
-        let logits = self.decoder.decode(&prompt, enc_out, &mut cache);
+        let logits = self
+            .decoder
+            .decode(&prompt, enc_out, &mut cache, &mut workspace);
+        let logits = &*logits;
 
         let num_langs = self.model.hparams.num_languages();
         let sot = self.tokenizer.sot();
@@ -215,7 +236,7 @@ impl WhisperContext {
     /// Transcribe whole audio mel spectrogram into text segments.
     pub fn transcribe(&self, mel: &MelSpectrogram, params: &WhisperParams) -> Vec<Segment> {
         let mut state = self.create_state();
-        self.transcribe_internal(mel, params, &mut state)
+        self.transcribe_internal(mel, params, &mut state, None)
     }
 
     fn transcribe_internal(
@@ -223,6 +244,7 @@ impl WhisperContext {
         mel: &MelSpectrogram,
         params: &WhisperParams,
         state: &mut WhisperState,
+        speech_map: Option<&SpeechMap>,
     ) -> Vec<Segment> {
         let is_multilingual = self.model.hparams.is_multilingual();
         let n_audio_ctx =
@@ -232,16 +254,29 @@ impl WhisperContext {
                 self.model.hparams.n_audio_ctx as usize
             };
 
-        // Precompute chunk 0 encoder output so we never compute it twice
-        let mel_chunk_0 = mel.get_chunk(0, n_audio_ctx);
-        let enc_out_0 = self.encoder.forward_with_ctx(&mel_chunk_0, n_audio_ctx);
-
         if params.abort_callback.as_ref().is_some_and(|cb| cb()) {
             return Vec::new();
         }
 
+        // The first window is encoded at most once and shared between language
+        // detection and the transcription loop. It is left lazy because VAD may
+        // skip that window entirely when the audio opens with silence, and an
+        // English-only model never needs it for language detection.
+        let needs_first_encode_for_language = is_multilingual && params.language == "auto";
+        let mut enc_out_0: Option<Vec<f32>> = if needs_first_encode_for_language {
+            let mel_chunk_0 = mel.get_chunk(0, n_audio_ctx);
+            Some(self.encoder.forward_with_ctx(&mel_chunk_0, n_audio_ctx))
+        } else {
+            None
+        };
+
         let lang = if params.language == "auto" {
-            let (detected, prob) = self.detect_language_with_enc(&enc_out_0);
+            let (detected, prob) = if let Some(enc) = enc_out_0.as_deref() {
+                self.detect_language_with_enc(enc)
+            } else {
+                // English-only models have nothing to detect.
+                ("en".to_string(), 1.0)
+            };
             state.lang_prob = prob;
             detected
         } else {
@@ -316,9 +351,30 @@ impl WhisperContext {
             if seek_frame + 10 >= seek_end {
                 break;
             }
+            // Jump over windows that contain no speech. Skipping the window is
+            // free: neither the encoder nor the decoder runs, and because mel
+            // frame indices stay absolute the emitted timestamps remain aligned
+            // with the original audio.
+            if let Some(map) = speech_map {
+                if !map.overlaps(seek_frame, seek_frame + chunk_frames) {
+                    match map.next_speech_start(seek_frame + chunk_frames) {
+                        Some(next) => {
+                            seek_frame = next;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+            }
             let seek_time = seek_frame as f64 * 0.01;
             let enc_out = if seek_frame == 0 {
-                enc_out_0.clone()
+                // Encode window 0 on first use, then reuse it if the loop
+                // returns here; a VAD-skipped opening window never pays for it.
+                if enc_out_0.is_none() {
+                    let mel_chunk = mel.get_chunk(0, n_audio_ctx);
+                    enc_out_0 = Some(self.encoder.forward_with_ctx(&mel_chunk, n_audio_ctx));
+                }
+                enc_out_0.clone().expect("window 0 encoded above")
             } else {
                 let mel_chunk = mel.get_chunk(seek_frame, n_audio_ctx);
                 self.encoder.forward_with_ctx(&mel_chunk, n_audio_ctx)
@@ -352,15 +408,26 @@ impl WhisperContext {
                 tokens_cur.clear();
                 token_logprobs.clear();
                 token_entropies.clear();
-                let mut cache = DecoderKvCache::new(self.decoder.n_layers);
+                // Beam search keeps one KV arena slot per branch, so branching
+                // never deep-copies an entire cache; greedy decoding needs one.
+                let n_slots = if params.beam_size > 1 {
+                    params.beam_size
+                } else {
+                    1
+                };
+                let mut cache =
+                    DecoderKvCache::new(self.decoder.n_layers, n_slots, self.decoder.d_model);
 
                 if params.beam_size > 1 && temperature == 0.0 {
                     // BEAM SEARCH
-                    let mut logits = self.decoder.decode(&window_prompt, &enc_out, &mut cache);
-                    let mut beam = BeamSearch::new(params.beam_size, cache);
-
-                    // Seed beam candidates with top branches from initial prompt
                     let n_vocab = self.decoder.n_vocab;
+                    let mut beam = BeamSearch::new(params.beam_size, &mut cache);
+                    let logits = self.decoder.decode(
+                        &window_prompt,
+                        &enc_out,
+                        &mut cache,
+                        &mut state.workspace,
+                    );
                     let start_idx = logits.len() - n_vocab;
                     let step_logits = &mut logits[start_idx..];
 
@@ -404,12 +471,21 @@ impl WhisperContext {
 
                     beam.candidates = seed_tokens
                         .into_iter()
-                        .map(|(tok, l)| crate::beam::BeamCandidate {
-                            tokens: vec![tok],
-                            cumulative_logprob: l as f64,
-                            cache: beam.candidates[0].cache.clone(),
-                            completed: tok == eot,
-                            last_timestamp: if tok >= beg { Some(tok) } else { None },
+                        .enumerate()
+                        .map(|(slot, (tok, l))| {
+                            // Slot 0 already holds the prompt KV; the remaining
+                            // seed branches fork from it instead of replaying the
+                            // prompt through the decoder.
+                            if slot > 0 {
+                                cache.copy_slot(slot, 0);
+                            }
+                            crate::beam::BeamCandidate {
+                                tokens: vec![tok],
+                                cumulative_logprob: l as f64,
+                                slot,
+                                completed: tok == eot,
+                                last_timestamp: if tok >= beg { Some(tok) } else { None },
+                            }
                         })
                         .collect();
 
@@ -434,6 +510,8 @@ impl WhisperContext {
                             } else {
                                 0.7
                             },
+                            &mut cache,
+                            &mut state.workspace,
                         );
                     }
 
@@ -442,7 +520,6 @@ impl WhisperContext {
                     }
                 } else {
                     // GREEDY DECODING
-                    let mut logits = self.decoder.decode(&window_prompt, &enc_out, &mut cache);
                     let mut last_timestamp_token: Option<i32> = None;
                     let max_steps = 224;
                     let n_vocab = self.decoder.n_vocab;
@@ -479,8 +556,28 @@ impl WhisperContext {
                         if params.abort_callback.as_ref().is_some_and(|cb| cb()) {
                             break;
                         }
-                        let start_idx = logits.len() - n_vocab;
-                        let step_logits = &mut logits[start_idx..];
+                        let start_idx;
+                        {
+                            // The prompt is decoded on the first step; later
+                            // steps append only the token chosen previously, so
+                            // the KV cache keeps the whole history.
+                            let step_input: &[i32] = if step == 0 {
+                                &window_prompt
+                            } else {
+                                &tokens_cur[tokens_cur.len() - 1..]
+                            };
+                            let logits = self.decoder.decode(
+                                step_input,
+                                &enc_out,
+                                &mut cache,
+                                &mut state.workspace,
+                            );
+                            start_idx = logits.len() - n_vocab;
+                        }
+                        // The filter pipeline mutates the logits in place, which
+                        // is why the decoder hands back a mutable slice into the
+                        // reused workspace instead of a fresh vector per token.
+                        let step_logits = &mut state.workspace.logits_mut()[start_idx..];
 
                         let filter_ctx = LogitFilterContext {
                             step,
@@ -536,7 +633,6 @@ impl WhisperContext {
                         }
 
                         tokens_cur.push(best_id);
-                        logits = self.decoder.decode(&[best_id], &enc_out, &mut cache);
                     }
                 }
 

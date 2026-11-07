@@ -156,6 +156,26 @@ pub struct Args {
         default_value = "/System/Library/Fonts/Supplemental/Courier New Bold.ttf"
     )]
     pub font_path: String,
+
+    /// Skip windows that contain no speech (voice activity detection)
+    #[arg(long = "vad", default_value_t = false)]
+    pub vad: bool,
+
+    /// VAD energy threshold (higher = stricter)
+    #[arg(long = "vad-threshold", default_value_t = 0.5)]
+    pub vad_threshold: f32,
+
+    /// Minimum speech duration in milliseconds for a VAD segment
+    #[arg(long = "vad-min-speech-duration-ms", default_value_t = 250)]
+    pub vad_min_speech_duration_ms: usize,
+
+    /// Silence gap in milliseconds that splits two VAD segments
+    #[arg(long = "vad-min-silence-duration-ms", default_value_t = 100)]
+    pub vad_min_silence_duration_ms: usize,
+
+    /// Padding in milliseconds added around each detected speech region
+    #[arg(long = "vad-speech-pad-ms", default_value_t = 300)]
+    pub vad_speech_pad_ms: usize,
 }
 
 impl Default for Args {
@@ -192,6 +212,11 @@ impl Default for Args {
             print_confidence: false,
             output_words: false,
             font_path: "/System/Library/Fonts/Supplemental/Courier New Bold.ttf".to_string(),
+            vad: false,
+            vad_threshold: 0.5,
+            vad_min_speech_duration_ms: 250,
+            vad_min_silence_duration_ms: 100,
+            vad_speech_pad_ms: 300,
         }
     }
 }
@@ -433,6 +458,11 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         max_initial_ts: args.max_initial_ts,
         single_segment: args.single_segment,
         suppress_regex: args.suppress_regex.clone(),
+        vad_enable: args.vad,
+        vad_threshold: args.vad_threshold,
+        vad_min_speech_duration_ms: args.vad_min_speech_duration_ms,
+        vad_min_silence_duration_ms: args.vad_min_silence_duration_ms,
+        vad_speech_pad_ms: args.vad_speech_pad_ms,
         ..Default::default()
     };
 

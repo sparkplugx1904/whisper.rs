@@ -1514,6 +1514,9 @@ pub unsafe extern "C" fn whisper_encode_with_state(
 
     let enc_out = context.inner.encoder.forward(&mel_chunk);
     state_ref.inner.encoder_output = enc_out;
+    // New audio invalidates the cross-attention projections that the previous
+    // window left in the cache, even if both windows have the same length.
+    state_ref.inner.cache.invalidate_cross();
     (*ctx).timings.encode_ms += t_start.elapsed().as_secs_f32() * 1000.0;
     0
 }
@@ -1557,17 +1560,23 @@ pub unsafe extern "C" fn whisper_decode_with_state(
     }
     let tok_vec: Vec<i32> = token_slice.to_vec();
 
-    state_ref.inner.cache.t_past = n_past.max(0) as usize;
+    // The KV cache is a slot arena; the C API drives a single sequence, so the
+    // caller-supplied history length applies to slot 0.
+    state_ref.inner.cache.t_past[0] = n_past.max(0) as usize;
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        context.inner.decoder.decode(
+        let logits = context.inner.decoder.decode(
             &tok_vec,
             &state_ref.inner.encoder_output,
             &mut state_ref.inner.cache,
-        )
+            &mut state_ref.inner.workspace,
+        );
+        // Copy out of the reusable workspace so the C getter keeps returning a
+        // stable pointer for the lifetime of the state.
+        state_ref.inner.logits.clear();
+        state_ref.inner.logits.extend_from_slice(logits);
     }));
     match res {
-        Ok(logits) => {
-            state_ref.inner.logits = logits;
+        Ok(()) => {
             (*ctx).timings.decode_ms += t_start.elapsed().as_secs_f32() * 1000.0;
             0
         }

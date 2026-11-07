@@ -1,8 +1,11 @@
-use crate::decoder::DecoderKvCache;
+use crate::decoder::{DecoderKvCache, DecoderWorkspace};
 use crate::segment::Segment;
 
 pub struct WhisperState {
     pub cache: DecoderKvCache,
+    /// Scratch buffers for the decoder forward pass. Kept here so a reused state
+    /// never reallocates the intermediate activations between windows or tokens.
+    pub workspace: DecoderWorkspace,
     pub encoder_output: Vec<f32>,
     pub logits: Vec<f32>,
     pub mel: Option<whisper_audio::MelSpectrogram>,
@@ -13,9 +16,10 @@ pub struct WhisperState {
 }
 
 impl WhisperState {
-    pub fn new(n_layers: usize) -> Self {
+    pub fn new(n_layers: usize, d_model: usize) -> Self {
         Self {
-            cache: DecoderKvCache::new(n_layers),
+            cache: DecoderKvCache::new(n_layers, 1, d_model),
+            workspace: DecoderWorkspace::new(),
             encoder_output: Vec::new(),
             logits: Vec::new(),
             mel: None,
@@ -29,6 +33,7 @@ impl WhisperState {
     /// Reset state between transcriptions to reuse allocated buffers.
     pub fn clear(&mut self) {
         self.cache.clear();
+        self.workspace.clear();
         self.encoder_output.clear();
         self.logits.clear();
         self.mel = None;

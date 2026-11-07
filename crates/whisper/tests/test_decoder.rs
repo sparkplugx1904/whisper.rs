@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use whisper_rs::audio::{compute_log_mel_spectrogram, WavAudio};
 use whisper_rs::model::WhisperModel;
 use whisper_rs::tokenizer::Tokenizer;
-use whisper_rs::{DecoderKvCache, WhisperDecoder, WhisperEncoder};
+use whisper_rs::{DecodeSlot, DecoderKvCache, DecoderWorkspace, WhisperDecoder, WhisperEncoder};
 
 fn workspace_path(rel: &str) -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -41,10 +41,11 @@ fn test_decoder_first_logits_vs_reference() {
     let enc_out = encoder.forward(&mel_chunk);
 
     let decoder = WhisperDecoder::new(&model).expect("init decoder");
-    let mut cache = DecoderKvCache::new(decoder.n_layers);
+    let mut cache = DecoderKvCache::new(decoder.n_layers, 1, decoder.d_model);
+    let mut workspace = DecoderWorkspace::new();
 
     let prompt = [model.vocab.token_sot];
-    let logits = decoder.decode(&prompt, &enc_out, &mut cache);
+    let logits = decoder.decode(&prompt, &enc_out, &mut cache, &mut workspace);
 
     // Read reference fixture
     let mut ref_file = File::open(ref_path).expect("open ref");
@@ -131,13 +132,14 @@ fn test_greedy_transcription_jfk() {
     let enc_out = encoder.forward(&mel_chunk);
 
     let decoder = WhisperDecoder::new(&model).expect("init decoder");
-    let mut cache = DecoderKvCache::new(decoder.n_layers);
+    let mut cache = DecoderKvCache::new(decoder.n_layers, 1, decoder.d_model);
+    let mut workspace = DecoderWorkspace::new();
 
     let mut tokens = vec![tokenizer.sot()];
     let mut generated = Vec::new();
 
     for _ in 0..100 {
-        let logits = decoder.decode(&tokens, &enc_out, &mut cache);
+        let logits = decoder.decode(&tokens, &enc_out, &mut cache, &mut workspace);
         assert_eq!(logits.len(), decoder.n_vocab);
 
         // Greedy argmax
@@ -168,4 +170,99 @@ fn test_greedy_transcription_jfk() {
         "Decoded text does not match expected JFK speech: '{}'",
         text
     );
+}
+
+#[test]
+fn test_batched_decode_matches_separate_calls() {
+    let wav_path = workspace_path("samples/jfk.wav");
+    let model_path = resolve_model_path("ggml-tiny.en.bin");
+
+    if !model_path.exists() {
+        eprintln!("Missing model, skipping batched decode test");
+        return;
+    }
+
+    let audio = WavAudio::load_from_file(&wav_path).expect("load wav");
+    let model = WhisperModel::load_from_file(model_path).expect("load model");
+    let mel = compute_log_mel_spectrogram(&audio.samples, &model.filters.data, model.filters.n_mel);
+    let mel_chunk = mel.get_chunk(0, model.hparams.n_audio_ctx as usize);
+
+    let encoder = WhisperEncoder::new(&model).expect("init encoder");
+    let enc_out = encoder.forward(&mel_chunk);
+    let decoder = WhisperDecoder::new(&model).expect("init decoder");
+    let n_vocab = decoder.n_vocab;
+    let d_model = decoder.d_model;
+
+    let prompt_a = [model.vocab.token_prev, model.vocab.token_sot];
+    let prompt_b = [model.vocab.token_prev];
+
+    // Reference: each prompt decodes in its own cache, one row per token.
+    let mut ref_a = Vec::new();
+    {
+        let mut cache = DecoderKvCache::new(decoder.n_layers, 1, d_model);
+        let mut ws = DecoderWorkspace::new();
+        ref_a.extend_from_slice(decoder.decode(&prompt_a, &enc_out, &mut cache, &mut ws));
+    }
+    let mut ref_b = Vec::new();
+    {
+        let mut cache = DecoderKvCache::new(decoder.n_layers, 1, d_model);
+        let mut ws = DecoderWorkspace::new();
+        ref_b.extend_from_slice(decoder.decode(&prompt_b, &enc_out, &mut cache, &mut ws));
+    }
+
+    // Batched: both prompts share one forward pass over the weight matrices.
+    let mut cache = DecoderKvCache::new(decoder.n_layers, 2, d_model);
+    let mut ws = DecoderWorkspace::new();
+    let batched = decoder.decode_batch(
+        &[
+            DecodeSlot {
+                slot: 0,
+                tokens: &prompt_a,
+            },
+            DecodeSlot {
+                slot: 1,
+                tokens: &prompt_b,
+            },
+        ],
+        &enc_out,
+        &mut cache,
+        &mut ws,
+    );
+    assert_eq!(batched.len(), (prompt_a.len() + prompt_b.len()) * n_vocab);
+    assert_eq!(cache.t_past, vec![prompt_a.len(), prompt_b.len()]);
+
+    let rows_a = &batched[..prompt_a.len() * n_vocab];
+    let rows_b = &batched[prompt_a.len() * n_vocab..];
+
+    // Rows from different sequences are independent, so the only expected
+    // difference between the batched GEMM and the single-row GEMV path is
+    // floating-point accumulation order.
+    let max_diff = |got: &[f32], expected: &[f32]| {
+        got.iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let diff_a = max_diff(rows_a, &ref_a);
+    let diff_b = max_diff(rows_b, &ref_b);
+    assert!(
+        diff_a < 1e-3,
+        "batched logits for sequence A differ from the sequential decode by {diff_a}"
+    );
+    assert!(
+        diff_b < 1e-3,
+        "batched logits for sequence B differ from the sequential decode by {diff_b}"
+    );
+
+    // Forking a slot must reproduce the source history exactly; beam search
+    // relies on this instead of cloning a whole cache.
+    cache.ensure_slots(3);
+    cache.copy_slot(2, 0);
+    assert_eq!(cache.slot_len(2), prompt_a.len());
+    for (layer_idx, layer) in cache.k_self.iter().enumerate() {
+        assert_eq!(layer[0], layer[2], "layer {layer_idx} key copy diverged");
+    }
+    for (layer_idx, layer) in cache.v_self.iter().enumerate() {
+        assert_eq!(layer[0], layer[2], "layer {layer_idx} value copy diverged");
+    }
 }

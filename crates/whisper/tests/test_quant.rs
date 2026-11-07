@@ -75,6 +75,31 @@ fn test_q8_0_transcription() {
     assert_eq!(model.hparams.ftype, 7); // ggml_ftype MOSTLY_Q8_0 is 7
 
     let ctx = WhisperContext::new(model).expect("init context");
+
+    // The weights must still be in their GGML block layout after loading: an
+    // expansion to f32 would multiply the resident size of every projection by
+    // 3.76 and put the memory-bandwidth-bound decode path back where it was.
+    let block = &ctx.decoder.weights.blocks[0];
+    for weight in [
+        &block.attn_q_w,
+        &block.attn_k_w,
+        &block.attn_v_w,
+        &block.cross_attn_k_w,
+        &block.mlp0_w,
+    ] {
+        assert!(
+            weight.is_quantized(),
+            "Q8_0 checkpoint must keep its projection weights quantized in RAM"
+        );
+        assert_eq!(weight.dtype(), whisper_rs::tensor::DType::Q8_0);
+    }
+    assert!(ctx.decoder.weights.token_embedding.is_quantized());
+    assert_eq!(
+        ctx.encoder.weights.blocks[0].attn_qkv_w.dtype(),
+        whisper_rs::tensor::DType::Q8_0,
+        "fused encoder QKV must keep the checkpoint's block format"
+    );
+
     let mel = compute_log_mel_spectrogram(
         &audio.samples,
         &ctx.model.filters.data,

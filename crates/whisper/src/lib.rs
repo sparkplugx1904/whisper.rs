@@ -8,10 +8,14 @@ pub mod encoder;
 pub mod filter;
 pub mod params;
 pub mod segment;
+pub mod speech_map;
 pub mod state;
 pub mod transcribe;
 pub use beam::{BeamCandidate, BeamSearch};
-pub use decoder::{DecoderBlockWeights, DecoderKvCache, DecoderWeights, WhisperDecoder};
+pub use decoder::{
+    DecodeSlot, DecoderBlockWeights, DecoderKvCache, DecoderWeights, DecoderWorkspace,
+    WhisperDecoder,
+};
 pub use dtw::{
     align_dtw, get_alignment_heads, merge_tokens_to_words, AlignmentHeadsPreset, WordTiming,
 };
@@ -26,6 +30,7 @@ pub use params::{AbortCallback, FullParamsBuilder, SamplingStrategy, WhisperPara
 pub use segment::{
     format_json, format_karaoke_srt, format_karaoke_vtt, format_srt, format_vtt, Segment,
 };
+pub use speech_map::SpeechMap;
 pub use state::WhisperState;
 pub use transcribe::WhisperContext;
 pub use transcribe::{FallbackEvaluation, WindowPromptBuilder};

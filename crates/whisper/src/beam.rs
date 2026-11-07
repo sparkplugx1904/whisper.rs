@@ -1,10 +1,18 @@
-use crate::decoder::{DecoderKvCache, WhisperDecoder};
+//! Beam search over decoder hypotheses.
+//!
+//! Every candidate refers to a slot of the shared [`DecoderKvCache`] arena
+//! instead of owning a private copy of the attention state. Branching therefore
+//! costs one slot copy per fork rather than one deep clone of every layer's
+//! key and value tensors, which previously dominated the beam step.
+
+use crate::decoder::{DecodeSlot, DecoderKvCache, DecoderWorkspace, WhisperDecoder};
 
 #[derive(Clone)]
 pub struct BeamCandidate {
     pub tokens: Vec<i32>,
     pub cumulative_logprob: f64,
-    pub cache: DecoderKvCache,
+    /// Arena slot holding this hypothesis' self-attention history.
+    pub slot: usize,
     pub completed: bool,
     pub last_timestamp: Option<i32>,
 }
@@ -13,14 +21,29 @@ pub struct BeamSearch {
     pub beam_size: usize,
     pub candidates: Vec<BeamCandidate>,
     pub suppress_indices: Vec<usize>,
+    /// Scratch row used for filtering one candidate's logits in place.
+    logits_buf: Vec<f32>,
+    /// Scratch flags: slots that a retained branch claims as its parent slot.
+    slot_reserved: Vec<bool>,
+    /// Scratch flags: slots already handed to a retained branch.
+    slot_claimed: Vec<bool>,
 }
 
 impl BeamSearch {
-    pub fn new(beam_size: usize, initial_cache: DecoderKvCache) -> Self {
+    /// Start a search that borrows the caller's KV arena.
+    ///
+    /// The arena is only grown to `beam_size` slots: slot 0 carries whatever
+    /// context the caller has already decoded (the window prompt in the
+    /// transcription loop), and the caller seeds the first candidates by
+    /// forking it into the remaining slots. Resetting the arena here would
+    /// throw that prefill away, so nothing is cleared.
+    pub fn new(beam_size: usize, cache: &mut DecoderKvCache) -> Self {
+        cache.ensure_slots(beam_size.max(1));
+
         let root = BeamCandidate {
             tokens: Vec::new(),
             cumulative_logprob: 0.0,
-            cache: initial_cache,
+            slot: 0,
             completed: false,
             last_timestamp: None,
         };
@@ -29,12 +52,19 @@ impl BeamSearch {
             beam_size,
             candidates: vec![root],
             suppress_indices: Vec::new(),
+            logits_buf: Vec::new(),
+            slot_reserved: Vec::new(),
+            slot_claimed: Vec::new(),
         }
     }
 
     /// Step the beam search by decoding the current tokens of each candidate,
     /// filtering logits (including GBNF grammar constraints), computing log-probs,
     /// and retaining the top `beam_size` branches according to length penalty.
+    ///
+    /// All live candidates are decoded in a single batched pass: their rows
+    /// share every projection matrix, so the step turns `beam_size` independent
+    /// memory-bound GEMVs into one GEMM.
     #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
@@ -49,8 +79,50 @@ impl BeamSearch {
         vocab: &whisper_model::Vocab,
         tokenizer: &whisper_tokenizer::Tokenizer,
         length_penalty: f32,
+        cache: &mut DecoderKvCache,
+        ws: &mut DecoderWorkspace,
     ) {
-        let mut branches = Vec::new();
+        let n_vocab = decoder.n_vocab;
+        if self.logits_buf.len() < n_vocab {
+            self.logits_buf.resize(n_vocab, 0.0);
+        }
+
+        // Only the last token of each live candidate is new to its slot; the
+        // rest of the history is already in the arena. Candidates are ordered
+        // by slot so the batched logits arrive slot-major.
+        let mut order: Vec<usize> = (0..self.candidates.len())
+            .filter(|&i| !self.candidates[i].completed && !self.candidates[i].tokens.is_empty())
+            .collect();
+        order.sort_by_key(|&i| self.candidates[i].slot);
+        debug_assert!(
+            order
+                .windows(2)
+                .all(|w| self.candidates[w[0]].slot != self.candidates[w[1]].slot),
+            "active candidates must own distinct arena slots"
+        );
+
+        let seqs: Vec<DecodeSlot<'_>> = order
+            .iter()
+            .map(|&i| {
+                let cand = &self.candidates[i];
+                DecodeSlot {
+                    slot: cand.slot,
+                    tokens: &cand.tokens[cand.tokens.len() - 1..],
+                }
+            })
+            .collect();
+
+        // Slot -> logits row, sorted by slot for lookup below.
+        let rows: Vec<(usize, usize)> = order
+            .iter()
+            .enumerate()
+            .map(|(row, &i)| (self.candidates[i].slot, row))
+            .collect();
+
+        let logits = decoder.decode_batch(&seqs, encoder_output, cache, ws);
+
+        let mut branches: Vec<BeamCandidate> =
+            Vec::with_capacity(self.candidates.len() * self.beam_size);
 
         for cand in &self.candidates {
             if cand.completed {
@@ -58,23 +130,25 @@ impl BeamSearch {
                 continue;
             }
 
-            let last_token = cand.tokens.last().copied();
-            let mut cand_cache = cand.cache.clone();
+            let row = rows
+                .binary_search_by_key(&cand.slot, |&(slot, _)| slot)
+                .ok()
+                .map(|pos| rows[pos].1);
 
-            let decode_input = match last_token {
-                Some(t) => vec![t],
-                None => Vec::new(),
+            let step_logits = match row {
+                Some(r) => {
+                    self.logits_buf
+                        .copy_from_slice(&logits[r * n_vocab..(r + 1) * n_vocab]);
+                    &mut self.logits_buf[..]
+                }
+                // A candidate without tokens was never seeded with a prompt
+                // token, so there is nothing to decode; a flat distribution
+                // matches decoding no input at all.
+                None => {
+                    self.logits_buf.fill(0.0);
+                    &mut self.logits_buf[..]
+                }
             };
-
-            let mut logits = if decode_input.is_empty() {
-                vec![0.0f32; decoder.n_vocab]
-            } else {
-                decoder.decode(&decode_input, encoder_output, &mut cand_cache)
-            };
-
-            let n_vocab = decoder.n_vocab;
-            let start_idx = logits.len() - n_vocab;
-            let step_logits = &mut logits[start_idx..];
 
             // 1. Suppress blank at start
             if suppress_blank && step_idx == 0 {
@@ -141,10 +215,12 @@ impl BeamSearch {
                     cand.last_timestamp
                 };
 
+                // The branch inherits the parent slot until the survivors are
+                // known; slots are reassigned below.
                 branches.push(BeamCandidate {
                     tokens: new_tokens,
                     cumulative_logprob: cand.cumulative_logprob + (logp as f64),
-                    cache: cand_cache.clone(),
+                    slot: cand.slot,
                     completed: is_completed,
                     last_timestamp: new_ts,
                 });
@@ -164,6 +240,49 @@ impl BeamSearch {
         });
 
         branches.truncate(self.beam_size);
+
+        // Hand out arena slots to the retained branches.
+        //
+        // Each parent slot may have produced several surviving children. The
+        // first one keeps the parent's slot because the arena already holds the
+        // exact token history that branch needs; every further child needs its
+        // own copy, which `copy_slot` makes from the parent. Slots that are a
+        // parent of some retained branch are reserved up front so a sibling's
+        // extra child cannot steal the slot its owner is about to claim.
+        // Completed hypotheses are never decoded again, so the slots they keep
+        // are taken out of circulation as well: they count as their own parent
+        // in the branch list.
+        let n_slots = cache.t_past.len();
+        self.slot_reserved.clear();
+        self.slot_reserved.resize(n_slots, false);
+        for branch in &branches {
+            debug_assert!(branch.slot < n_slots, "candidate slot out of range");
+            self.slot_reserved[branch.slot] = true;
+        }
+        self.slot_claimed.clear();
+        self.slot_claimed.resize(n_slots, false);
+
+        let mut free_cursor = 0usize;
+        for branch in branches.iter_mut() {
+            let parent = branch.slot;
+            if !self.slot_claimed[parent] {
+                self.slot_claimed[parent] = true;
+                continue;
+            }
+
+            let mut new_slot = free_cursor;
+            while new_slot < n_slots
+                && (self.slot_reserved[new_slot] || self.slot_claimed[new_slot])
+            {
+                new_slot += 1;
+            }
+            assert!(new_slot < n_slots, "beam slot arena exhausted");
+            self.slot_claimed[new_slot] = true;
+            cache.copy_slot(new_slot, parent);
+            branch.slot = new_slot;
+            free_cursor = new_slot;
+        }
+
         self.candidates = branches;
     }
 
