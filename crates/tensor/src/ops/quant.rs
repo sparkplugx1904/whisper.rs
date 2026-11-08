@@ -274,6 +274,83 @@ pub fn quantized_linear(
     }
 }
 
+/// Quantized matrix-matrix product with an explicit thread count.
+///
+/// Computes `output[t * rows + r] = sum_k W[r, k] * x[t * cols + k]`, where `W`
+/// is stored in the GGML block layout for `dtype` and `x` is token-major.
+/// Quantized rows are streamed once per row chunk and reused for every token,
+/// so the kernel moves compressed weights instead of materializing a dense
+/// copy. F32 and F16 weights have nothing to dequantize, so they take the dense
+/// GEMM path directly.
+///
+/// This is the kernel used by `whisper_bench_ggml_mul_mat`. Unlike
+/// [`quantized_linear`] it never switches to the dequantize-then-GEMM path for
+/// large batches of quantized weights, which keeps the reported throughput a
+/// measurement of the quantized dot kernels themselves. F32 and F16 are dense
+/// formats, so they take the GEMM path directly.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul(
+    weight_bytes: &[u8],
+    dtype: DType,
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+    num_tokens: usize,
+    output: &mut [f32],
+    n_threads: usize,
+) {
+    assert_eq!(x.len(), num_tokens * cols);
+    assert_eq!(output.len(), num_tokens * rows);
+
+    if rows == 0 || cols == 0 || num_tokens == 0 {
+        return;
+    }
+
+    let bytes_per_row = dtype.byte_size_for(cols);
+    assert_eq!(weight_bytes.len(), rows * bytes_per_row);
+
+    let n_threads = n_threads.clamp(1, 16);
+
+    if matches!(dtype, DType::F32 | DType::F16) {
+        let dense = dtype
+            .dequantize_to_f32(weight_bytes, rows * cols)
+            .expect("validated weight bytes must dequantize");
+        crate::ops::matmul::linear_parallel(
+            x, &dense, None, cols, rows, num_tokens, output, n_threads,
+        );
+        return;
+    }
+
+    let chunk_rows = rows.div_ceil(n_threads).max(1);
+
+    use rayon::prelude::*;
+
+    // The public output is token-major, but a row's weights are reused across
+    // tokens. Accumulating row-major first keeps that reuse contiguous; the
+    // final transpose is a cheap linear copy next to the quantization math.
+    let mut row_major = vec![0.0f32; rows * num_tokens];
+    row_major
+        .par_chunks_mut(chunk_rows * num_tokens)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let r_start = chunk_idx * chunk_rows;
+            for (r_rel, row_out) in chunk.chunks_mut(num_tokens).enumerate() {
+                let r_abs = r_start + r_rel;
+                let row_bytes = &weight_bytes[r_abs * bytes_per_row..(r_abs + 1) * bytes_per_row];
+                for (t, out_val) in row_out.iter_mut().enumerate() {
+                    let x_t = &x[t * cols..(t + 1) * cols];
+                    *out_val = row_dot(dtype, row_bytes, x_t);
+                }
+            }
+        });
+
+    for (r, src) in row_major.chunks_exact(num_tokens).enumerate() {
+        for (t, &val) in src.iter().enumerate() {
+            output[t * rows + r] = val;
+        }
+    }
+}
+
 /// Dot product between one row of raw weight bytes and a float vector.
 ///
 /// Dispatches to the hand-written quantized kernels for GGML block formats and
@@ -466,4 +543,62 @@ pub fn vec_dot_q6_k_f32(raw_blocks: &[u8], x: &[f32]) -> f32 {
         }
     }
     sum
+}
+
+#[cfg(test)]
+mod matmul_tests {
+    use super::*;
+
+    #[test]
+    fn quantized_matmul_matches_dequantized_reference() {
+        let rows = 4;
+        let cols = 64;
+        let num_tokens = 3;
+
+        let weight_values: Vec<f32> = (0..rows * cols)
+            .map(|i| (((i * 37) % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        let x: Vec<f32> = (0..num_tokens * cols)
+            .map(|i| (((i * 13) % 19) as f32 - 9.0) * 0.03125)
+            .collect();
+
+        for dtype in [
+            DType::Q4_0,
+            DType::Q4_1,
+            DType::Q5_0,
+            DType::Q5_1,
+            DType::Q8_0,
+            DType::F16,
+            DType::F32,
+        ] {
+            let raw = dtype
+                .quantize_from_f32(&weight_values)
+                .expect("quantize benchmark-shaped weights");
+            let dense = dtype
+                .dequantize_to_f32(&raw, rows * cols)
+                .expect("dequantize benchmark-shaped weights");
+
+            let mut got = vec![0.0f32; num_tokens * rows];
+            quantized_matmul(&raw, dtype, rows, cols, &x, num_tokens, &mut got, 2);
+
+            for t in 0..num_tokens {
+                for r in 0..rows {
+                    let mut expected = 0.0f32;
+                    for k in 0..cols {
+                        expected += dense[r * cols + k] * x[t * cols + k];
+                    }
+                    let diff = (got[t * rows + r] - expected).abs();
+                    assert!(
+                        diff < 1e-3 * (1.0 + expected.abs()),
+                        "{:?} token {} row {}: {} vs {}",
+                        dtype,
+                        t,
+                        r,
+                        got[t * rows + r],
+                        expected
+                    );
+                }
+            }
+        }
+    }
 }

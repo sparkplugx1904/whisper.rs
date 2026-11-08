@@ -27,6 +27,9 @@ pub struct BeamSearch {
     slot_reserved: Vec<bool>,
     /// Scratch flags: slots already handed to a retained branch.
     slot_claimed: Vec<bool>,
+    /// Optional user callback invoked with each candidate's token history and
+    /// logits before any built-in suppression runs.
+    pub logits_callback: Option<crate::params::LogitsCallback>,
 }
 
 impl BeamSearch {
@@ -55,6 +58,7 @@ impl BeamSearch {
             logits_buf: Vec::new(),
             slot_reserved: Vec::new(),
             slot_claimed: Vec::new(),
+            logits_callback: None,
         }
     }
 
@@ -83,6 +87,9 @@ impl BeamSearch {
         ws: &mut DecoderWorkspace,
     ) {
         let n_vocab = decoder.n_vocab;
+        // Cloned once per step so the per-candidate logits buffer can be
+        // borrowed mutably while the callback stays reachable.
+        let logits_callback = self.logits_callback.clone();
         if self.logits_buf.len() < n_vocab {
             self.logits_buf.resize(n_vocab, 0.0);
         }
@@ -149,6 +156,12 @@ impl BeamSearch {
                     &mut self.logits_buf[..]
                 }
             };
+
+            // 0. User logits callback observes the raw logits of this candidate
+            // before any built-in suppression runs.
+            if let Some(cb) = &logits_callback {
+                (cb)(&cand.tokens, step_logits);
+            }
 
             // 1. Suppress blank at start
             if suppress_blank && step_idx == 0 {

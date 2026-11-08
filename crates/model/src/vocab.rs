@@ -127,8 +127,14 @@ pub fn lang_id(code_or_name: &str) -> Option<usize> {
 #[derive(Debug, Clone)]
 pub struct Vocab {
     pub n_vocab: usize,
-    pub token_to_id: HashMap<String, i32>,
+    /// Exact token bytes, as stored in the GGML vocabulary. Token strings are
+    /// not guaranteed to be valid UTF-8 (byte-level BPE fragments are not), so
+    /// lookups must stay byte-oriented.
+    pub token_to_id: HashMap<Vec<u8>, i32>,
+    /// Lossy UTF-8 rendering for text-facing consumers.
     pub id_to_token: Vec<String>,
+    /// Exact bytes for every token id.
+    pub token_bytes: Vec<Vec<u8>>,
 
     pub token_eot: i32,
     pub token_sot: i32,
@@ -147,6 +153,7 @@ impl Default for Vocab {
             n_vocab: 0,
             token_to_id: HashMap::new(),
             id_to_token: Vec::new(),
+            token_bytes: Vec::new(),
             token_eot: 50256,
             token_sot: 50257,
             token_translate: 50358,
@@ -166,10 +173,15 @@ impl Vocab {
     }
 
     pub fn add_token(&mut self, token: impl Into<String>) -> i32 {
-        let tok = token.into();
+        self.add_token_bytes(token.into().into_bytes())
+    }
+
+    pub fn add_token_bytes(&mut self, token: Vec<u8>) -> i32 {
         let id = self.id_to_token.len() as i32;
-        self.token_to_id.insert(tok.clone(), id);
-        self.id_to_token.push(tok);
+        self.token_to_id.insert(token.clone(), id);
+        self.id_to_token
+            .push(String::from_utf8_lossy(&token).into_owned());
+        self.token_bytes.push(token);
         self.n_vocab = self.id_to_token.len();
         id
     }
@@ -180,20 +192,22 @@ impl Vocab {
         let n_vocab_file = reader.read_i32::<LittleEndian>()? as usize;
         let mut token_to_id = HashMap::with_capacity(hparams.n_vocab as usize);
         let mut id_to_token = vec![String::new(); hparams.n_vocab as usize];
+        let mut token_bytes = vec![Vec::new(); hparams.n_vocab as usize];
 
         for i in 0..n_vocab_file {
             let len = reader.read_u32::<LittleEndian>()? as usize;
             let token = if len > 0 {
                 let mut buf = vec![0u8; len];
                 reader.read_exact(&mut buf)?;
-                String::from_utf8_lossy(&buf).into_owned()
+                buf
             } else {
-                String::new()
+                Vec::new()
             };
 
             token_to_id.insert(token.clone(), i as i32);
             if i < id_to_token.len() {
-                id_to_token[i] = token;
+                id_to_token[i] = String::from_utf8_lossy(&token).into_owned();
+                token_bytes[i] = token;
             }
         }
 
@@ -266,7 +280,10 @@ impl Vocab {
                     format!("[_extra_token_{}]", i)
                 };
 
-                token_to_id.insert(word.clone(), i_i32);
+                token_to_id.insert(word.as_bytes().to_vec(), i_i32);
+                if let Some(slot_bytes) = token_bytes.get_mut(i) {
+                    *slot_bytes = word.as_bytes().to_vec();
+                }
                 *slot = word;
             }
         }
@@ -275,6 +292,7 @@ impl Vocab {
             n_vocab: total_vocab,
             token_to_id,
             id_to_token,
+            token_bytes,
             token_eot,
             token_sot,
             token_translate,
@@ -288,12 +306,25 @@ impl Vocab {
     }
 
     pub fn token_to_id(&self, token: &str) -> Option<i32> {
+        self.token_to_id.get(token.as_bytes()).copied()
+    }
+
+    pub fn token_to_id_bytes(&self, token: &[u8]) -> Option<i32> {
         self.token_to_id.get(token).copied()
     }
 
     pub fn id_to_token(&self, id: i32) -> Option<&str> {
         if id >= 0 && (id as usize) < self.id_to_token.len() {
             Some(&self.id_to_token[id as usize])
+        } else {
+            None
+        }
+    }
+
+    /// Exact token bytes for `id`, without UTF-8 replacement.
+    pub fn id_to_token_bytes(&self, id: i32) -> Option<&[u8]> {
+        if id >= 0 && (id as usize) < self.token_bytes.len() {
+            Some(&self.token_bytes[id as usize])
         } else {
             None
         }

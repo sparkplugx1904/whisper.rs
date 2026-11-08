@@ -2,14 +2,16 @@ use crate::beam::BeamSearch;
 use crate::decoder::{DecoderKvCache, DecoderWorkspace, WhisperDecoder};
 use crate::encoder::WhisperEncoder;
 use crate::filter::{
-    compression_ratio, GrammarLogitFilter, LogitFilterContext, LogitFilterPipeline, RegexFilter,
-    RepetitionPenaltyFilter, SuppressBlankFilter, SuppressNonSpeechFilter, TimestampLogitFilter,
+    compression_ratio, CallbackLogitFilter, GrammarLogitFilter, LogitFilterContext,
+    LogitFilterPipeline, RegexFilter, RepetitionPenaltyFilter, SuppressBlankFilter,
+    SuppressNonSpeechFilter, TimestampLogitFilter,
 };
 use crate::params::WhisperParams;
 use crate::segment::Segment;
 use crate::speech_map::SpeechMap;
 use crate::state::WhisperState;
 use std::path::Path;
+use std::time::Instant;
 use whisper_audio::mel::MelSpectrogram;
 use whisper_audio::wav::WHISPER_SAMPLE_RATE;
 use whisper_audio::AudioError;
@@ -72,11 +74,13 @@ impl WhisperContext {
             }
         }
 
+        let mel_start = Instant::now();
         let mel = whisper_audio::compute_log_mel_spectrogram(
             samples,
             &self.model.filters.data,
             self.model.filters.n_mel,
         );
+        state.timings.mel_us += mel_start.elapsed().as_micros() as u64;
 
         state.segments = self.transcribe_internal(&mel, params, state, speech_map.as_ref());
         Ok(())
@@ -125,13 +129,33 @@ impl WhisperContext {
 
         let mel_chunk = mel.get_chunk(0, self.model.hparams.n_audio_ctx as usize);
         let enc_out = self.encoder.forward(&mel_chunk);
+        self.detect_language_probs_with_enc(&enc_out, probs_out)
+    }
+
+    /// Compute language probabilities from an already encoded audio window.
+    ///
+    /// The C API allows callers to pick the window with `offset_ms`; keeping
+    /// the decoder step separate lets that path reuse an encoder output.
+    pub fn detect_language_probs_with_enc(
+        &self,
+        enc_out: &[f32],
+        mut probs_out: Option<&mut [f32]>,
+    ) -> (String, usize, f32) {
+        if !self.model.hparams.is_multilingual() {
+            if let Some(probs) = &mut probs_out {
+                if !probs.is_empty() {
+                    probs[0] = 1.0;
+                }
+            }
+            return ("en".to_string(), 0, 1.0);
+        }
 
         let mut cache = DecoderKvCache::new(self.decoder.n_layers, 1, self.decoder.d_model);
         let mut workspace = DecoderWorkspace::new();
         let prompt = [self.tokenizer.sot()];
         let logits = self
             .decoder
-            .decode(&prompt, &enc_out, &mut cache, &mut workspace);
+            .decode(&prompt, enc_out, &mut cache, &mut workspace);
         let logits = &*logits;
 
         let num_langs = self.model.hparams.num_languages();
@@ -179,52 +203,8 @@ impl WhisperContext {
     }
 
     pub fn detect_language_with_enc(&self, enc_out: &[f32]) -> (String, f32) {
-        if !self.model.hparams.is_multilingual() {
-            return ("en".to_string(), 1.0);
-        }
-
-        let mut cache = DecoderKvCache::new(self.decoder.n_layers, 1, self.decoder.d_model);
-        let mut workspace = DecoderWorkspace::new();
-        let prompt = [self.tokenizer.sot()];
-        let logits = self
-            .decoder
-            .decode(&prompt, enc_out, &mut cache, &mut workspace);
-        let logits = &*logits;
-
-        let num_langs = self.model.hparams.num_languages();
-        let sot = self.tokenizer.sot();
-
-        let mut lang_scores = Vec::with_capacity(num_langs);
-        let mut max_score = f32::NEG_INFINITY;
-
-        for (i, &(code, _)) in LANGUAGES.iter().take(num_langs).enumerate() {
-            let token_id = sot + 1 + i as i32;
-            let score = logits[token_id as usize];
-            if score > max_score {
-                max_score = score;
-            }
-            lang_scores.push((code, score));
-        }
-
-        let mut sum_exp = 0.0f32;
-        for (_, score) in &mut lang_scores {
-            *score = (*score - max_score).exp();
-            sum_exp += *score;
-        }
-
-        let inv_sum = 1.0 / sum_exp.max(1e-10);
-        let mut best_lang = "en";
-        let mut best_prob = 0.0f32;
-
-        for (code, score) in lang_scores {
-            let prob = score * inv_sum;
-            if prob > best_prob {
-                best_prob = prob;
-                best_lang = code;
-            }
-        }
-
-        (best_lang.to_string(), best_prob)
+        let (lang, _, prob) = self.detect_language_probs_with_enc(enc_out, None);
+        (lang, prob)
     }
 
     pub fn detect_language(&self, mel: &MelSpectrogram) -> (String, f32) {
@@ -264,8 +244,18 @@ impl WhisperContext {
         // English-only model never needs it for language detection.
         let needs_first_encode_for_language = is_multilingual && params.language == "auto";
         let mut enc_out_0: Option<Vec<f32>> = if needs_first_encode_for_language {
+            // The language-detection prefill is a real encoder pass, so the
+            // begin callback gates it exactly like the per-window passes.
+            if !encoder_begin_allowed(params) {
+                return Vec::new();
+            }
             let mel_chunk_0 = mel.get_chunk(0, n_audio_ctx);
-            Some(self.encoder.forward_with_ctx(&mel_chunk_0, n_audio_ctx))
+            let encode_start = Instant::now();
+            let enc = self.encoder.forward_with_ctx(&mel_chunk_0, n_audio_ctx);
+            state
+                .timings
+                .add_encode(encode_start.elapsed().as_micros() as u64);
+            Some(enc)
         } else {
             None
         };
@@ -371,13 +361,29 @@ impl WhisperContext {
                 // Encode window 0 on first use, then reuse it if the loop
                 // returns here; a VAD-skipped opening window never pays for it.
                 if enc_out_0.is_none() {
+                    if !encoder_begin_allowed(params) {
+                        break;
+                    }
                     let mel_chunk = mel.get_chunk(0, n_audio_ctx);
-                    enc_out_0 = Some(self.encoder.forward_with_ctx(&mel_chunk, n_audio_ctx));
+                    let encode_start = Instant::now();
+                    let enc = self.encoder.forward_with_ctx(&mel_chunk, n_audio_ctx);
+                    state
+                        .timings
+                        .add_encode(encode_start.elapsed().as_micros() as u64);
+                    enc_out_0 = Some(enc);
                 }
                 enc_out_0.clone().expect("window 0 encoded above")
             } else {
+                if !encoder_begin_allowed(params) {
+                    break;
+                }
                 let mel_chunk = mel.get_chunk(seek_frame, n_audio_ctx);
-                self.encoder.forward_with_ctx(&mel_chunk, n_audio_ctx)
+                let encode_start = Instant::now();
+                let enc = self.encoder.forward_with_ctx(&mel_chunk, n_audio_ctx);
+                state
+                    .timings
+                    .add_encode(encode_start.elapsed().as_micros() as u64);
+                enc
             };
             state.encoder_output = enc_out.clone();
 
@@ -422,16 +428,27 @@ impl WhisperContext {
                     // BEAM SEARCH
                     let n_vocab = self.decoder.n_vocab;
                     let mut beam = BeamSearch::new(params.beam_size, &mut cache);
+                    // Beam steps filter per-candidate logits inside the search
+                    // loop, so the callback travels with the search object.
+                    beam.logits_callback = params.on_logits.clone();
+                    let decode_start = Instant::now();
                     let logits = self.decoder.decode(
                         &window_prompt,
                         &enc_out,
                         &mut cache,
                         &mut state.workspace,
                     );
+                    let decode_elapsed = decode_start.elapsed().as_micros() as u64;
+                    state.timings.add_decode(decode_elapsed);
+                    state.timings.add_prompt(decode_elapsed);
                     let start_idx = logits.len() - n_vocab;
                     let step_logits = &mut logits[start_idx..];
 
+                    let sample_start = Instant::now();
                     let mut beam_pipeline = LogitFilterPipeline::new();
+                    if let Some(cb) = &params.on_logits {
+                        beam_pipeline.add(CallbackLogitFilter::new(cb.clone()));
+                    }
                     if params.suppress_blank {
                         beam_pipeline.add(SuppressBlankFilter::new(220, eot));
                     }
@@ -468,6 +485,9 @@ impl WhisperContext {
                     seed_tokens
                         .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                     seed_tokens.truncate(params.beam_size);
+                    state
+                        .timings
+                        .add_sample(sample_start.elapsed().as_micros() as u64);
 
                     beam.candidates = seed_tokens
                         .into_iter()
@@ -494,6 +514,7 @@ impl WhisperContext {
                         if beam.is_completed(1.0) {
                             break;
                         }
+                        let batch_start = Instant::now();
                         beam.step(
                             &self.decoder,
                             &enc_out,
@@ -513,6 +534,9 @@ impl WhisperContext {
                             &mut cache,
                             &mut state.workspace,
                         );
+                        state
+                            .timings
+                            .add_batch_decode(batch_start.elapsed().as_micros() as u64);
                     }
 
                     if let Some(best) = beam.best_candidate() {
@@ -524,6 +548,11 @@ impl WhisperContext {
                     let max_steps = 224;
                     let n_vocab = self.decoder.n_vocab;
                     let mut greedy_pipeline = LogitFilterPipeline::new();
+                    // The user logits callback runs before every built-in
+                    // suppression, matching whisper.cpp's filter order.
+                    if let Some(cb) = &params.on_logits {
+                        greedy_pipeline.add(CallbackLogitFilter::new(cb.clone()));
+                    }
                     if params.suppress_blank {
                         greedy_pipeline.add(SuppressBlankFilter::new(220, eot));
                     }
@@ -568,14 +597,21 @@ impl WhisperContext {
                             } else {
                                 &tokens_cur[tokens_cur.len() - 1..]
                             };
+                            let decode_start = Instant::now();
                             let logits = self.decoder.decode(
                                 step_input,
                                 &enc_out,
                                 &mut cache,
                                 &mut state.workspace,
                             );
+                            let decode_elapsed = decode_start.elapsed().as_micros() as u64;
+                            state.timings.add_decode(decode_elapsed);
+                            if step == 0 {
+                                state.timings.add_prompt(decode_elapsed);
+                            }
                             start_idx = logits.len() - n_vocab;
                         }
+                        let sample_start = Instant::now();
                         // The filter pipeline mutates the logits in place, which
                         // is why the decoder hands back a mutable slice into the
                         // reused workspace instead of a fresh vector per token.
@@ -633,6 +669,10 @@ impl WhisperContext {
                             }
                         }
 
+                        state
+                            .timings
+                            .add_sample(sample_start.elapsed().as_micros() as u64);
+
                         if best_id == eot {
                             break;
                         }
@@ -659,6 +699,20 @@ impl WhisperContext {
                 }
                 // Trigger temperature fallback
                 temperature += params.temperature_inc;
+                if temperature > 1.0 {
+                    break;
+                }
+                // A retry actually runs, so record which criterion rejected the
+                // temperature that was just decoded. whisper.cpp keeps the same
+                // two counters behind its timing report.
+                if token_entropies.len() >= 32 && eval.avg_entropy > params.entropy_thold {
+                    state.timings.n_fail_h += 1;
+                }
+                if (eval.avg_logprob as f64) < params.logprob_threshold
+                    && no_speech_prob < params.no_speech_threshold as f32
+                {
+                    state.timings.n_fail_p += 1;
+                }
             }
 
             let eval = FallbackEvaluation::evaluate(
@@ -870,6 +924,11 @@ impl WhisperContext {
             avg_entropy,
         )
     }
+}
+
+/// Evaluates the optional encoder-begin callback; `true` means the pass may run.
+fn encoder_begin_allowed(params: &WhisperParams) -> bool {
+    params.on_encoder_begin.as_ref().is_none_or(|cb| cb())
 }
 
 fn split_segments_by_max_len(

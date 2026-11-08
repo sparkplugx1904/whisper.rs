@@ -10,6 +10,7 @@ pub mod params;
 pub mod segment;
 pub mod speech_map;
 pub mod state;
+pub mod timing;
 pub mod transcribe;
 pub use beam::{BeamCandidate, BeamSearch};
 pub use decoder::{
@@ -22,16 +23,20 @@ pub use dtw::{
 pub use encoder::{EncoderBlockWeights, EncoderWeights, WhisperEncoder};
 pub use filter::{
     apply_repetition_penalty, apply_suppress_blank, apply_suppress_non_speech, compression_ratio,
-    compute_distribution_entropy, compute_token_logprob, GrammarLogitFilter, LogitFilter,
-    LogitFilterContext, LogitFilterPipeline, RegexFilter, RepetitionPenaltyFilter,
+    compute_distribution_entropy, compute_token_logprob, CallbackLogitFilter, GrammarLogitFilter,
+    LogitFilter, LogitFilterContext, LogitFilterPipeline, RegexFilter, RepetitionPenaltyFilter,
     SuppressBlankFilter, SuppressNonSpeechFilter, TimestampLogitFilter,
 };
-pub use params::{AbortCallback, FullParamsBuilder, SamplingStrategy, WhisperParams};
+pub use params::{
+    AbortCallback, EncoderBeginCallback, FullParamsBuilder, LogitsCallback, SamplingStrategy,
+    WhisperParams,
+};
 pub use segment::{
     format_json, format_karaoke_srt, format_karaoke_vtt, format_srt, format_vtt, Segment,
 };
 pub use speech_map::SpeechMap;
 pub use state::WhisperState;
+pub use timing::Timings;
 pub use transcribe::WhisperContext;
 pub use transcribe::{FallbackEvaluation, WindowPromptBuilder};
 

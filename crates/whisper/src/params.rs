@@ -3,6 +3,11 @@ use std::sync::Arc;
 pub type NewSegmentCallback = Arc<dyn Fn(&crate::segment::Segment) + Send + Sync>;
 pub type ProgressCallback = Arc<dyn Fn(i32) + Send + Sync>;
 pub type AbortCallback = Arc<dyn Fn() -> bool + Send + Sync>;
+/// Invoked before each encoder pass; returning `false` aborts transcription.
+pub type EncoderBeginCallback = Arc<dyn Fn() -> bool + Send + Sync>;
+/// Invoked with the tokens generated so far and the raw logits of the next
+/// step, before any suppression filter runs. The callback may rewrite logits.
+pub type LogitsCallback = Arc<dyn Fn(&[i32], &mut [f32]) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct WhisperParams {
@@ -89,6 +94,16 @@ pub struct WhisperParams {
     pub vad_min_silence_duration_ms: usize,
     /// Speech padding margin in milliseconds applied before and after detected speech (default: 300)
     pub vad_speech_pad_ms: usize,
+    /// Path to a Silero VAD GGML model. When set together with `vad_enable`,
+    /// the neural detector replaces the energy detector (default: None)
+    pub vad_model_path: Option<String>,
+    /// Called immediately before each encoder pass. Returning `false` stops
+    /// transcription cleanly, keeping segments produced so far.
+    pub on_encoder_begin: Option<EncoderBeginCallback>,
+    /// Called with the current token history and mutable logits of the next
+    /// step, before any suppression filter. Matches whisper.cpp's
+    /// `logits_filter_callback` position in the filter chain.
+    pub on_logits: Option<LogitsCallback>,
 }
 impl std::fmt::Debug for WhisperParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -117,6 +132,9 @@ impl std::fmt::Debug for WhisperParams {
                 &self.vad_min_silence_duration_ms,
             )
             .field("vad_speech_pad_ms", &self.vad_speech_pad_ms)
+            .field("vad_model_path", &self.vad_model_path)
+            .field("on_encoder_begin", &self.on_encoder_begin.is_some())
+            .field("on_logits", &self.on_logits.is_some())
             .finish()
     }
 }
@@ -164,6 +182,9 @@ impl Default for WhisperParams {
             vad_min_speech_duration_ms: 250,
             vad_min_silence_duration_ms: 100,
             vad_speech_pad_ms: 300,
+            vad_model_path: None,
+            on_encoder_begin: None,
+            on_logits: None,
         }
     }
 }
@@ -353,6 +374,31 @@ impl FullParamsBuilder {
     /// Set speech padding margin in milliseconds applied before and after detected speech (default: 300).
     pub fn vad_speech_pad_ms(mut self, ms: usize) -> Self {
         self.params.vad_speech_pad_ms = ms;
+        self
+    }
+    /// Use a Silero VAD GGML model for speech detection (default: energy detector).
+    pub fn vad_model_path(mut self, path: impl Into<String>) -> Self {
+        self.params.vad_model_path = Some(path.into());
+        self
+    }
+    /// Register a callback invoked before each encoder pass.
+    ///
+    /// Returning `false` aborts transcription and keeps the segments emitted so
+    /// far, mirroring whisper.cpp's `encoder_begin_callback`.
+    pub fn on_encoder_begin<F>(mut self, cb: F) -> Self
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        self.params.on_encoder_begin = Some(Arc::new(cb));
+        self
+    }
+    /// Register a callback invoked with the generated tokens and raw logits of
+    /// the next decoding step, before any suppression filter runs.
+    pub fn on_logits<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(&[i32], &mut [f32]) + Send + Sync + 'static,
+    {
+        self.params.on_logits = Some(Arc::new(cb));
         self
     }
     pub fn build(self) -> WhisperParams {

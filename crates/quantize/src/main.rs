@@ -91,13 +91,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 4. Write Vocab
-    let n_vocab_file = model.vocab.id_to_token.len().min(50257);
+    let n_vocab_file = model.vocab.token_bytes.len().min(50257);
     writer.write_i32::<LittleEndian>(n_vocab_file as i32)?;
-    for i in 0..n_vocab_file {
-        let tok = &model.vocab.id_to_token[i];
-        let bytes = tok.as_bytes();
-        writer.write_u32::<LittleEndian>(bytes.len() as u32)?;
-        writer.write_all(bytes)?;
+    for token in model.vocab.token_bytes.iter().take(n_vocab_file) {
+        writer.write_u32::<LittleEndian>(token.len() as u32)?;
+        writer.write_all(token)?;
     }
 
     // 5. Write Tensors

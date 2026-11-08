@@ -4,10 +4,51 @@
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr;
+use std::sync::Arc;
 use whisper_rs::model::header::ModelType;
 use whisper_rs::model::vocab::{lang_id, lang_str};
 use whisper_rs::model::WhisperModel;
 use whisper_rs::{WhisperContext, WhisperParams, WhisperState};
+
+/// Raw pointer wrapper for C callbacks stored in `Send + Sync` closures.
+struct SendPtr<T>(*mut T);
+
+impl<T> Clone for SendPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for SendPtr<T> {}
+
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+
+impl<T> SendPtr<T> {
+    fn get(&self) -> *mut T {
+        self.0
+    }
+
+    unsafe fn as_ref(&self) -> &T {
+        &*self.0
+    }
+}
+
+fn merge_timings(dst: &mut whisper_rs::Timings, src: &whisper_rs::Timings) {
+    dst.mel_us += src.mel_us;
+    dst.sample_us += src.sample_us;
+    dst.encode_us += src.encode_us;
+    dst.decode_us += src.decode_us;
+    dst.batchd_us += src.batchd_us;
+    dst.prompt_us += src.prompt_us;
+    dst.n_sample += src.n_sample;
+    dst.n_encode += src.n_encode;
+    dst.n_decode += src.n_decode;
+    dst.n_batchd += src.n_batchd;
+    dst.n_prompt += src.n_prompt;
+    dst.n_fail_p += src.n_fail_p;
+    dst.n_fail_h += src.n_fail_h;
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -47,6 +88,7 @@ pub struct whisper_vad_context {
     pub probs: Vec<f32>,
     pub model_path: Option<String>,
     pub samples_cache: Vec<f32>,
+    pub silero: Option<whisper_vad::SileroVad>,
 }
 
 #[allow(non_camel_case_types)]
@@ -408,9 +450,9 @@ unsafe fn init_context_from_model(
     let token_to_str_cache = inner
         .model
         .vocab
-        .id_to_token
+        .token_bytes
         .iter()
-        .map(|s| CString::new(s.as_str()).unwrap_or_else(|_| CString::new("").unwrap()))
+        .map(|bytes| CString::new(bytes.clone()).unwrap_or_else(|_| CString::new("").unwrap()))
         .collect();
 
     let ctx = Box::new(whisper_context {
@@ -424,6 +466,163 @@ unsafe fn init_context_from_model(
     });
 
     Box::into_raw(ctx)
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct whisper_model_loader {
+    pub context: *mut c_void,
+    pub read: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> usize>,
+    pub eof: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+    pub close: Option<unsafe extern "C" fn(*mut c_void)>,
+}
+
+/// Drain a `whisper_model_loader` into memory. The ABI streams the GGML file,
+/// but the Rust loader indexes the whole buffer, so the bytes are collected
+/// first and the loader is closed once, including on a short or failed read.
+unsafe fn read_loader_bytes(loader: *mut whisper_model_loader) -> Option<Vec<u8>> {
+    if loader.is_null() {
+        return None;
+    }
+    let loader = &*loader;
+    let read = loader.read?;
+
+    let mut bytes = Vec::new();
+    let mut chunk = vec![0u8; 1 << 20];
+
+    loop {
+        // The reference file/buffer loaders can return the requested size even
+        // on a short read; `eof` is the authoritative end marker. Checking it
+        // also prevents a loader that never returns 0 from spinning forever.
+        if let Some(eof) = loader.eof {
+            if eof(loader.context) {
+                break;
+            }
+        }
+
+        let n = read(loader.context, chunk.as_mut_ptr().cast(), chunk.len());
+        if n == 0 {
+            break;
+        }
+        if n > chunk.len() {
+            if let Some(close) = loader.close {
+                close(loader.context);
+            }
+            return None;
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+
+    if let Some(close) = loader.close {
+        close(loader.context);
+    }
+
+    Some(bytes)
+}
+
+struct LoaderReader<'a> {
+    loader: &'a whisper_model_loader,
+}
+
+impl std::io::Read for LoaderReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.loader.read.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "loader has no read callback",
+            )
+        })?;
+        let n = unsafe { read(self.loader.context, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "loader returned more bytes than requested",
+            ));
+        }
+        Ok(n)
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_init_with_params_no_state(
+    loader: *mut whisper_model_loader,
+    params: whisper_context_params,
+) -> *mut whisper_context {
+    if loader.is_null() {
+        return ptr::null_mut();
+    }
+
+    let loader_ref = &*loader;
+    let mut reader = LoaderReader { loader: loader_ref };
+    let result = WhisperModel::load_from_reader(&mut reader, || {
+        loader_ref.eof.is_some_and(|eof| eof(loader_ref.context))
+    });
+
+    if let Some(close) = loader_ref.close {
+        close(loader_ref.context);
+    }
+
+    let model = match result {
+        Ok(model) => model,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    init_context_from_model(model, false, params)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_init_with_params(
+    loader: *mut whisper_model_loader,
+    params: whisper_context_params,
+) -> *mut whisper_context {
+    let ctx = whisper_init_with_params_no_state(loader, params);
+    if ctx.is_null() {
+        return ctx;
+    }
+
+    let state = whisper_init_state(ctx);
+    if state.is_null() {
+        whisper_free(ctx);
+        return ptr::null_mut();
+    }
+    (*ctx).default_state = Some(Box::from_raw(state));
+
+    ctx
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_init(loader: *mut whisper_model_loader) -> *mut whisper_context {
+    whisper_init_with_params(loader, whisper_context_default_params())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_init_no_state(
+    loader: *mut whisper_model_loader,
+) -> *mut whisper_context {
+    whisper_init_with_params_no_state(loader, whisper_context_default_params())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_ctx_init_openvino_encoder_with_state(
+    _ctx: *mut whisper_context,
+    _state: *mut whisper_state,
+    _model_path: *const c_char,
+    _device: *const c_char,
+    _cache_dir: *const c_char,
+) -> c_int {
+    // whisper.cpp returns 1 when built without OpenVINO, and this port never
+    // links OpenVINO. Callers use a non-zero return to keep the CPU path.
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_ctx_init_openvino_encoder(
+    _ctx: *mut whisper_context,
+    _model_path: *const c_char,
+    _device: *const c_char,
+    _cache_dir: *const c_char,
+) -> c_int {
+    1
 }
 
 #[no_mangle]
@@ -568,22 +767,130 @@ pub unsafe extern "C" fn whisper_free_state(state: *mut whisper_state) {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn whisper_full_with_state(
+unsafe fn wrap_progress_callback(
     ctx: *mut whisper_context,
     state: *mut whisper_state,
-    params: whisper_full_params,
-    samples: *const f32,
-    n_samples: c_int,
-) -> c_int {
-    if ctx.is_null() || state.is_null() || samples.is_null() || n_samples <= 0 {
-        return -1;
+    params: &whisper_full_params,
+) -> Option<whisper_rs::params::ProgressCallback> {
+    if params.progress_callback.is_null() {
+        return None;
     }
+    let callback = SendPtr(params.progress_callback as *mut c_void);
+    let ctx_ptr = SendPtr(ctx);
+    let state_ptr = SendPtr(state);
+    let user_data = SendPtr(params.progress_callback_user_data);
 
-    let context = &*ctx;
-    let state_ref = &mut *state;
+    Some(Arc::new(move |progress: i32| {
+        type Cb = extern "C" fn(*mut whisper_context, *mut whisper_state, c_int, *mut c_void);
+        let cb: Cb = std::mem::transmute(callback.get());
+        cb(ctx_ptr.get(), state_ptr.get(), progress, user_data.get());
+    }))
+}
 
-    let sample_slice = std::slice::from_raw_parts(samples, n_samples as usize);
+unsafe fn wrap_abort_callback(params: &whisper_full_params) -> Option<whisper_rs::AbortCallback> {
+    if params.abort_callback.is_null() {
+        return None;
+    }
+    let callback = SendPtr(params.abort_callback as *mut c_void);
+    let user_data = SendPtr(params.abort_callback_user_data);
+
+    Some(Arc::new(move || {
+        type Cb = extern "C" fn(*mut c_void) -> bool;
+        let cb: Cb = std::mem::transmute(callback.get());
+        cb(user_data.get())
+    }))
+}
+
+unsafe fn wrap_encoder_begin_callback(
+    ctx: *mut whisper_context,
+    state: *mut whisper_state,
+    params: &whisper_full_params,
+) -> Option<whisper_rs::EncoderBeginCallback> {
+    if params.encoder_begin_callback.is_null() {
+        return None;
+    }
+    let callback = SendPtr(params.encoder_begin_callback as *mut c_void);
+    let ctx_ptr = SendPtr(ctx);
+    let state_ptr = SendPtr(state);
+    let user_data = SendPtr(params.encoder_begin_callback_user_data);
+
+    Some(Arc::new(move || {
+        type Cb = extern "C" fn(*mut whisper_context, *mut whisper_state, *mut c_void) -> bool;
+        let cb: Cb = std::mem::transmute(callback.get());
+        cb(ctx_ptr.get(), state_ptr.get(), user_data.get())
+    }))
+}
+
+unsafe fn wrap_logits_callback(
+    ctx: *mut whisper_context,
+    state: *mut whisper_state,
+    params: &whisper_full_params,
+) -> Option<whisper_rs::LogitsCallback> {
+    if params.logits_filter_callback.is_null() {
+        return None;
+    }
+    let callback = SendPtr(params.logits_filter_callback as *mut c_void);
+    let ctx_ptr = SendPtr(ctx);
+    let state_ptr = SendPtr(state);
+    let user_data = SendPtr(params.logits_filter_callback_user_data);
+
+    Some(Arc::new(move |tokens: &[i32], logits: &mut [f32]| {
+        type Cb = extern "C" fn(
+            *mut whisper_context,
+            *mut whisper_state,
+            *const whisper_token_data,
+            c_int,
+            *mut f32,
+            *mut c_void,
+        );
+        let cb: Cb = std::mem::transmute(callback.get());
+        let token_data: Vec<whisper_token_data> = tokens
+            .iter()
+            .map(|&id| whisper_token_data {
+                id,
+                tid: id,
+                p: 0.0,
+                plog: 0.0,
+                pt: 0.0,
+                ptsum: 0.0,
+                t0: 0,
+                t1: 0,
+                t_dtw: 0,
+                vlen: 0.0,
+            })
+            .collect();
+        cb(
+            ctx_ptr.get(),
+            state_ptr.get(),
+            token_data.as_ptr(),
+            token_data.len() as c_int,
+            logits.as_mut_ptr(),
+            user_data.get(),
+        );
+    }))
+}
+
+/// Translate the C parameter struct into the engine representation.
+///
+/// Kept separate from `whisper_full_with_state` so `whisper_full_parallel` can
+/// apply the same mapping to every chunk instead of hand-picking fields.
+unsafe fn build_rust_params(
+    ctx: *mut whisper_context,
+    state: *mut whisper_state,
+    params: &whisper_full_params,
+) -> WhisperParams {
+    let on_progress = wrap_progress_callback(ctx, state, params);
+    let abort_callback = wrap_abort_callback(params);
+    let on_encoder_begin = wrap_encoder_begin_callback(ctx, state, params);
+    let on_logits = wrap_logits_callback(ctx, state, params);
+    let vad_model_path = if params.vad_model.is_null() {
+        None
+    } else {
+        CStr::from_ptr(params.vad_model)
+            .to_str()
+            .ok()
+            .map(|path| path.to_string())
+    };
 
     let lang_str = if !params.language.is_null() {
         CStr::from_ptr(params.language)
@@ -638,7 +945,7 @@ pub unsafe extern "C" fn whisper_full_with_state(
     // caller sees a flag "accepted" and silently ignored. `max_len` and
     // `split_on_word` used to be dropped here, which is exactly the complaint in
     // ggml-org/whisper.cpp#460 for the Go bindings.
-    let rust_params = WhisperParams {
+    WhisperParams {
         language: lang_str,
         translate: params.translate,
         temperature: params.temperature,
@@ -676,12 +983,36 @@ pub unsafe extern "C" fn whisper_full_with_state(
         vad_min_speech_duration_ms: params.vad_params.min_speech_duration_ms.max(0) as usize,
         vad_min_silence_duration_ms: params.vad_params.min_silence_duration_ms.max(0) as usize,
         vad_speech_pad_ms: params.vad_params.speech_pad_ms.max(0) as usize,
+        vad_model_path,
+        on_progress,
+        abort_callback,
+        on_encoder_begin,
+        on_logits,
         // `grammar_rules` is a parsed C rule table, which this port does not
         // consume; callers pass GBNF source through the Rust API instead.
         ..Default::default()
-    };
+    }
+}
 
-    let t_start = std::time::Instant::now();
+#[no_mangle]
+pub unsafe extern "C" fn whisper_full_with_state(
+    ctx: *mut whisper_context,
+    state: *mut whisper_state,
+    params: whisper_full_params,
+    samples: *const f32,
+    n_samples: c_int,
+) -> c_int {
+    if ctx.is_null() || state.is_null() || samples.is_null() || n_samples <= 0 {
+        return -1;
+    }
+
+    let context = &*ctx;
+    let state_ref = &mut *state;
+
+    let sample_slice = std::slice::from_raw_parts(samples, n_samples as usize);
+
+    let rust_params = build_rust_params(ctx, state, &params);
+
     if context
         .inner
         .full(&mut state_ref.inner, &rust_params, sample_slice)
@@ -689,10 +1020,6 @@ pub unsafe extern "C" fn whisper_full_with_state(
     {
         return -2;
     }
-    let total_ms = t_start.elapsed().as_secs_f32() * 1000.0;
-    (*ctx).timings.sample_ms += total_ms * 0.05;
-    (*ctx).timings.encode_ms += total_ms * 0.70;
-    (*ctx).timings.decode_ms += total_ms * 0.25;
 
     // Refresh CString cache for segments and tokens
     state_ref.segment_c_strings.clear();
@@ -703,19 +1030,28 @@ pub unsafe extern "C" fn whisper_full_with_state(
 
         let mut tok_cstrs = Vec::new();
         for &tok_id in &seg.tokens {
-            let tok_str = context.inner.tokenizer.id_to_token(tok_id).unwrap_or("");
-            tok_cstrs.push(CString::new(tok_str).unwrap_or_else(|_| CString::new("").unwrap()));
+            let bytes = context
+                .inner
+                .model
+                .vocab
+                .id_to_token_bytes(tok_id)
+                .unwrap_or(&[]);
+            tok_cstrs
+                .push(CString::new(bytes.to_vec()).unwrap_or_else(|_| CString::new("").unwrap()));
         }
         state_ref.token_c_strings.push(tok_cstrs);
     }
-    // Invoke new_segment_callback if provided
-    if !params.new_segment_callback.is_null() {
+    // The callback contract is `n_new` new segments since the previous call.
+    // This path delivers after decoding, so all segments are new at once; a
+    // single call lets the canonical `n_segments - n_new` index address them.
+    let n_segments = state_ref.inner.segments.len();
+    if !params.new_segment_callback.is_null() && n_segments > 0 {
         type NewSegCb = extern "C" fn(*mut whisper_context, *mut whisper_state, c_int, *mut c_void);
         let cb: NewSegCb = std::mem::transmute(params.new_segment_callback);
         cb(
             ctx,
             state,
-            state_ref.inner.segments.len() as c_int,
+            n_segments as c_int,
             params.new_segment_callback_user_data,
         );
     }
@@ -752,96 +1088,167 @@ pub unsafe extern "C" fn whisper_full_parallel(
         return -1;
     }
 
+    // Resource guard: each processor owns a KV cache, workspace, and segment
+    // buffer. Upstream leaves this caller-controlled; cap it like the previous
+    // implementation so a bad value cannot spawn thousands of threads.
     let n_procs = n_processors.clamp(1, 16) as usize;
-    if n_procs <= 1 {
+    if n_procs == 1 {
         return whisper_full(ctx, params, samples, n_samples);
     }
 
-    let sample_slice = std::slice::from_raw_parts(samples, n_samples as usize);
+    // VAD rewrites the sample stream before chunking in whisper.cpp. The engine
+    // keeps VAD internal to `full()`, so falling back to the serial path keeps
+    // the transcript correct instead of splitting a stream the engine has not
+    // produced.
+    if params.vad {
+        return whisper_full(ctx, params, samples, n_samples);
+    }
+
     let context = &*ctx;
+    let sample_slice = std::slice::from_raw_parts(samples, n_samples as usize);
+    let offset_samples = (16000i64 * params.offset_ms.max(0) as i64 / 1000) as usize;
 
-    // 30-second audio windows (480,000 samples)
-    let chunk_size = 16000 * 30;
-    let n_chunks = sample_slice.len().div_ceil(chunk_size);
-
-    if n_chunks <= 1 {
-        return whisper_full(ctx, params, samples, n_samples);
+    if offset_samples >= sample_slice.len() {
+        return -1;
     }
 
-    use rayon::prelude::*;
-
-    let lang_str = if !params.language.is_null() {
-        CStr::from_ptr(params.language)
-            .to_str()
-            .unwrap_or("auto")
-            .to_string()
-    } else {
-        "auto".to_string()
-    };
-    let translate = params.translate;
-    let temperature = params.temperature;
-    let no_timestamps = params.no_timestamps;
-
-    let chunk_results: Vec<Vec<whisper_rs::Segment>> = (0..n_chunks)
-        .into_par_iter()
-        .map(|chunk_idx| {
-            let start = chunk_idx * chunk_size;
-            let end = (start + chunk_size).min(sample_slice.len());
-            let chunk_samples = &sample_slice[start..end];
-            let time_offset = start as f64 / 16000.0;
-
-            let mut state = context.inner.create_state();
-            let rust_params = whisper_rs::WhisperParams {
-                language: lang_str.clone(),
-                translate,
-                temperature,
-                beam_size: 1,
-                no_timestamps,
-                n_threads: 1,
-                ..Default::default()
-            };
-
-            if context
-                .inner
-                .full(&mut state, &rust_params, chunk_samples)
-                .is_ok()
-            {
-                let mut segs = state.segments;
-                for s in &mut segs {
-                    s.t0 += time_offset;
-                    s.t1 += time_offset;
-                    for w in &mut s.words {
-                        w.t0 += time_offset;
-                        w.t1 += time_offset;
-                    }
-                }
-                segs
-            } else {
-                Vec::new()
-            }
-        })
-        .collect();
+    // whisper.cpp divides the post-offset audio into equal chunks and gives the
+    // final worker every remaining sample. The main thread takes the first
+    // chunk (including the offset samples) so its timestamps are absolute.
+    let n_samples_per_processor = (sample_slice.len() - offset_samples) / n_procs;
+    // The engine ignores inputs shorter than 100 ms; splitting below that
+    // threshold would silently return an empty transcript for every worker.
+    if n_samples_per_processor < 1600 {
+        return whisper_full(ctx, params, samples, n_samples);
+    }
 
     let default_state_ref = match (*ctx).default_state.as_mut() {
         Some(st) => st.as_mut(),
         None => return -1,
     };
-    default_state_ref.inner.segments.clear();
+
+    let main_params = build_rust_params(ctx, default_state_ref as *mut whisper_state, &params);
+    let params_ptr = SendPtr(&params as *const whisper_full_params as *mut whisper_full_params);
+    let ctx_ptr = SendPtr(ctx);
+
+    let main_len = offset_samples + n_samples_per_processor;
+    let main_samples = &sample_slice[..main_len];
+
+    let (main_result, worker_results) = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(n_procs.saturating_sub(1));
+
+        for i in 0..n_procs - 1 {
+            let start = offset_samples + (i + 1) * n_samples_per_processor;
+            let end = if i == n_procs - 2 {
+                sample_slice.len()
+            } else {
+                start + n_samples_per_processor
+            };
+            let chunk = &sample_slice[start..end];
+            let inner = &context.inner;
+
+            handles.push(scope.spawn(move || {
+                let mut state = whisper_state {
+                    inner: inner.create_state(),
+                    segment_c_strings: Vec::new(),
+                    token_c_strings: Vec::new(),
+                };
+                let state_ptr = &mut state as *mut whisper_state;
+                let mut params_cur =
+                    unsafe { build_rust_params(ctx_ptr.get(), state_ptr, params_ptr.as_ref()) };
+                params_cur.offset_ms = 0;
+                params_cur.on_new_segment = None;
+                params_cur.on_progress = None;
+
+                inner
+                    .full(&mut state.inner, &params_cur, chunk)
+                    .map(|_| {
+                        let segments = state.inner.segments;
+                        let timings = state.inner.timings;
+                        (segments, timings)
+                    })
+                    .map_err(|_| ())
+            }));
+        }
+
+        let main_result = context
+            .inner
+            .full(&mut default_state_ref.inner, &main_params, main_samples)
+            .map_err(|_| ());
+
+        let worker_results: Vec<Result<(Vec<whisper_rs::Segment>, whisper_rs::Timings), ()>> =
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or(Err(())))
+                .collect();
+
+        (main_result, worker_results)
+    });
+
+    if main_result.is_err() {
+        return -2;
+    }
+
+    for (i, result) in worker_results.into_iter().enumerate() {
+        let (segments, timings) = match result {
+            Ok(result) => result,
+            Err(_) => continue,
+        };
+        merge_timings(&mut default_state_ref.inner.timings, &timings);
+
+        // Worker i (0-based here) processed the chunk starting at
+        // offset + (i + 1) * n_samples_per_processor.
+        let shift = (offset_samples + (i + 1) * n_samples_per_processor) as f64 / 16000.0;
+        for mut segment in segments {
+            segment.t0 += shift;
+            segment.t1 += shift;
+            for word in &mut segment.words {
+                word.t0 += shift;
+                word.t1 += shift;
+            }
+
+            // Keep the merged timeline monotonic, as the reference does.
+            if let Some(last) = default_state_ref.inner.segments.last() {
+                segment.t0 = segment.t0.max(last.t1);
+            }
+            default_state_ref.inner.segments.push(segment);
+        }
+    }
+
+    // Rebuild the C string views over the merged segment list.
     default_state_ref.segment_c_strings.clear();
     default_state_ref.token_c_strings.clear();
+    for seg in &default_state_ref.inner.segments {
+        let c_str = CString::new(seg.text.clone()).unwrap_or_else(|_| CString::new("").unwrap());
+        default_state_ref.segment_c_strings.push(c_str);
 
-    for segs in chunk_results {
-        for s in segs {
-            let c_str = CString::new(s.text.clone()).unwrap_or_else(|_| CString::new("").unwrap());
-            default_state_ref.segment_c_strings.push(c_str);
-            let mut tok_cstrs = Vec::new();
-            for &tok_id in &s.tokens {
-                let tok_str = context.inner.tokenizer.id_to_token(tok_id).unwrap_or("");
-                tok_cstrs.push(CString::new(tok_str).unwrap_or_else(|_| CString::new("").unwrap()));
-            }
-            default_state_ref.token_c_strings.push(tok_cstrs);
-            default_state_ref.inner.segments.push(s);
+        let mut tok_cstrs = Vec::new();
+        for &tok_id in &seg.tokens {
+            let bytes = context
+                .inner
+                .model
+                .vocab
+                .id_to_token_bytes(tok_id)
+                .unwrap_or(&[]);
+            tok_cstrs
+                .push(CString::new(bytes.to_vec()).unwrap_or_else(|_| CString::new("").unwrap()));
         }
+        default_state_ref.token_c_strings.push(tok_cstrs);
+    }
+
+    // The main chunk bypasses `whisper_full_with_state`; all merged segments are
+    // new when this post-run callback fires, so report them in one call. The
+    // canonical `n_segments - n_new` index then covers the whole list.
+    let n_segments = default_state_ref.inner.segments.len();
+    if !params.new_segment_callback.is_null() && n_segments > 0 {
+        type NewSegCb = extern "C" fn(*mut whisper_context, *mut whisper_state, c_int, *mut c_void);
+        let cb: NewSegCb = std::mem::transmute(params.new_segment_callback);
+        cb(
+            ctx,
+            default_state_ref as *mut whisper_state,
+            n_segments as c_int,
+            params.new_segment_callback_user_data,
+        );
     }
 
     0
@@ -1346,21 +1753,32 @@ pub unsafe extern "C" fn whisper_tokenize(
     tokens: *mut c_int,
     n_max_tokens: c_int,
 ) -> c_int {
-    if ctx.is_null() || text.is_null() || tokens.is_null() || n_max_tokens <= 0 {
+    if ctx.is_null() || text.is_null() {
         return 0;
     }
     let context = &*ctx;
-    let text_str = match CStr::from_ptr(text).to_str() {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
+    let text_bytes = CStr::from_ptr(text).to_bytes();
+    let token_ids = context.inner.tokenizer.encode_bytes(text_bytes);
+    let count = token_ids.len() as c_int;
 
-    let token_ids = context.inner.tokenizer.encode(text_str);
-    let count = token_ids.len().min(n_max_tokens as usize);
-    for (i, &tok_id) in token_ids.iter().take(count).enumerate() {
+    // whisper.h promises a negative result carrying the required size instead
+    // of silently truncating. A null destination is only valid in count mode.
+    if n_max_tokens < 0 || tokens.is_null() || count > n_max_tokens {
+        return -count;
+    }
+
+    for (i, &tok_id) in token_ids.iter().enumerate() {
         *tokens.add(i) = tok_id;
     }
-    count as c_int
+    count
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_token_count(
+    ctx: *mut whisper_context,
+    text: *const c_char,
+) -> c_int {
+    -whisper_tokenize(ctx, text, ptr::null_mut(), 0)
 }
 
 #[no_mangle]
@@ -1422,7 +1840,7 @@ pub unsafe extern "C" fn whisper_pcm_to_mel_with_state(
         context.inner.model.filters.n_mel,
     );
     state_ref.inner.mel = Some(mel);
-    (*ctx).timings.sample_ms += t_start.elapsed().as_secs_f32() * 1000.0;
+    state_ref.inner.timings.mel_us += t_start.elapsed().as_micros() as u64;
     0
 }
 
@@ -1502,31 +1920,46 @@ pub unsafe extern "C" fn whisper_lang_auto_detect(
 pub unsafe extern "C" fn whisper_lang_auto_detect_with_state(
     ctx: *mut whisper_context,
     state: *mut whisper_state,
-    _offset_ms: c_int,
+    offset_ms: c_int,
     _n_threads: c_int,
     lang_probs: *mut f32,
 ) -> c_int {
-    if ctx.is_null() {
+    if ctx.is_null() || offset_ms < 0 {
         return -1;
     }
-    let context = &*ctx;
-    let st = if !state.is_null() {
-        &(*state).inner
-    } else if let Some(ref default_st) = context.default_state {
-        &default_st.inner
+    let state_ptr = if !state.is_null() {
+        state
     } else {
-        return -1;
+        match (*ctx).default_state.as_mut() {
+            Some(st) => &mut **st as *mut whisper_state,
+            None => return -1,
+        }
     };
+    let context = &*ctx;
+    let st = &mut *state_ptr;
 
-    let mel = match &st.mel {
+    let seek = (offset_ms / 10) as usize;
+    let mel = match &st.inner.mel {
         Some(m) => m,
         None => return -1,
     };
 
+    if seek >= mel.n_len_org {
+        return -2;
+    }
+
+    let n_audio_ctx = context.inner.model.hparams.n_audio_ctx as usize;
+    let mel_chunk = mel.get_chunk(seek, n_audio_ctx);
+    st.inner.encoder_output = context.inner.encoder.forward(&mel_chunk);
+    // The encoder output changed, so cross-attention projections cached from a
+    // previous window must not be reused.
+    st.inner.cache.invalidate_cross();
+
     let max_langs = whisper_lang_max_id() as usize + 1;
     let mut probs = vec![0.0f32; max_langs];
-
-    let (_code, best_idx, _prob) = context.inner.detect_language_probs(mel, Some(&mut probs));
+    let (_, best_idx, _) = context
+        .inner
+        .detect_language_probs_with_enc(&st.inner.encoder_output, Some(&mut probs));
 
     if !lang_probs.is_null() {
         let slice = std::slice::from_raw_parts_mut(lang_probs, max_langs);
@@ -1561,7 +1994,10 @@ pub unsafe extern "C" fn whisper_encode_with_state(
     // New audio invalidates the cross-attention projections that the previous
     // window left in the cache, even if both windows have the same length.
     state_ref.inner.cache.invalidate_cross();
-    (*ctx).timings.encode_ms += t_start.elapsed().as_secs_f32() * 1000.0;
+    state_ref
+        .inner
+        .timings
+        .add_encode(t_start.elapsed().as_micros() as u64);
     0
 }
 
@@ -1621,7 +2057,10 @@ pub unsafe extern "C" fn whisper_decode_with_state(
     }));
     match res {
         Ok(()) => {
-            (*ctx).timings.decode_ms += t_start.elapsed().as_secs_f32() * 1000.0;
+            state_ref
+                .inner
+                .timings
+                .add_decode(t_start.elapsed().as_micros() as u64);
             0
         }
         Err(_) => -1,
@@ -1675,6 +2114,20 @@ pub unsafe extern "C" fn whisper_get_timings(ctx: *mut whisper_context) -> *mut 
     if ctx.is_null() {
         return ptr::null_mut();
     }
+    let t = (*ctx)
+        .default_state
+        .as_ref()
+        .map(|state| state.inner.timings)
+        .unwrap_or_default();
+    let per_run = |total_us: u64, runs: u32| 1e-3f32 * total_us as f32 / runs.max(1) as f32;
+
+    (*ctx).timings = whisper_timings {
+        sample_ms: per_run(t.sample_us, t.n_sample),
+        encode_ms: per_run(t.encode_us, t.n_encode),
+        decode_ms: per_run(t.decode_us, t.n_decode),
+        batchd_ms: per_run(t.batchd_us, t.n_batchd),
+        prompt_ms: per_run(t.prompt_us, t.n_prompt),
+    };
     &mut (*ctx).timings as *mut whisper_timings
 }
 
@@ -1683,10 +2136,41 @@ pub unsafe extern "C" fn whisper_print_timings(ctx: *mut whisper_context) {
     if ctx.is_null() {
         return;
     }
-    let t = &(*ctx).timings;
+    let t = (*ctx)
+        .default_state
+        .as_ref()
+        .map(|state| state.inner.timings)
+        .unwrap_or_default();
+    let ms = |total_us: u64| 1e-3f32 * total_us as f32;
+    let per_run = |total_us: u64, runs: u32| ms(total_us) / runs.max(1) as f32;
+
     let msg = format!(
-        "\nwhisper_print_timings:     load time =      0.00 ms\nwhisper_print_timings:     fallbacks =         0 p /         0 b\nwhisper_print_timings:      mel time =      0.00 ms\nwhisper_print_timings:   sample time = {:9.2} ms\nwhisper_print_timings:   encode time = {:9.2} ms\nwhisper_print_timings:   decode time = {:9.2} ms\nwhisper_print_timings:   batchd time = {:9.2} ms\nwhisper_print_timings:   prompt time = {:9.2} ms\n",
-        t.sample_ms, t.encode_ms, t.decode_ms, t.batchd_ms, t.prompt_ms
+        "\nwhisper_print_timings:     load time =      0.00 ms\n\
+         whisper_print_timings:     fallbacks = {:5} p / {:5} h\n\
+         whisper_print_timings:      mel time = {:9.2} ms\n\
+         whisper_print_timings:   sample time = {:9.2} ms / {:5} runs ( {:8.2} ms per run)\n\
+         whisper_print_timings:   encode time = {:9.2} ms / {:5} runs ( {:8.2} ms per run)\n\
+         whisper_print_timings:   decode time = {:9.2} ms / {:5} runs ( {:8.2} ms per run)\n\
+         whisper_print_timings:   batchd time = {:9.2} ms / {:5} runs ( {:8.2} ms per run)\n\
+         whisper_print_timings:   prompt time = {:9.2} ms / {:5} runs ( {:8.2} ms per run)\n",
+        t.n_fail_p,
+        t.n_fail_h,
+        ms(t.mel_us),
+        ms(t.sample_us),
+        t.n_sample,
+        per_run(t.sample_us, t.n_sample),
+        ms(t.encode_us),
+        t.n_encode,
+        per_run(t.encode_us, t.n_encode),
+        ms(t.decode_us),
+        t.n_decode,
+        per_run(t.decode_us, t.n_decode),
+        ms(t.batchd_us),
+        t.n_batchd,
+        per_run(t.batchd_us, t.n_batchd),
+        ms(t.prompt_us),
+        t.n_prompt,
+        per_run(t.prompt_us, t.n_prompt),
     );
     whisper_log(ggml_log_level::GGML_LOG_LEVEL_INFO, &msg);
 }
@@ -1695,6 +2179,9 @@ pub unsafe extern "C" fn whisper_print_timings(ctx: *mut whisper_context) {
 pub unsafe extern "C" fn whisper_reset_timings(ctx: *mut whisper_context) {
     if !ctx.is_null() {
         (*ctx).timings = whisper_timings::default();
+        if let Some(state) = (*ctx).default_state.as_mut() {
+            state.inner.reset_timings();
+        }
     }
 }
 
@@ -1706,11 +2193,31 @@ pub extern "C" fn whisper_log_set(log_callback: ggml_log_callback, user_data: *m
     }
 }
 
-static SYSTEM_INFO: &str = "whisper.rs: AVX2=1, FMA=1, NEON=1, MultiThreading=1\0";
+fn system_info_string() -> String {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let features = format!(
+        "AVX = {} | AVX2 = {} | FMA = {} | NEON = 0",
+        std::arch::is_x86_feature_detected!("avx") as u8,
+        std::arch::is_x86_feature_detected!("avx2") as u8,
+        std::arch::is_x86_feature_detected!("fma") as u8
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    let features = "AVX = 0 | AVX2 = 0 | FMA = 0 | NEON = 1".to_string();
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    let features = "AVX = 0 | AVX2 = 0 | FMA = 0 | NEON = 0".to_string();
+
+    format!("WHISPER : {}", features)
+}
+
+static SYSTEM_INFO: std::sync::LazyLock<CString> = std::sync::LazyLock::new(|| {
+    CString::new(system_info_string()).expect("system info must not contain NUL bytes")
+});
 
 #[no_mangle]
 pub extern "C" fn whisper_print_system_info() -> *const c_char {
-    SYSTEM_INFO.as_ptr() as *const c_char
+    SYSTEM_INFO.as_ptr()
 }
 
 #[no_mangle]
@@ -2145,17 +2652,53 @@ pub unsafe extern "C" fn whisper_vad_init_from_file_with_params(
     path: *const c_char,
     params: whisper_vad_context_params,
 ) -> *mut whisper_vad_context {
-    let model_path = if !path.is_null() {
-        CStr::from_ptr(path).to_str().ok().map(|s| s.to_string())
-    } else {
-        None
+    if path.is_null() {
+        return ptr::null_mut();
+    }
+    let path_str = match CStr::from_ptr(path).to_str() {
+        Ok(path) => path,
+        Err(_) => return ptr::null_mut(),
+    };
+    let bytes = match std::fs::read(path_str) {
+        Ok(bytes) => bytes,
+        Err(_) => return ptr::null_mut(),
+    };
+    let silero = match whisper_vad::SileroVad::from_bytes(&bytes) {
+        Ok(silero) => silero,
+        Err(_) => return ptr::null_mut(),
     };
 
     let ctx = Box::new(whisper_vad_context {
         params,
         probs: Vec::new(),
-        model_path,
+        model_path: Some(path_str.to_string()),
         samples_cache: Vec::new(),
+        silero: Some(silero),
+    });
+
+    Box::into_raw(ctx)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn whisper_vad_init_with_params(
+    loader: *mut whisper_model_loader,
+    params: whisper_vad_context_params,
+) -> *mut whisper_vad_context {
+    let bytes = match read_loader_bytes(loader) {
+        Some(bytes) if !bytes.is_empty() => bytes,
+        _ => return ptr::null_mut(),
+    };
+    let silero = match whisper_vad::SileroVad::from_bytes(&bytes) {
+        Ok(silero) => silero,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let ctx = Box::new(whisper_vad_context {
+        params,
+        probs: Vec::new(),
+        model_path: None,
+        samples_cache: Vec::new(),
+        silero: Some(silero),
     });
 
     Box::into_raw(ctx)
@@ -2174,66 +2717,8 @@ pub unsafe extern "C" fn whisper_vad_detect_speech(
     samples: *const f32,
     n_samples: c_int,
 ) -> c_int {
-    if ctx.is_null() || samples.is_null() || n_samples <= 0 {
-        return 0;
-    }
-    let context = &mut *ctx;
-    let sample_slice = std::slice::from_raw_parts(samples, n_samples as usize);
-    context.samples_cache = sample_slice.to_vec();
-
-    let sample_rate = 16000;
-    let frame_len = (sample_rate * 30) / 1000; // 30ms window (480 samples @ 16kHz)
-    let frame_hop = (sample_rate * 10) / 1000; // 10ms hop (160 samples @ 16kHz)
-
-    if sample_slice.len() < frame_len {
-        context.probs.clear();
-        return 0;
-    }
-
-    let n_frames = (sample_slice.len() - frame_len) / frame_hop + 1;
-    let mut energies = Vec::with_capacity(n_frames);
-    for i in 0..n_frames {
-        let start = i * frame_hop;
-        let frame = &sample_slice[start..start + frame_len];
-        let mut sum_sq = 0.0f32;
-        for &s in frame {
-            sum_sq += s * s;
-        }
-        let rms = (sum_sq / frame_len as f32).sqrt();
-        energies.push(rms);
-    }
-
-    let mut sorted_energies = energies.clone();
-    sorted_energies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median_energy = sorted_energies[sorted_energies.len() / 2];
-    let dyn_threshold = (0.5f32 * 0.02).max(median_energy * 2.0);
-
-    context.probs = energies
-        .iter()
-        .map(|&e| {
-            if dyn_threshold > 0.0 {
-                (e / (e + dyn_threshold)).clamp(0.0, 1.0)
-            } else if e > 0.0 {
-                1.0
-            } else {
-                0.0
-            }
-        })
-        .collect();
-
-    let vad_params = whisper_vad::VadParams {
-        threshold: 0.5,
-        min_speech_duration_ms: 250,
-        min_silence_duration_ms: 100,
-        speech_pad_ms: 30,
-        sample_rate: 16000,
-    };
-    let segments = whisper_vad::detect_speech_segments(sample_slice, &vad_params);
-    if segments.is_empty() {
-        0
-    } else {
-        1
-    }
+    whisper_vad_reset_state(ctx);
+    whisper_vad_detect_speech_no_reset(ctx, samples, n_samples)
 }
 
 #[no_mangle]
@@ -2242,14 +2727,34 @@ pub unsafe extern "C" fn whisper_vad_detect_speech_no_reset(
     samples: *const f32,
     n_samples: c_int,
 ) -> c_int {
-    whisper_vad_detect_speech(ctx, samples, n_samples)
+    if ctx.is_null() || samples.is_null() || n_samples <= 0 {
+        return 0;
+    }
+    let context = &mut *ctx;
+    let sample_slice = std::slice::from_raw_parts(samples, n_samples as usize);
+
+    let probs = match context.silero.as_mut() {
+        Some(silero) => silero.detect_probs(sample_slice).to_vec(),
+        None => return 0,
+    };
+
+    context.probs = probs;
+    context.samples_cache = sample_slice.to_vec();
+
+    // The reference returns whether the graph ran, not whether speech was
+    // present. Callers inspect `probs` for the actual decision.
+    1
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn whisper_vad_reset_state(ctx: *mut whisper_vad_context) {
     if !ctx.is_null() {
-        (*ctx).probs.clear();
-        (*ctx).samples_cache.clear();
+        let context = &mut *ctx;
+        if let Some(silero) = context.silero.as_mut() {
+            silero.reset_state();
+        }
+        context.probs.clear();
+        context.samples_cache.clear();
     }
 }
 
@@ -2269,27 +2774,43 @@ pub unsafe extern "C" fn whisper_vad_probs(ctx: *mut whisper_vad_context) -> *mu
     (*ctx).probs.as_mut_ptr()
 }
 
+unsafe fn c_vad_params(params: &whisper_vad_params) -> whisper_vad::VadParams {
+    whisper_vad::VadParams {
+        threshold: params.threshold,
+        min_speech_duration_ms: params.min_speech_duration_ms.max(0) as usize,
+        min_silence_duration_ms: params.min_silence_duration_ms.max(0) as usize,
+        max_speech_duration_s: params.max_speech_duration_s,
+        speech_pad_ms: params.speech_pad_ms.max(0) as usize,
+        samples_overlap: params.samples_overlap,
+        sample_rate: 16000,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn whisper_vad_segments_from_samples(
-    _ctx: *mut whisper_vad_context,
+    ctx: *mut whisper_vad_context,
     params: whisper_vad_params,
     samples: *const f32,
     n_samples: c_int,
 ) -> *mut whisper_vad_segments {
-    if samples.is_null() || n_samples <= 0 {
+    if ctx.is_null() || samples.is_null() || n_samples <= 0 {
         return ptr::null_mut();
     }
+
+    let context = &*ctx;
+    if context.silero.is_some() {
+        if whisper_vad_detect_speech(ctx, samples, n_samples) == 0 {
+            return ptr::null_mut();
+        }
+        return whisper_vad_segments_from_probs(ctx, params);
+    }
+
+    // The energy detector remains available for contexts that do not carry a
+    // Silero model; it is not reachable through the file/loader constructors.
     let sample_slice = std::slice::from_raw_parts(samples, n_samples as usize);
-    let rust_params = whisper_vad::VadParams {
-        threshold: params.threshold,
-        min_speech_duration_ms: params.min_speech_duration_ms.max(0) as usize,
-        min_silence_duration_ms: params.min_silence_duration_ms.max(0) as usize,
-        speech_pad_ms: params.speech_pad_ms.max(0) as usize,
-        sample_rate: 16000,
-    };
+    let rust_params = c_vad_params(&params);
     let segments = whisper_vad::detect_speech_segments(sample_slice, &rust_params);
-    let segs = Box::new(whisper_vad_segments { segments });
-    Box::into_raw(segs)
+    Box::into_raw(Box::new(whisper_vad_segments { segments }))
 }
 
 #[no_mangle]
@@ -2301,42 +2822,26 @@ pub unsafe extern "C" fn whisper_vad_segments_from_probs(
         return ptr::null_mut();
     }
     let context = &*ctx;
+    let rust_params = c_vad_params(&params);
+
+    if let Some(silero) = &context.silero {
+        let segments =
+            whisper_vad::segments_from_probs(&context.probs, &rust_params, silero.n_window());
+        return Box::into_raw(Box::new(whisper_vad_segments { segments }));
+    }
+
     if !context.samples_cache.is_empty() {
-        whisper_vad_segments_from_samples(
+        return whisper_vad_segments_from_samples(
             ctx,
             params,
             context.samples_cache.as_ptr(),
             context.samples_cache.len() as c_int,
-        )
-    } else {
-        let frame_hop = 0.01;
-        let mut segments = Vec::new();
-        let mut in_speech = false;
-        let mut seg_start = 0;
-        let min_speech_frames = (params.min_speech_duration_ms as usize / 10).max(1);
-        for (i, &p) in context.probs.iter().enumerate() {
-            if p >= params.threshold && !in_speech {
-                in_speech = true;
-                seg_start = i;
-            } else if p < params.threshold && in_speech {
-                in_speech = false;
-                if i - seg_start >= min_speech_frames {
-                    segments.push(whisper_vad::SpeechSegment {
-                        t0: seg_start as f64 * frame_hop,
-                        t1: i as f64 * frame_hop + 0.03,
-                    });
-                }
-            }
-        }
-        if in_speech && context.probs.len() - seg_start >= min_speech_frames {
-            segments.push(whisper_vad::SpeechSegment {
-                t0: seg_start as f64 * frame_hop,
-                t1: context.probs.len() as f64 * frame_hop + 0.03,
-            });
-        }
-        let segs = Box::new(whisper_vad_segments { segments });
-        Box::into_raw(segs)
+        );
     }
+
+    Box::into_raw(Box::new(whisper_vad_segments {
+        segments: Vec::new(),
+    }))
 }
 
 #[no_mangle]
@@ -2386,5 +2891,368 @@ pub unsafe extern "C" fn whisper_vad_segments_get_segment_t1(
 pub unsafe extern "C" fn whisper_vad_free_segments(segments: *mut whisper_vad_segments) {
     if !segments.is_null() {
         drop(Box::from_raw(segments));
+    }
+}
+
+// =================================================================================================
+// Development benchmarks matching whisper.cpp's ggml helpers.
+// =================================================================================================
+
+static BENCH_MEMCPY_STRINGS: std::sync::LazyLock<std::sync::Mutex<Vec<CString>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+static BENCH_MUL_MAT_STRINGS: std::sync::LazyLock<std::sync::Mutex<Vec<CString>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Timed iterations per memcpy phase, matching `whisper.cpp`.
+const BENCH_MEMCPY_N: usize = 20;
+/// Bytes copied per iteration when at least one thread is requested (1 GB).
+const BENCH_MEMCPY_ARR: usize = 1024;
+
+/// Matrix sizes reported by the quantized matmul benchmark, matching `whisper.cpp`.
+const BENCH_MUL_MAT_SIZES: &[usize] = &[64, 128, 256, 512, 1024, 2048, 4096];
+/// Upper bound on timed runs per type and size, matching `whisper.cpp`.
+const BENCH_MUL_MAT_N_MAX: usize = 128;
+/// Wall-clock budget after which a type stops being timed, matching `whisper.cpp`.
+const BENCH_MUL_MAT_TIME_BUDGET: f64 = 1.0;
+
+const BENCH_MUL_MAT_TYPES: [whisper_tensor::DType; 7] = [
+    whisper_tensor::DType::Q4_0,
+    whisper_tensor::DType::Q4_1,
+    whisper_tensor::DType::Q5_0,
+    whisper_tensor::DType::Q5_1,
+    whisper_tensor::DType::Q8_0,
+    whisper_tensor::DType::F16,
+    whisper_tensor::DType::F32,
+];
+
+/// Retain a report and return a pointer that stays valid for the process lifetime.
+///
+/// `CString` owns its heap buffer, so growing the vector only moves the owning
+/// structs and never invalidates pointers handed out by earlier calls.
+fn store_c_string(
+    cache: &'static std::sync::LazyLock<std::sync::Mutex<Vec<CString>>>,
+    text: String,
+) -> *const c_char {
+    let c_text = CString::new(text).unwrap_or_else(|_| CString::new("").unwrap());
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.push(c_text);
+    cache.last().unwrap().as_ptr()
+}
+
+fn allocate_memcpy_buffers(size: usize) -> (Vec<u8>, Vec<u8>) {
+    let mut src = vec![0u8; size];
+    for (i, byte) in src.iter_mut().enumerate() {
+        *byte = i as u8;
+    }
+    (src, vec![0u8; size])
+}
+
+/// Mutate one source byte so the compiler cannot hoist the copy out of the loop.
+fn perturb_source(buf: &mut [u8], seed: u64) {
+    if buf.is_empty() {
+        return;
+    }
+    let mut state = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let index = ((state >> 33) as usize) % buf.len();
+    buf[index] = (state >> 17) as u8;
+}
+
+fn memcpy_checksum(bytes: &[u8]) -> f64 {
+    bytes.iter().map(|&byte| byte as f64).sum()
+}
+
+fn memcpy_gbps(n: usize, size: usize, seconds: f64) -> f64 {
+    if seconds > 0.0 {
+        (n as f64 * size as f64) / (seconds * 1e9)
+    } else {
+        0.0
+    }
+}
+
+fn bench_memcpy_report(n_threads: c_int) -> String {
+    let n = BENCH_MEMCPY_N;
+    // Upstream's trick: a non-positive thread count collapses the array to zero
+    // bytes, which keeps the report cheap while still exercising the code path.
+    let arr = if n_threads > 0 {
+        BENCH_MEMCPY_ARR
+    } else {
+        n_threads.max(0) as usize
+    };
+    let size = arr * 1_000_000;
+
+    let mut report = String::new();
+    let mut sum = 0.0f64;
+
+    // Heat-up pass.
+    {
+        let (mut src, mut dst) = allocate_memcpy_buffers(size);
+        dst.copy_from_slice(&src);
+
+        let mut tsum = 0.0f64;
+        for i in 0..n {
+            let t0 = std::time::Instant::now();
+            dst.copy_from_slice(&src);
+            tsum += t0.elapsed().as_secs_f64();
+            perturb_source(&mut src, i as u64);
+        }
+
+        report.push_str(&format!(
+            "memcpy: {:7.2} GB/s (heat-up)\n",
+            memcpy_gbps(n, size, tsum)
+        ));
+
+        std::hint::black_box(dst.as_slice());
+        sum += memcpy_checksum(&dst);
+    }
+
+    // Single-thread pass.
+    {
+        let (mut src, mut dst) = allocate_memcpy_buffers(size);
+        dst.copy_from_slice(&src);
+
+        let mut tsum = 0.0f64;
+        for i in 0..n {
+            let t0 = std::time::Instant::now();
+            dst.copy_from_slice(&src);
+            tsum += t0.elapsed().as_secs_f64();
+            perturb_source(&mut src, i as u64);
+        }
+
+        report.push_str(&format!(
+            "memcpy: {:7.2} GB/s ( 1 thread)\n",
+            memcpy_gbps(n, size, tsum)
+        ));
+
+        std::hint::black_box(dst.as_slice());
+        sum += memcpy_checksum(&dst);
+    }
+
+    // Multi-thread passes, one report line per requested thread count.
+    let k_max = n_threads.max(0) as usize;
+    for k in 1..=k_max {
+        let (mut src, mut dst) = allocate_memcpy_buffers(size);
+        dst.copy_from_slice(&src);
+
+        let mut src_rest: &mut [u8] = &mut src;
+        let mut dst_rest: &mut [u8] = &mut dst;
+        let mut parts = Vec::with_capacity(k);
+        for th in 0..k {
+            let start = (th as u128 * size as u128 / k as u128) as usize;
+            let end = ((th + 1) as u128 * size as u128 / k as u128) as usize;
+            let (src_chunk, src_tail) = src_rest.split_at_mut(end - start);
+            let (dst_chunk, dst_tail) = dst_rest.split_at_mut(end - start);
+            src_rest = src_tail;
+            dst_rest = dst_tail;
+            parts.push((src_chunk, dst_chunk));
+        }
+
+        let t0 = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            let (last_src, last_dst) = parts.pop().expect("k is at least one");
+            let last_th = parts.len();
+
+            for (th, (src_chunk, dst_chunk)) in parts.into_iter().enumerate() {
+                scope.spawn(move || {
+                    for i in 0..n {
+                        dst_chunk.copy_from_slice(src_chunk);
+                        perturb_source(src_chunk, ((th as u64) << 32) | i as u64);
+                    }
+                });
+            }
+
+            for i in 0..n {
+                last_dst.copy_from_slice(last_src);
+                perturb_source(last_src, ((last_th as u64) << 32) | i as u64);
+            }
+        });
+        let elapsed = t0.elapsed().as_secs_f64();
+
+        report.push_str(&format!(
+            "memcpy: {:7.2} GB/s ({:2} thread)\n",
+            memcpy_gbps(n, size, elapsed),
+            k
+        ));
+
+        std::hint::black_box(dst.as_slice());
+        sum += memcpy_checksum(&dst);
+    }
+
+    report.push_str(&format!("sum:    {:.6}\n", sum));
+    report
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_quantized_matmul(
+    weights: &[u8],
+    dtype: whisper_tensor::DType,
+    n: usize,
+    b: &[f32],
+    out: &mut [f32],
+    n_threads: usize,
+    pool: Option<&rayon::ThreadPool>,
+) {
+    let mut run = || {
+        whisper_tensor::ops::quantized_matmul(weights, dtype, n, n, b, n, out, n_threads);
+    };
+    match pool {
+        Some(pool) => pool.install(run),
+        None => run(),
+    }
+}
+
+fn bench_mul_mat_report(
+    sizes: &[usize],
+    n_max: usize,
+    n_threads: c_int,
+    time_budget: f64,
+) -> String {
+    let n_threads = if n_threads > 0 {
+        n_threads as usize
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    }
+    .clamp(1, 16);
+
+    // Rayon's global pool ignores the requested thread count, so install a
+    // dedicated pool for the duration of the benchmark.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build()
+        .ok();
+
+    let mut report = String::new();
+
+    for &n in sizes {
+        let mut gflops = [0.0f64; BENCH_MUL_MAT_TYPES.len()];
+        let mut runs = [0usize; BENCH_MUL_MAT_TYPES.len()];
+
+        for (k, dtype) in BENCH_MUL_MAT_TYPES.iter().enumerate() {
+            let weight_values: Vec<f32> = (0..n * n)
+                .map(|i| (((i * 37) % 23) as f32 - 11.0) * 0.03125)
+                .collect();
+            let weights = dtype
+                .quantize_from_f32(&weight_values)
+                .expect("benchmark weights must quantize");
+            let b: Vec<f32> = (0..n * n)
+                .map(|i| (((i * 13) % 17) as f32 - 8.0) * 0.0625)
+                .collect();
+            let mut out = vec![0.0f32; n * n];
+
+            // Heat-up.
+            run_quantized_matmul(&weights, *dtype, n, &b, &mut out, n_threads, pool.as_ref());
+
+            let mut tsum = 0.0f64;
+            let mut count = 0usize;
+            for _ in 0..n_max {
+                let t0 = std::time::Instant::now();
+                run_quantized_matmul(&weights, *dtype, n, &b, &mut out, n_threads, pool.as_ref());
+                tsum += t0.elapsed().as_secs_f64();
+                count += 1;
+
+                std::hint::black_box(out.as_slice());
+
+                if tsum > time_budget && count >= 3 {
+                    break;
+                }
+            }
+
+            runs[k] = count;
+            gflops[k] = if tsum > 0.0 {
+                (2.0 * (n * n * n) as f64 * count as f64) / tsum * 1e-9
+            } else {
+                0.0
+            };
+        }
+
+        report.push_str(&format!(
+            "{:4} x {:4}: Q4_0 {:7.1} GFLOPS ({:3} runs) | Q4_1 {:7.1} GFLOPS ({:3} runs)\n",
+            n, n, gflops[0], runs[0], gflops[1], runs[1]
+        ));
+        report.push_str(&format!(
+            "{:4} x {:4}: Q5_0 {:7.1} GFLOPS ({:3} runs) | Q5_1 {:7.1} GFLOPS ({:3} runs) | Q8_0 {:7.1} GFLOPS ({:3} runs)\n",
+            n, n, gflops[2], runs[2], gflops[3], runs[3], gflops[4], runs[4]
+        ));
+        report.push_str(&format!(
+            "{:4} x {:4}: F16  {:7.1} GFLOPS ({:3} runs) | F32  {:7.1} GFLOPS ({:3} runs)\n",
+            n, n, gflops[5], runs[5], gflops[6], runs[6]
+        ));
+    }
+
+    report
+}
+
+#[no_mangle]
+pub extern "C" fn whisper_bench_memcpy(n_threads: c_int) -> c_int {
+    eprint!("{}", bench_memcpy_report(n_threads));
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn whisper_bench_memcpy_str(n_threads: c_int) -> *const c_char {
+    store_c_string(&BENCH_MEMCPY_STRINGS, bench_memcpy_report(n_threads))
+}
+
+#[no_mangle]
+pub extern "C" fn whisper_bench_ggml_mul_mat(n_threads: c_int) -> c_int {
+    eprint!(
+        "{}",
+        bench_mul_mat_report(
+            BENCH_MUL_MAT_SIZES,
+            BENCH_MUL_MAT_N_MAX,
+            n_threads,
+            BENCH_MUL_MAT_TIME_BUDGET
+        )
+    );
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn whisper_bench_ggml_mul_mat_str(n_threads: c_int) -> *const c_char {
+    store_c_string(
+        &BENCH_MUL_MAT_STRINGS,
+        bench_mul_mat_report(
+            BENCH_MUL_MAT_SIZES,
+            BENCH_MUL_MAT_N_MAX,
+            n_threads,
+            BENCH_MUL_MAT_TIME_BUDGET,
+        ),
+    )
+}
+
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+
+    #[test]
+    fn memcpy_report_zero_threads_is_well_formed() {
+        let report = bench_memcpy_report(0);
+        assert!(report.contains("memcpy:"));
+        assert!(report.contains("sum:"));
+        assert_eq!(report.lines().count(), 3);
+    }
+
+    #[test]
+    fn mul_mat_report_formats_every_type() {
+        let report = bench_mul_mat_report(&[32], 3, 1, 0.0);
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("Q4_0") && lines[0].contains("Q4_1"));
+        assert!(lines[1].contains("Q5_0") && lines[1].contains("Q5_1"));
+        assert!(lines[1].contains("Q8_0"));
+        assert!(lines[2].contains("F16") && lines[2].contains("F32"));
+        for line in lines {
+            assert!(line.contains("GFLOPS"));
+            assert!(line.contains("runs)"));
+        }
     }
 }

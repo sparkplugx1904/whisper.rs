@@ -25,6 +25,30 @@ impl ModelStorage {
     }
 }
 
+/// Reader wrapper that records every byte consumed by the model parser.
+struct TeeReader<'a, R> {
+    inner: &'a mut R,
+    buffer: &'a mut Vec<u8>,
+}
+
+impl<R: Read> Read for TeeReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.buffer.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+}
+
+impl<R: Read> TeeReader<'_, R> {
+    /// Read tensor payload directly into the backing buffer, avoiding a second
+    /// allocation the size of the tensor.
+    fn read_data(&mut self, len: usize) -> std::io::Result<()> {
+        let start = self.buffer.len();
+        self.buffer.resize(start + len, 0);
+        self.inner.read_exact(&mut self.buffer[start..])
+    }
+}
+
 /// Zero-copy, non-owning view of a raw tensor directly from the model's backing storage.
 ///
 /// Holds a direct borrowed slice into the memory-mapped file or in-memory byte buffer,
@@ -244,6 +268,104 @@ impl WhisperModel {
 
     pub fn load_from_bytes(bytes: Vec<u8>) -> Result<Self, ModelError> {
         Self::load_from_storage(ModelStorage::Bytes(bytes))
+    }
+
+    /// Load a model from a streaming reader.
+    ///
+    /// `eof` is consulted before each tensor header because the C model-loader
+    /// contract lets `read` return the requested size even at end of file; the
+    /// callback is the authoritative end marker. Only the bytes that belong to
+    /// the model are retained, so a loader that over-reports its final read
+    /// does not leave trailing garbage in the backing storage.
+    pub fn load_from_reader<R: Read>(
+        reader: &mut R,
+        mut eof: impl FnMut() -> bool,
+    ) -> Result<Self, ModelError> {
+        let mut buffer = Vec::new();
+        let mut tensors = HashMap::new();
+        let mut total_weight_bytes = 0;
+
+        let (hparams, filters, vocab) = {
+            let mut tee = TeeReader {
+                inner: reader,
+                buffer: &mut buffer,
+            };
+
+            let hparams = Hyperparameters::read(&mut tee)?;
+            let filters = MelFilters::read(&mut tee)?;
+            let vocab = Vocab::read(&mut tee, &hparams)?;
+
+            loop {
+                if eof() {
+                    break;
+                }
+
+                let n_dims = match tee.read_i32::<LittleEndian>() {
+                    Ok(n_dims) => n_dims,
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(error) => return Err(ModelError::Io(error)),
+                };
+
+                // The reference loader checks eof after reading the header
+                // triple; a final over-reported read must not be parsed.
+                if eof() {
+                    break;
+                }
+
+                if !(0..=4).contains(&n_dims) {
+                    return Err(ModelError::FormatError(format!(
+                        "Invalid n_dims {} (expected 0..=4)",
+                        n_dims
+                    )));
+                }
+
+                let name_len = tee.read_i32::<LittleEndian>()? as usize;
+                let ttype_raw = tee.read_u32::<LittleEndian>()?;
+                let dtype = DType::from_u32(ttype_raw).map_err(|e| {
+                    ModelError::FormatError(format!("Invalid dtype {}: {}", ttype_raw, e))
+                })?;
+
+                let mut ne = Vec::with_capacity(n_dims as usize);
+                let mut numel = 1usize;
+                for _ in 0..n_dims {
+                    let dim = tee.read_i32::<LittleEndian>()? as usize;
+                    ne.push(dim);
+                    numel *= dim;
+                }
+
+                let mut name_buf = vec![0u8; name_len];
+                tee.read_exact(&mut name_buf)?;
+                let name = String::from_utf8_lossy(&name_buf).into_owned();
+
+                let byte_size = dtype.byte_size_for(numel);
+                let offset = tee.buffer.len();
+                tee.read_data(byte_size)?;
+
+                total_weight_bytes += byte_size;
+                tensors.insert(
+                    name.clone(),
+                    TensorInfo {
+                        name,
+                        n_dims: n_dims as usize,
+                        ne,
+                        dtype,
+                        offset,
+                        byte_size,
+                    },
+                );
+            }
+
+            (hparams, filters, vocab)
+        };
+
+        Ok(Self {
+            hparams,
+            filters,
+            vocab,
+            tensors,
+            total_weight_bytes,
+            storage: Arc::new(ModelStorage::Bytes(buffer)),
+        })
     }
 
     fn load_from_storage(storage: ModelStorage) -> Result<Self, ModelError> {
@@ -549,6 +671,7 @@ mod tests {
             vocab: Vocab {
                 token_to_id: HashMap::new(),
                 id_to_token: Vec::new(),
+                token_bytes: Vec::new(),
                 n_vocab: 51864,
                 token_eot: 50256,
                 token_sot: 50257,

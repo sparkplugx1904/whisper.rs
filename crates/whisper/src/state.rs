@@ -1,5 +1,6 @@
 use crate::decoder::{DecoderKvCache, DecoderWorkspace};
 use crate::segment::Segment;
+use crate::timing::Timings;
 
 pub struct WhisperState {
     pub cache: DecoderKvCache,
@@ -13,6 +14,9 @@ pub struct WhisperState {
     pub vad_segments: Vec<(usize, usize)>,
     pub lang_id: usize,
     pub lang_prob: f32,
+    /// Cumulative phase telemetry, matching `whisper_state` in whisper.cpp.
+    /// Survives [`WhisperState::clear`] and is only zeroed explicitly.
+    pub timings: Timings,
 }
 
 impl WhisperState {
@@ -27,10 +31,15 @@ impl WhisperState {
             vad_segments: Vec::new(),
             lang_id: 0,
             lang_prob: 0.0,
+            timings: Timings::default(),
         }
     }
 
     /// Reset state between transcriptions to reuse allocated buffers.
+    ///
+    /// Timing counters are intentionally left untouched: whisper.cpp keeps
+    /// accumulating them across `whisper_full` calls and only clears them when
+    /// the caller or the C API reports timings.
     pub fn clear(&mut self) {
         self.cache.clear();
         self.workspace.clear();
@@ -46,6 +55,11 @@ impl WhisperState {
     /// Clear VAD state when VAD is disabled (whisper.cpp PR #4122)
     pub fn clear_vad(&mut self) {
         self.vad_segments.clear();
+    }
+
+    /// Zero the accumulated phase telemetry.
+    pub fn reset_timings(&mut self) {
+        self.timings.reset();
     }
 
     pub fn segments(&self) -> &[Segment] {

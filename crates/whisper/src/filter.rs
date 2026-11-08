@@ -375,6 +375,29 @@ impl LogitFilter for GrammarLogitFilter {
     }
 }
 
+/// Adapter that forwards the current token history and mutable logits to a
+/// user-supplied callback.
+///
+/// whisper.cpp runs `logits_filter_callback` before its built-in filters, so
+/// this filter is added first in both the greedy and beam pipelines. The
+/// callback sees the raw decoder logits and may rewrite them; later filters
+/// then apply their suppressions on top.
+pub struct CallbackLogitFilter {
+    pub callback: crate::params::LogitsCallback,
+}
+
+impl CallbackLogitFilter {
+    pub fn new(callback: crate::params::LogitsCallback) -> Self {
+        Self { callback }
+    }
+}
+
+impl LogitFilter for CallbackLogitFilter {
+    fn apply(&self, logits: &mut [f32], ctx: &LogitFilterContext) {
+        (self.callback)(ctx.tokens_cur, logits);
+    }
+}
+
 /// Composable pipeline executing a sequence of `LogitFilter` strategies.
 #[derive(Default)]
 pub struct LogitFilterPipeline {

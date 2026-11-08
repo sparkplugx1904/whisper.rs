@@ -13,7 +13,9 @@
 //! audio.
 
 use crate::params::WhisperParams;
-use whisper_vad::{detect_speech_segments, VadParams};
+use whisper_vad::{
+    detect_speech_segments, segments_from_probs, SileroVad, SpeechSegment, VadParams,
+};
 
 /// Mel frames per second; the encoder consumes one frame per 10 ms of audio.
 const FRAMES_PER_SECOND: f64 = 100.0;
@@ -43,11 +45,24 @@ impl SpeechMap {
             threshold: params.vad_threshold,
             min_speech_duration_ms: params.vad_min_speech_duration_ms,
             min_silence_duration_ms: params.vad_min_silence_duration_ms,
+            max_speech_duration_s: f32::MAX,
             speech_pad_ms: params.vad_speech_pad_ms,
-            sample_rate: 16_000,
+            ..VadParams::default()
         };
 
-        let segments = detect_speech_segments(samples, &vad_params);
+        // The neural detector is strongly preferred when its model is
+        // available: it tolerates music and noise beds that the adaptive
+        // energy threshold mistakes for speech. A missing or corrupt model must
+        // never poison transcription, so every failure falls back to the
+        // dependency-free energy detector.
+        let segments = match params.vad_model_path.as_deref() {
+            Some(path) => match silero_speech_segments(samples, path, &vad_params) {
+                Some(segments) => segments,
+                None => detect_speech_segments(samples, &vad_params),
+            },
+            None => detect_speech_segments(samples, &vad_params),
+        };
+
         let mut ranges: Vec<(usize, usize)> = segments
             .iter()
             .map(|segment| {
@@ -111,6 +126,23 @@ impl SpeechMap {
             .iter()
             .any(|&(range_start, range_end)| range_start < end && start < range_end)
     }
+}
+
+/// Runs the Silero VAD model over `samples` and converts its probabilities into
+/// speech segments.
+///
+/// Returns `None` when the model file cannot be read or parsed, or when the
+/// model rejects the input, so the caller can fall back to the energy detector.
+fn silero_speech_segments(
+    samples: &[f32],
+    model_path: &str,
+    vad_params: &VadParams,
+) -> Option<Vec<SpeechSegment>> {
+    let bytes = std::fs::read(model_path).ok()?;
+    let mut silero = SileroVad::from_bytes(&bytes).ok()?;
+    let n_window = silero.n_window();
+    let probs = silero.detect_probs(samples);
+    Some(segments_from_probs(probs, vad_params, n_window))
 }
 
 #[cfg(test)]

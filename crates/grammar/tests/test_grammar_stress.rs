@@ -5,14 +5,17 @@ use whisper_model::Vocab;
 fn make_test_vocab(tokens: &[&str]) -> Vocab {
     let mut token_to_id = HashMap::new();
     let mut id_to_token = Vec::new();
+    let mut token_bytes = Vec::new();
     for (i, &t) in tokens.iter().enumerate() {
-        token_to_id.insert(t.to_string(), i as i32);
+        token_to_id.insert(t.as_bytes().to_vec(), i as i32);
         id_to_token.push(t.to_string());
+        token_bytes.push(t.as_bytes().to_vec());
     }
     Vocab {
         n_vocab: tokens.len(),
         token_to_id,
         id_to_token,
+        token_bytes,
         token_eot: 50256,
         token_sot: 50257,
         token_translate: 50258,

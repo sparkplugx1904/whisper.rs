@@ -583,8 +583,13 @@ fn test_c_abi_telemetry_and_logging() {
 #[test]
 fn test_c_abi_vad_standalone_api() {
     let wav_path = workspace_path("samples/jfk.wav");
-    assert!(wav_path.exists());
+    let model_path = resolve_model_path("for-tests-silero-v6.2.0-ggml.bin");
+    if !wav_path.exists() || !model_path.exists() {
+        eprintln!("VAD model or sample not found, skipping VAD test");
+        return;
+    }
     let audio = whisper_rs::audio::WavAudio::load_from_file(&wav_path).expect("load wav");
+    let c_model_path = CString::new(model_path.to_str().unwrap()).unwrap();
 
     unsafe {
         // 1. Parameter defaults
@@ -598,23 +603,20 @@ fn test_c_abi_vad_standalone_api() {
         assert_eq!(vad_cparams.n_threads, 4);
         assert!(!vad_cparams.use_gpu);
 
-        // 2. Init and free context
-        let vctx = whisper_vad_init_from_file_with_params(std::ptr::null(), vad_cparams);
+        // 2. Init from the Silero GGML model
+        let vctx = whisper_vad_init_from_file_with_params(c_model_path.as_ptr(), vad_cparams);
         assert!(
             !vctx.is_null(),
-            "whisper_vad_init_from_file_with_params must return valid context"
+            "whisper_vad_init_from_file_with_params must load the Silero model"
         );
 
         // 3. Speech detection on JFK audio (active speech)
         let detected =
             whisper_vad_detect_speech(vctx, audio.samples.as_ptr(), audio.samples.len() as i32);
-        assert_eq!(
-            detected, 1,
-            "whisper_vad_detect_speech must return 1 on active speech"
-        );
+        assert_eq!(detected, 1, "VAD graph must run successfully");
 
         let n_probs = whisper_vad_n_probs(vctx);
-        assert!(n_probs > 0, "Number of probabilities must be > 0");
+        assert_eq!(n_probs, 344, "one probability per 512-sample window");
         let probs_ptr = whisper_vad_probs(vctx);
         assert!(
             !probs_ptr.is_null(),
@@ -622,6 +624,11 @@ fn test_c_abi_vad_standalone_api() {
         );
         let probs_slice = std::slice::from_raw_parts(probs_ptr, n_probs as usize);
         assert!(probs_slice.iter().all(|&p| (0.0..=1.0).contains(&p)));
+
+        // Reference values from whisper.cpp on the same model and audio.
+        assert!((probs_slice[0] - 0.001695).abs() < 1e-3);
+        assert!((probs_slice[1] - 0.083180).abs() < 1e-3);
+        assert!((probs_slice[50] - 0.985183).abs() < 1e-3);
 
         // 4. Extract segments from samples
         let segs = whisper_vad_segments_from_samples(
@@ -637,6 +644,7 @@ fn test_c_abi_vad_standalone_api() {
             let t0 = whisper_vad_segments_get_segment_t0(segs, i);
             let t1 = whisper_vad_segments_get_segment_t1(segs, i);
             assert!(t1 >= t0, "Segment end must be >= start");
+            assert!(t1 <= 1100.0, "Segment must stay inside the audio");
         }
         whisper_vad_free_segments(segs);
 
@@ -646,14 +654,14 @@ fn test_c_abi_vad_standalone_api() {
         assert!(whisper_vad_segments_n_segments(segs_probs) > 0);
         whisper_vad_free_segments(segs_probs);
 
-        // 6. Test pure silence (5 seconds)
+        // 6. Pure silence still runs the graph, but every window is silent.
         let silence = vec![0.0f32; 16000 * 5];
         let detected_silence =
             whisper_vad_detect_speech(vctx, silence.as_ptr(), silence.len() as i32);
-        assert_eq!(
-            detected_silence, 0,
-            "whisper_vad_detect_speech must return 0 on pure silence"
-        );
+        assert_eq!(detected_silence, 1);
+        let n_silence = whisper_vad_n_probs(vctx) as usize;
+        let silence_probs = std::slice::from_raw_parts(whisper_vad_probs(vctx), n_silence);
+        assert!(silence_probs.iter().all(|&p| p < 0.5));
 
         // 7. Streaming & reset state
         whisper_vad_reset_state(vctx);
@@ -663,6 +671,44 @@ fn test_c_abi_vad_standalone_api() {
         whisper_vad_free(vctx);
         whisper_vad_free(std::ptr::null_mut());
         whisper_vad_free_segments(std::ptr::null_mut());
+    }
+}
+
+#[test]
+fn test_c_abi_vad_loader_init() {
+    let model_path = resolve_model_path("for-tests-silero-v6.2.0-ggml.bin");
+    if !model_path.exists() {
+        eprintln!("VAD model not found, skipping VAD loader test");
+        return;
+    }
+
+    let data = std::fs::read(&model_path).expect("read VAD model");
+    let mut loader_ctx = LoaderContext {
+        data,
+        pos: 0,
+        closed: false,
+    };
+
+    unsafe {
+        let mut loader = whisper_model_loader {
+            context: &mut loader_ctx as *mut LoaderContext as *mut std::ffi::c_void,
+            read: Some(loader_read),
+            eof: Some(loader_eof),
+            close: Some(loader_close),
+        };
+
+        let vctx = whisper_vad_init_with_params(&mut loader, whisper_vad_default_context_params());
+        assert!(!vctx.is_null(), "loader-based VAD init must succeed");
+        assert!(loader_ctx.closed, "the loader must be closed");
+
+        let samples = vec![0.0f32; 16000];
+        assert_eq!(
+            whisper_vad_detect_speech(vctx, samples.as_ptr(), samples.len() as i32),
+            1
+        );
+        assert_eq!(whisper_vad_n_probs(vctx), 32);
+
+        whisper_vad_free(vctx);
     }
 }
 
@@ -756,6 +802,312 @@ fn test_c_abi_honours_max_len_and_offset() {
         );
         assert!(whisper_full_n_segments(ctx) >= 1);
 
+        whisper_free(ctx);
+    }
+}
+
+#[test]
+fn test_c_abi_tokenize_contract_and_count() {
+    let model_path = resolve_model_path("ggml-tiny.bin");
+    if !model_path.exists() {
+        eprintln!("Model not found, skipping tokenize contract test");
+        return;
+    }
+
+    let c_model_path = CString::new(model_path.to_str().unwrap()).unwrap();
+    let text = CString::new("Hello, world!").unwrap();
+    let expected = [15947, 11, 1002, 0];
+
+    unsafe {
+        let ctx = whisper_init_from_file(c_model_path.as_ptr());
+        assert!(!ctx.is_null());
+
+        let count = whisper_token_count(ctx, text.as_ptr());
+        assert_eq!(count, expected.len() as i32);
+
+        // A buffer that is too small reports the required size as a negative
+        // value, like whisper.cpp, instead of silently truncating.
+        let mut small = [0i32; 2];
+        let rc = whisper_tokenize(ctx, text.as_ptr(), small.as_mut_ptr(), small.len() as i32);
+        assert_eq!(rc, -(expected.len() as i32));
+
+        let mut tokens = [0i32; 4];
+        let rc = whisper_tokenize(ctx, text.as_ptr(), tokens.as_mut_ptr(), tokens.len() as i32);
+        assert_eq!(rc, expected.len() as i32);
+        assert_eq!(tokens, expected);
+
+        // Token text is returned as the raw vocabulary bytes. Token 171 is the
+        // first byte of the fullwidth comma and is not valid UTF-8 on its own.
+        let byte_token = whisper_token_to_str(ctx, 171);
+        assert!(!byte_token.is_null());
+        assert_eq!(CStr::from_ptr(byte_token).to_bytes(), &[0xef]);
+
+        whisper_free(ctx);
+    }
+}
+
+struct LoaderContext {
+    data: Vec<u8>,
+    pos: usize,
+    closed: bool,
+}
+
+unsafe extern "C" fn loader_read(
+    ctx: *mut std::ffi::c_void,
+    output: *mut std::ffi::c_void,
+    read_size: usize,
+) -> usize {
+    let loader = &mut *(ctx as *mut LoaderContext);
+    let n = read_size.min(loader.data.len() - loader.pos);
+    if n > 0 {
+        std::ptr::copy_nonoverlapping(loader.data.as_ptr().add(loader.pos), output as *mut u8, n);
+        loader.pos += n;
+    }
+    n
+}
+
+unsafe extern "C" fn loader_eof(ctx: *mut std::ffi::c_void) -> bool {
+    let loader = &*(ctx as *const LoaderContext);
+    loader.pos >= loader.data.len()
+}
+
+unsafe extern "C" fn loader_close(ctx: *mut std::ffi::c_void) {
+    let loader = &mut *(ctx as *mut LoaderContext);
+    loader.closed = true;
+}
+
+#[test]
+fn test_c_abi_loader_init_and_openvino() {
+    let model_path = resolve_model_path("ggml-tiny.bin");
+    if !model_path.exists() {
+        eprintln!("Model not found, skipping loader init test");
+        return;
+    }
+
+    let data = std::fs::read(&model_path).expect("read model");
+    let expected_vocab = 51865;
+
+    let mut loader_ctx = LoaderContext {
+        data,
+        pos: 0,
+        closed: false,
+    };
+
+    unsafe {
+        let mut loader = whisper_model_loader {
+            context: &mut loader_ctx as *mut LoaderContext as *mut std::ffi::c_void,
+            read: Some(loader_read),
+            eof: Some(loader_eof),
+            close: Some(loader_close),
+        };
+
+        let ctx = whisper_init_with_params(&mut loader, whisper_context_default_params());
+        assert!(!ctx.is_null(), "loader-based init must succeed");
+        assert!(loader_ctx.closed, "the loader must be closed exactly once");
+        assert_eq!(whisper_n_vocab(ctx), expected_vocab);
+        assert_eq!(whisper_full_n_segments(ctx), 0);
+
+        let device = CString::new("CPU").unwrap();
+        assert_eq!(
+            whisper_ctx_init_openvino_encoder(
+                ctx,
+                std::ptr::null(),
+                device.as_ptr(),
+                std::ptr::null()
+            ),
+            1
+        );
+
+        whisper_free(ctx);
+    }
+}
+
+#[derive(Default)]
+struct SegmentCallbackData {
+    calls: i32,
+    n_new_sum: i32,
+    last_total: i32,
+}
+
+unsafe extern "C" fn segment_callback(
+    _ctx: *mut whisper_context,
+    state: *mut whisper_state,
+    n_new: i32,
+    user_data: *mut std::ffi::c_void,
+) {
+    let data = &mut *(user_data as *mut SegmentCallbackData);
+    data.calls += 1;
+    data.n_new_sum += n_new;
+    data.last_total = whisper_full_n_segments_from_state(state);
+}
+
+#[test]
+fn test_c_abi_full_parallel_chunks_and_callbacks() {
+    let model_path = resolve_model_path("ggml-tiny.en.bin");
+    let wav_path = workspace_path("samples/jfk.wav");
+    if !model_path.exists() || !wav_path.exists() {
+        eprintln!("Model or sample not found, skipping parallel test");
+        return;
+    }
+
+    let audio = whisper_rs::audio::WavAudio::load_from_file(&wav_path).expect("load wav");
+    let c_model_path = CString::new(model_path.to_str().unwrap()).unwrap();
+
+    unsafe {
+        let ctx = whisper_init_from_file(c_model_path.as_ptr());
+        assert!(!ctx.is_null());
+
+        let mut params =
+            whisper_full_default_params(whisper_sampling_strategy::WHISPER_SAMPLING_GREEDY);
+        let mut callback_data = SegmentCallbackData::default();
+        params.new_segment_callback = segment_callback as *const std::ffi::c_void;
+        params.new_segment_callback_user_data =
+            &mut callback_data as *mut SegmentCallbackData as *mut std::ffi::c_void;
+
+        let rc = whisper_full_parallel(
+            ctx,
+            params,
+            audio.samples.as_ptr(),
+            audio.samples.len() as i32,
+            2,
+        );
+        assert_eq!(rc, 0, "parallel transcription must succeed");
+
+        let n_segments = whisper_full_n_segments(ctx);
+        assert!(
+            n_segments >= 1,
+            "parallel transcription produced no segments"
+        );
+        assert!(callback_data.calls >= 1);
+        assert_eq!(callback_data.n_new_sum, n_segments);
+        assert_eq!(callback_data.last_total, n_segments);
+
+        let mut previous_t1 = 0;
+        for i in 0..n_segments {
+            let t0 = whisper_full_get_segment_t0(ctx, i);
+            let t1 = whisper_full_get_segment_t1(ctx, i);
+            assert!(t0 <= t1, "segment {} has reversed timestamps", i);
+            assert!(
+                t0 >= previous_t1,
+                "segment {} starts before the previous one ended",
+                i
+            );
+            previous_t1 = t1;
+        }
+
+        let duration_cs = (audio.samples.len() as f64 / 16000.0 * 100.0) as i64;
+        assert!(
+            previous_t1 <= duration_cs + 10,
+            "last segment ends past the audio: {} > {}",
+            previous_t1,
+            duration_cs
+        );
+
+        whisper_free(ctx);
+    }
+}
+
+#[test]
+fn test_c_abi_lang_auto_detect_honours_offset() {
+    let model_path = resolve_model_path("ggml-tiny.bin");
+    let wav_path = workspace_path("samples/jfk.wav");
+    if !model_path.exists() || !wav_path.exists() {
+        eprintln!("Model or sample not found, skipping language offset test");
+        return;
+    }
+
+    let audio = whisper_rs::audio::WavAudio::load_from_file(&wav_path).expect("load wav");
+    let c_model_path = CString::new(model_path.to_str().unwrap()).unwrap();
+
+    unsafe {
+        let ctx = whisper_init_from_file(c_model_path.as_ptr());
+        assert!(!ctx.is_null());
+        assert_eq!(
+            whisper_pcm_to_mel(ctx, audio.samples.as_ptr(), audio.samples.len() as i32, 1),
+            0
+        );
+
+        let max_langs = whisper_lang_max_id() as usize + 1;
+        let mut probs_start = vec![0.0f32; max_langs];
+        let mut probs_later = vec![0.0f32; max_langs];
+
+        let lang_start = whisper_lang_auto_detect(ctx, 0, 1, probs_start.as_mut_ptr());
+        let lang_later = whisper_lang_auto_detect(ctx, 5_000, 1, probs_later.as_mut_ptr());
+        assert!(lang_start >= 0);
+        assert!(lang_later >= 0);
+
+        // The two windows cover different audio, so the language posterior must
+        // change. This fails if offset_ms is ignored.
+        let max_delta = probs_start
+            .iter()
+            .zip(&probs_later)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_delta > 1e-4,
+            "offset_ms had no effect on the language posterior"
+        );
+
+        let mut scratch = vec![0.0f32; max_langs];
+        assert_eq!(
+            whisper_lang_auto_detect(ctx, -10, 1, scratch.as_mut_ptr()),
+            -1,
+            "negative offsets must be rejected"
+        );
+        let past_end = (audio.samples.len() as f64 / 16000.0 * 1000.0) as i32 + 1000;
+        assert_eq!(
+            whisper_lang_auto_detect(ctx, past_end, 1, scratch.as_mut_ptr()),
+            -2,
+            "offsets past the audio must be rejected"
+        );
+
+        whisper_free(ctx);
+    }
+}
+
+unsafe extern "C" fn loader_read_full(
+    ctx: *mut std::ffi::c_void,
+    output: *mut std::ffi::c_void,
+    read_size: usize,
+) -> usize {
+    let loader = &mut *(ctx as *mut LoaderContext);
+    let n = read_size.min(loader.data.len() - loader.pos);
+    if n > 0 {
+        std::ptr::copy_nonoverlapping(loader.data.as_ptr().add(loader.pos), output as *mut u8, n);
+        loader.pos += n;
+    }
+    // The reference file loader returns the requested size even at EOF and
+    // relies on the eof callback to stop the reader.
+    read_size
+}
+
+#[test]
+fn test_c_abi_loader_uses_eof_callback() {
+    let model_path = resolve_model_path("ggml-tiny.bin");
+    if !model_path.exists() {
+        eprintln!("Model not found, skipping EOF loader test");
+        return;
+    }
+
+    let data = std::fs::read(&model_path).expect("read model");
+    let mut loader_ctx = LoaderContext {
+        data,
+        pos: 0,
+        closed: false,
+    };
+
+    unsafe {
+        let mut loader = whisper_model_loader {
+            context: &mut loader_ctx as *mut LoaderContext as *mut std::ffi::c_void,
+            read: Some(loader_read_full),
+            eof: Some(loader_eof),
+            close: Some(loader_close),
+        };
+
+        let ctx = whisper_init_with_params(&mut loader, whisper_context_default_params());
+        assert!(!ctx.is_null(), "EOF-driven loader must terminate and load");
+        assert!(loader_ctx.closed);
+        assert_eq!(whisper_n_vocab(ctx), 51865);
         whisper_free(ctx);
     }
 }

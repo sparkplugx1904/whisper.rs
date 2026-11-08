@@ -53,7 +53,7 @@ A high-performance, **100% Pure Rust** rewrite of [whisper.cpp](https://github.c
 - **Karaoke & Subtitle Splitting**: SubRip (.srt), WebVTT (.vtt), JSON, and Karaoke WebVTT format with per-word `<HH:MM:SS.mmm>` timing tags and length-constrained subtitle splitting.
 - **Tinydiarize Speaker Turn Detection**: Automatic detection and formatting of `[SPEAKER_TURN]` tokens for conversational audio.
 - **Constrained GBNF Grammar Decoding**: Enforce JSON schema or custom context-free grammar constraints during token generation.
-- **Voice Activity Detection**: Energy-based VAD runs on the raw samples and skips 30-second windows that contain no speech, with speech padding and absolute frame indices so timestamps stay aligned.
+- **Voice Activity Detection**: The Silero VAD GGML model runs through a pure-Rust STFT/conv/LSTM graph for the standalone C API and for `whisper_full` when a model path is configured; the dependency-free energy detector remains the default for long-form windows, with speech padding and absolute frame indices so timestamps stay aligned.
 - **Extensible Ecosystem**: C-ABI dynamic/static library (`whisper-ffi`), GBNF grammar parser (`whisper-grammar`), Voice Activity Detection (`whisper-vad`), OpenAI REST server, and streaming runtime.
 
 ---

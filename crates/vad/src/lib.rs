@@ -1,16 +1,24 @@
 #![forbid(unsafe_code)]
 //! Voice Activity Detection (VAD) for whisper.rs.
 //!
-//! Implementation: Adaptive Energy-based Voice Activity Detection with Dynamic Noise Floor Tracking.
-//! Analyzes short-time frame root-mean-square (RMS) energy, applies noise floor percentile estimation,
-//! and performs temporal smoothing with speech/silence duration constraints and padding.
+//! Two detectors are available:
+//! - [`silero::SileroVad`], the GGML Silero model used by whisper.cpp, with the
+//!   same STFT/conv/LSTM graph and speech-segment post-processing.
+//! - [`detect_speech_segments`], a dependency-free adaptive energy detector for
+//!   callers that do not ship a model file.
+
+pub mod silero;
+
+pub use silero::{segments_from_probs, SileroVad, SileroVadError};
 
 #[derive(Debug, Clone)]
 pub struct VadParams {
     pub threshold: f32,
     pub min_speech_duration_ms: usize,
     pub min_silence_duration_ms: usize,
+    pub max_speech_duration_s: f32,
     pub speech_pad_ms: usize,
+    pub samples_overlap: f32,
     pub sample_rate: usize,
 }
 
@@ -20,7 +28,9 @@ impl Default for VadParams {
             threshold: 0.5,
             min_speech_duration_ms: 250,
             min_silence_duration_ms: 100,
+            max_speech_duration_s: f32::MAX,
             speech_pad_ms: 30,
+            samples_overlap: 0.1,
             sample_rate: 16000,
         }
     }

@@ -714,6 +714,7 @@ version = "0.1.0"
 dependencies = [
  "rayon",
  "whisper-rs",
+ "whisper-tensor",
  "whisper-vad",
 ]
 
@@ -799,6 +800,7 @@ name = "whisper-vad"
 version = "0.1.0"
 dependencies = [
  "byteorder",
+ "half",
  "thiserror",
  "whisper-audio",
 ]
