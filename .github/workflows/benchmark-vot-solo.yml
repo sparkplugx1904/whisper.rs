@@ -2,6 +2,10 @@ name: Benchmark VOT solo
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - "benchmarks/vot-solo/**"
+      - ".github/workflows/benchmark-vot-solo.yml"
 
 permissions:
   contents: read
