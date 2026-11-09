@@ -72,3 +72,7 @@ models/*.bin
 whisper.cpp
 *.local
 .whisper-reference
+
+# Python bytecode
+__pycache__/
+*.pyc

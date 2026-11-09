@@ -1,0 +1,108 @@
+name: Benchmark VOT solo
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vot-solo-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg time
+          python -m pip install "jiwer==4.0.0"
+
+      - name: Prepare workspace
+        run: mkdir -p "$RUNNER_TEMP/vot-solo/models" "$RUNNER_TEMP/vot-solo/out" "$RUNNER_TEMP/vot-solo/report"
+
+      - name: Restore dataset
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/vot-solo/metadata.tsv
+            ${{ runner.temp }}/vot-solo/clips
+          key: vot-solo-clips-v1
+
+      - name: Restore model
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vot-solo/models
+          key: vot-solo-large-v3-turbo-f16-v1
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: vot-solo-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Download curated clips
+        run: |
+          python benchmarks/vot-solo/download_dataset.py --out "$RUNNER_TEMP/vot-solo"
+
+      - name: Merge clips without gaps
+        run: |
+          python benchmarks/vot-solo/merge_clips.py \
+            --metadata "$RUNNER_TEMP/vot-solo/metadata.tsv" \
+            --clips "$RUNNER_TEMP/vot-solo/clips" \
+            --wav "$RUNNER_TEMP/vot-solo/merged.wav" \
+            --boundaries "$RUNNER_TEMP/vot-solo/boundaries.json"
+
+      - name: Transcribe with whisper.rs
+        run: |
+          bash benchmarks/vot-solo/run_whisper_rs.sh \
+            "$RUNNER_TEMP/vot-solo/merged.wav" "$RUNNER_TEMP/vot-solo"
+
+      - name: Evaluate and report
+        run: |
+          VERSION="$(cat "$RUNNER_TEMP/vot-solo/out/whisper_rs.version.txt")"
+          python benchmarks/vot-solo/evaluate.py \
+            --boundaries "$RUNNER_TEMP/vot-solo/boundaries.json" \
+            --segments "$RUNNER_TEMP/vot-solo/out/merged.json" \
+            --audio "$RUNNER_TEMP/vot-solo/merged.wav" \
+            --out-dir "$RUNNER_TEMP/vot-solo/report" \
+            --time-file "$RUNNER_TEMP/vot-solo/out/transcribe.time.txt" \
+            --model large-v3-turbo \
+            --quantization f16 \
+            --tool-version "$VERSION"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vot-solo-report
+          path: |
+            ${{ runner.temp }}/vot-solo/report/
+            ${{ runner.temp }}/vot-solo/out/merged.txt
+            ${{ runner.temp }}/vot-solo/out/merged.json
+            ${{ runner.temp }}/vot-solo/out/transcribe.time.txt
+            ${{ runner.temp }}/vot-solo/boundaries.json
+          if-no-files-found: warn
+          retention-days: 30
