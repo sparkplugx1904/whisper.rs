@@ -20,78 +20,48 @@ pub enum AlignmentHeadsPreset {
     LargeV3Turbo = 14,
 }
 
+/// Preset that matches a loaded model, so callers do not have to hard-code
+/// head tables. English-only checkpoints use the `*En` calibration.
+pub fn preset_for_model(
+    model_type: whisper_model::header::ModelType,
+    is_multilingual: bool,
+) -> AlignmentHeadsPreset {
+    use whisper_model::header::ModelType;
+    match (model_type, is_multilingual) {
+        (ModelType::Tiny, false) => AlignmentHeadsPreset::TinyEn,
+        (ModelType::Tiny, true) => AlignmentHeadsPreset::Tiny,
+        (ModelType::Base, false) => AlignmentHeadsPreset::BaseEn,
+        (ModelType::Base, true) => AlignmentHeadsPreset::Base,
+        (ModelType::Small, false) => AlignmentHeadsPreset::SmallEn,
+        (ModelType::Small, true) => AlignmentHeadsPreset::Small,
+        (ModelType::Medium, false) => AlignmentHeadsPreset::MediumEn,
+        (ModelType::Medium, true) => AlignmentHeadsPreset::Medium,
+        (ModelType::Large, _) => AlignmentHeadsPreset::LargeV1,
+        (ModelType::LargeV3, _) => AlignmentHeadsPreset::LargeV3,
+        (ModelType::LargeV3Turbo, _) => AlignmentHeadsPreset::LargeV3Turbo,
+        (ModelType::Unknown, _) => AlignmentHeadsPreset::None,
+    }
+}
+
 pub fn get_alignment_heads(preset: AlignmentHeadsPreset) -> &'static [(usize, usize)] {
+    // Values mirror `g_aheads_*` in whisper.cpp. A head is `(text_layer,
+    // attention_head)`, and the upstream presets are the calibration data used
+    // by its DTW token-timestamp computation.
     match preset {
-        AlignmentHeadsPreset::TinyEn => &[(0, 2), (1, 3), (2, 0), (3, 5)],
-        AlignmentHeadsPreset::Tiny => &[
-            (0, 2),
-            (0, 3),
-            (1, 3),
-            (2, 1),
+        AlignmentHeadsPreset::TinyEn => &[
+            (1, 0),
+            (2, 0),
             (2, 5),
             (3, 0),
+            (3, 1),
+            (3, 2),
             (3, 3),
             (3, 4),
         ],
-        AlignmentHeadsPreset::BaseEn => &[
-            (0, 1),
-            (1, 2),
-            (1, 3),
-            (2, 1),
-            (2, 2),
-            (3, 2),
-            (4, 4),
-            (4, 5),
-        ],
+        AlignmentHeadsPreset::Tiny => &[(2, 2), (3, 0), (3, 2), (3, 3), (3, 4), (3, 5)],
+        AlignmentHeadsPreset::BaseEn => &[(3, 3), (4, 7), (5, 1), (5, 5), (5, 7)],
         AlignmentHeadsPreset::Base => &[
-            (0, 1),
-            (1, 2),
-            (1, 3),
-            (1, 4),
-            (1, 5),
-            (2, 1),
-            (2, 2),
-            (2, 3),
-            (2, 5),
             (3, 1),
-            (4, 1),
-            (4, 2),
-            (4, 3),
-            (4, 4),
-        ],
-        AlignmentHeadsPreset::SmallEn => &[
-            (2, 2),
-            (3, 0),
-            (3, 2),
-            (3, 4),
-            (3, 7),
-            (4, 2),
-            (4, 5),
-            (5, 3),
-            (5, 6),
-            (6, 1),
-            (6, 2),
-            (7, 0),
-            (7, 2),
-            (7, 6),
-            (7, 7),
-            (8, 4),
-            (9, 3),
-            (9, 6),
-            (10, 1),
-            (10, 3),
-            (10, 4),
-            (11, 2),
-            (11, 3),
-            (11, 4),
-            (11, 7),
-        ],
-        AlignmentHeadsPreset::Small => &[
-            (2, 2),
-            (3, 0),
-            (3, 2),
-            (3, 4),
-            (3, 7),
             (4, 2),
             (4, 3),
             (4, 7),
@@ -99,145 +69,71 @@ pub fn get_alignment_heads(preset: AlignmentHeadsPreset) -> &'static [(usize, us
             (5, 2),
             (5, 4),
             (5, 6),
-            (6, 1),
-            (6, 2),
-            (6, 3),
+        ],
+        AlignmentHeadsPreset::SmallEn => &[
+            (6, 6),
             (7, 0),
-            (7, 1),
-            (7, 2),
-            (7, 4),
-            (7, 6),
+            (7, 3),
+            (7, 8),
             (8, 2),
-            (8, 4),
+            (8, 5),
             (8, 7),
-            (9, 1),
-            (9, 2),
+            (9, 0),
             (9, 4),
-            (9, 7),
+            (9, 8),
+            (9, 10),
             (10, 0),
             (10, 1),
             (10, 2),
             (10, 3),
-            (10, 4),
             (10, 6),
+            (10, 11),
             (11, 2),
-            (11, 3),
             (11, 4),
         ],
-        AlignmentHeadsPreset::MediumEn => &[
-            (5, 11),
-            (6, 0),
-            (6, 1),
-            (6, 4),
-            (6, 7),
-            (7, 0),
-            (7, 8),
-            (7, 10),
-            (7, 11),
+        AlignmentHeadsPreset::Small => &[
+            (5, 3),
+            (5, 9),
             (8, 0),
-            (8, 2),
-            (8, 3),
+            (8, 4),
+            (8, 7),
             (8, 8),
             (9, 0),
-            (9, 5),
-            (10, 1),
+            (9, 7),
+            (9, 9),
             (10, 5),
-            (10, 8),
-            (11, 1),
+        ],
+        AlignmentHeadsPreset::MediumEn => &[
             (11, 4),
-            (11, 5),
-            (12, 1),
-            (12, 4),
-            (12, 7),
-            (13, 0),
-            (13, 2),
-            (13, 4),
-            (13, 8),
             (14, 1),
-            (14, 3),
-            (14, 7),
-            (14, 11),
-            (15, 6),
+            (14, 12),
+            (14, 14),
+            (15, 4),
             (16, 0),
-            (16, 5),
-            (16, 6),
-            (16, 7),
-            (16, 8),
-            (17, 3),
-            (17, 8),
+            (16, 4),
+            (16, 9),
+            (17, 12),
+            (17, 14),
             (18, 7),
-            (18, 11),
-            (19, 0),
-            (19, 1),
-            (19, 2),
-            (19, 8),
+            (18, 10),
+            (18, 15),
             (20, 0),
-            (20, 2),
             (20, 3),
-            (20, 6),
-            (21, 3),
-            (21, 5),
-            (21, 11),
-            (22, 1),
-            (22, 7),
-            (22, 8),
-            (23, 0),
-            (23, 2),
-            (23, 6),
+            (20, 9),
+            (20, 14),
+            (21, 12),
         ],
-        AlignmentHeadsPreset::Medium => &[
-            (6, 6),
-            (7, 2),
-            (7, 3),
-            (7, 5),
-            (8, 3),
-            (9, 2),
-            (9, 8),
-            (10, 0),
-            (10, 2),
-            (10, 7),
-            (11, 2),
-            (11, 8),
-            (12, 4),
-            (13, 1),
-            (13, 4),
-            (13, 8),
-            (14, 1),
-            (14, 2),
-            (14, 4),
-            (15, 2),
-            (15, 8),
-            (16, 1),
-            (16, 3),
-            (16, 5),
-            (17, 1),
-            (17, 2),
-            (17, 4),
-            (18, 0),
-            (18, 5),
-            (18, 8),
-            (19, 4),
-            (19, 5),
-            (19, 8),
-            (20, 2),
-            (20, 4),
-            (21, 3),
-            (21, 5),
-            (21, 7),
-            (22, 2),
-            (22, 8),
-            (23, 0),
-            (23, 3),
-        ],
+        AlignmentHeadsPreset::Medium => &[(13, 15), (15, 4), (15, 15), (16, 1), (20, 0), (23, 4)],
         AlignmentHeadsPreset::LargeV1 => &[
             (9, 19),
             (11, 2),
             (11, 4),
-            (11, 8),
-            (12, 12),
-            (13, 17),
-            (21, 16),
-            (22, 1),
+            (11, 17),
+            (22, 7),
+            (22, 11),
+            (22, 17),
+            (23, 2),
+            (23, 15),
         ],
         AlignmentHeadsPreset::LargeV2 => &[
             (10, 12),
@@ -256,39 +152,30 @@ pub fn get_alignment_heads(preset: AlignmentHeadsPreset) -> &'static [(usize, us
             (22, 3),
             (22, 9),
             (22, 12),
+            (23, 5),
             (23, 7),
-            (23, 8),
-            (23, 9),
-            (24, 6),
-            (24, 12),
-            (25, 6),
+            (23, 13),
+            (25, 5),
+            (26, 1),
+            (26, 12),
+            (27, 15),
         ],
         AlignmentHeadsPreset::LargeV3 => &[
             (7, 0),
             (10, 17),
-            (11, 16),
-            (12, 1),
+            (12, 18),
             (13, 12),
-            (14, 5),
-            (14, 14),
-            (15, 4),
-            (16, 15),
+            (16, 1),
             (17, 14),
-            (17, 19),
-            (18, 5),
-            (18, 11),
-            (18, 17),
             (19, 11),
-            (20, 17),
-            (21, 2),
-            (21, 3),
-            (22, 14),
-            (22, 19),
-            (23, 7),
-            (24, 12),
+            (21, 4),
+            (24, 1),
             (25, 6),
         ],
-        AlignmentHeadsPreset::LargeV3Turbo => &[(2, 4), (2, 12), (3, 7), (3, 14), (3, 17)],
+        AlignmentHeadsPreset::LargeV3Turbo => &[(2, 4), (2, 11), (3, 3), (3, 6), (3, 11), (3, 14)],
+        // N_TOP_MOST needs the model's layer count and `dtw_n_top`, and CUSTOM
+        // needs a caller-provided head list. Neither can be represented by a
+        // static preset, so both behave as "no calibration data".
         _ => &[],
     }
 }
@@ -319,6 +206,29 @@ pub fn align_dtw(
     n_tokens: usize,
     n_frames: usize,
 ) -> Vec<(usize, usize, usize)> {
+    align_dtw_impl(attention, n_tokens, n_frames, true)
+}
+
+/// Dynamic Time Warping over an explicit cost matrix.
+///
+/// Unlike [`align_dtw`], `cost` already holds the per-cell cost, so entries
+/// are accumulated as-is. Cross-attention alignment uses this form: the
+/// normalized, median-filtered attention is negated once while building the
+/// cost matrix.
+pub fn align_dtw_from_cost(
+    cost: &[f32],
+    n_tokens: usize,
+    n_frames: usize,
+) -> Vec<(usize, usize, usize)> {
+    align_dtw_impl(cost, n_tokens, n_frames, false)
+}
+
+fn align_dtw_impl(
+    attention: &[f32],
+    n_tokens: usize,
+    n_frames: usize,
+    neg_log: bool,
+) -> Vec<(usize, usize, usize)> {
     if n_tokens == 0 || n_frames == 0 || attention.len() != n_tokens * n_frames {
         return Vec::new();
     }
@@ -332,7 +242,11 @@ pub fn align_dtw(
         let att_row = &attention[(i - 1) * n_frames..i * n_frames];
         for j in 1..=n_frames {
             let att_val = att_row[j - 1];
-            let cost = -(att_val + 1e-8).ln();
+            let cost = if neg_log {
+                -(att_val + 1e-8).ln()
+            } else {
+                att_val
+            };
 
             let d_diag = d[(i - 1) * cols + (j - 1)];
             let d_top = d[(i - 1) * cols + j];
@@ -486,4 +400,156 @@ pub fn merge_tokens_to_words(
     }
 
     words
+}
+
+/// Build the DTW cost matrix from captured cross-attention weights.
+///
+/// `attention` is laid out `[token][head][audio_frame]` with `n_heads`
+/// selected alignment heads. The transformation mirrors whisper.cpp's DTW
+/// timestamp path: normalize each audio/head column over the token axis,
+/// median-filter along the audio axis, mean over the alignment heads, then
+/// negate so DTW minimizes the accumulated cost.
+///
+/// Returns an empty matrix when the shapes do not agree.
+pub fn dtw_cost_from_attention(
+    attention: &[f32],
+    n_tokens: usize,
+    n_audio: usize,
+    n_heads: usize,
+    median_width: usize,
+) -> Vec<f32> {
+    if n_tokens == 0 || n_audio == 0 || n_heads == 0 {
+        return Vec::new();
+    }
+    let expected = n_tokens * n_audio * n_heads;
+    if attention.len() < expected {
+        return Vec::new();
+    }
+
+    // ggml_norm over the token axis: one mean and standard deviation per
+    // (head, audio frame) column.
+    let mut normalized = vec![0.0f32; expected];
+    for h in 0..n_heads {
+        for j in 0..n_audio {
+            let mut sum = 0.0f64;
+            for i in 0..n_tokens {
+                sum += attention[(i * n_heads + h) * n_audio + j] as f64;
+            }
+            let mean = (sum / n_tokens as f64) as f32;
+
+            let mut var = 0.0f64;
+            for i in 0..n_tokens {
+                let d = attention[(i * n_heads + h) * n_audio + j] - mean;
+                var += (d * d) as f64;
+            }
+            let inv_std = 1.0f32 / (((var / n_tokens as f64) as f32) + 1e-9).sqrt();
+
+            for i in 0..n_tokens {
+                let idx = (i * n_heads + h) * n_audio + j;
+                normalized[idx] = (attention[idx] - mean) * inv_std;
+            }
+        }
+    }
+
+    // Median filter along the audio axis with reflect padding, like
+    // whisper.cpp's `median_filter`.
+    let mut width = median_width.max(1);
+    if width >= n_audio {
+        width = if n_audio.is_multiple_of(2) {
+            n_audio.saturating_sub(1)
+        } else {
+            n_audio
+        };
+    }
+    if width.is_multiple_of(2) {
+        width -= 1;
+    }
+    width = width.max(1);
+    let half = (width / 2) as isize;
+
+    // Accumulate the head mean while filtering so the filtered tensor never
+    // has to exist: normalized weights and the final cost are the only
+    // token-by-audio buffers.
+    let mut cost = vec![0.0f32; n_tokens * n_audio];
+    let inv_heads = 1.0f32 / n_heads as f32;
+    let mut window = Vec::with_capacity(width);
+    for i in 0..n_tokens {
+        for h in 0..n_heads {
+            let base = (i * n_heads + h) * n_audio;
+            for j in 0..n_audio {
+                window.clear();
+                for off in -half..=half {
+                    let mut idx = j as isize + off;
+                    if idx < 0 {
+                        idx = -idx;
+                    } else if idx >= n_audio as isize {
+                        idx = 2 * (n_audio as isize - 1) - idx;
+                    }
+                    window.push(normalized[base + idx as usize]);
+                }
+                window.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                cost[i * n_audio + j] += window[window.len() / 2] * inv_heads;
+            }
+        }
+    }
+    for value in &mut cost {
+        *value = -*value;
+    }
+    cost
+}
+
+/// Merge token alignments into word timings and clamp them to one segment.
+///
+/// Word starts and ends are constrained to `[seg_t0, seg_t1]`, and neither
+/// boundary moves backwards, so a segment's words never overlap or leave the
+/// interval reported for the segment.
+pub fn merge_tokens_to_words_clamped(
+    tokens: &[(&str, f32)],
+    alignments: &[(usize, usize, usize)],
+    seg_t0: f64,
+    seg_t1: f64,
+    time_offset: f64,
+    frame_step_sec: f64,
+) -> Vec<WordTiming> {
+    let mut words = merge_tokens_to_words(tokens, alignments, time_offset, frame_step_sec);
+    let mut prev_end = seg_t0;
+    for word in &mut words {
+        word.t0 = word.t0.clamp(seg_t0, seg_t1);
+        if word.t0 < prev_end {
+            word.t0 = prev_end;
+        }
+        word.t1 = word.t1.clamp(word.t0, seg_t1);
+        prev_end = word.t1;
+    }
+    words
+}
+
+/// Evenly distribute tokens across a segment when no alignment heads are
+/// configured.
+///
+/// This is a layout approximation, not acoustic alignment: it invents a
+/// Gaussian attention row per token so the existing DTW/word merge can be
+/// reused. Callers must keep it clearly separate from
+/// cross-attention-derived timings.
+pub fn approximate_word_timings(
+    tokens: &[(&str, f32)],
+    seg_t0: f64,
+    seg_t1: f64,
+    frame_step_sec: f64,
+) -> Vec<WordTiming> {
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let n_frames = (((seg_t1 - seg_t0) / frame_step_sec).round() as usize).max(1);
+    let mut att = vec![0.0f32; tokens.len() * n_frames];
+    for (ti, row) in att.chunks_exact_mut(n_frames).enumerate() {
+        let center = (ti * n_frames) / tokens.len();
+        for (frame, value) in row.iter_mut().enumerate() {
+            let dist = frame as isize - center as isize;
+            *value = (-(dist * dist) as f32 / 20.0).exp();
+        }
+    }
+
+    let alignments = align_dtw(&att, tokens.len(), n_frames);
+    merge_tokens_to_words_clamped(tokens, &alignments, seg_t0, seg_t1, seg_t0, frame_step_sec)
 }

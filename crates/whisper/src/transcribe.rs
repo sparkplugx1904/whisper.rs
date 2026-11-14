@@ -1,5 +1,9 @@
 use crate::beam::BeamSearch;
 use crate::decoder::{DecoderKvCache, DecoderWorkspace, WhisperDecoder};
+use crate::dtw::{
+    align_dtw_from_cost, approximate_word_timings, dtw_cost_from_attention, get_alignment_heads,
+    merge_tokens_to_words_clamped,
+};
 use crate::encoder::WhisperEncoder;
 use crate::filter::{
     compression_ratio, CallbackLogitFilter, GrammarLogitFilter, LogitFilterContext,
@@ -801,6 +805,25 @@ impl WhisperContext {
                 continue;
             }
 
+            // Token-level timestamps need real cross-attention, so the whole
+            // window is aligned once and every segment slices its own tokens
+            // out of that alignment.
+            let dtw_alignment = if params.dtw_token_timestamps {
+                self.compute_window_alignment(
+                    state,
+                    params.dtw_aheads_preset,
+                    &tokens_cur,
+                    &enc_out,
+                    seek_time,
+                    lang_idx,
+                    total_audio_sec,
+                    beg,
+                )
+            } else {
+                None
+            };
+            let mut dtw_cursor = 0usize;
+
             // Extract segments from tokens_cur
             if params.no_timestamps || tokens_cur.is_empty() {
                 let max_tok = if params.max_tokens > 0 {
@@ -811,7 +834,9 @@ impl WhisperContext {
                 for chunk in tokens_cur.chunks(max_tok) {
                     let t1 = (seek_time + chunk_sec).min(total_audio_sec);
                     let seg = self.build_segment(
-                        params.tdrz_enable,
+                        params,
+                        dtw_alignment.as_ref(),
+                        &mut dtw_cursor,
                         seek_time,
                         t1,
                         chunk,
@@ -851,7 +876,9 @@ impl WhisperContext {
                             seg_t0 = abs_sec;
                         } else {
                             let seg = self.build_segment(
-                                params.tdrz_enable,
+                                params,
+                                dtw_alignment.as_ref(),
+                                &mut dtw_cursor,
                                 seg_t0,
                                 abs_sec,
                                 &seg_tokens,
@@ -881,7 +908,9 @@ impl WhisperContext {
                             let t_mid =
                                 (seg_t0 + (seg_tokens.len() as f64 * 0.2)).min(total_audio_sec);
                             let seg = self.build_segment(
-                                params.tdrz_enable,
+                                params,
+                                dtw_alignment.as_ref(),
+                                &mut dtw_cursor,
                                 seg_t0,
                                 t_mid,
                                 &seg_tokens,
@@ -917,7 +946,9 @@ impl WhisperContext {
                         window_end
                     };
                     let seg = self.build_segment(
-                        params.tdrz_enable,
+                        params,
+                        dtw_alignment.as_ref(),
+                        &mut dtw_cursor,
                         seg_t0,
                         t1,
                         &seg_tokens,
@@ -969,38 +1000,57 @@ impl WhisperContext {
         segments
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_segment(
         &self,
-        tdrz_enable: bool,
+        params: &WhisperParams,
+        alignment: Option<&WindowAlignment>,
+        dtw_cursor: &mut usize,
         seg_t0: f64,
         seg_t1: f64,
         tokens: &[i32],
         stats: SegmentStats,
     ) -> Segment {
         let mut text = self.tokenizer.decode(tokens, true);
-        if tdrz_enable
+        if params.tdrz_enable
             && tokens.iter().any(|&t| t == 50363 || t == 50364)
             && !text.starts_with("[SPEAKER_TURN]")
         {
             text = format!("[SPEAKER_TURN] {}", text.trim());
         }
-        let token_tuples: Vec<(&str, f32)> = tokens
+
+        // Word timings are derived from ordinary text tokens only. Timestamp
+        // and other special tokens are segment separators, not speech.
+        let eot = self.tokenizer.eot();
+        let text_tokens: Vec<i32> = tokens
+            .iter()
+            .copied()
+            .filter(|&tok| tok >= 0 && tok < eot)
+            .collect();
+        let token_tuples: Vec<(&str, f32)> = text_tokens
             .iter()
             .map(|&tok| (self.tokenizer.id_to_token(tok).unwrap_or(""), 0.95))
             .collect();
 
-        let n_frames_seg = (((seg_t1 - seg_t0) / 0.02).round() as usize).max(1);
-        let mut att = vec![0.0f32; tokens.len() * n_frames_seg];
-        for (ti, row) in att.chunks_exact_mut(n_frames_seg).enumerate() {
-            let center_f = (ti * n_frames_seg) / tokens.len().max(1);
-            for (fj, val) in row.iter_mut().enumerate() {
-                let dist = (fj as isize - center_f as isize).abs() as f32;
-                *val = (-dist * dist / 20.0).exp();
-            }
-        }
-
-        let alignments = crate::dtw::align_dtw(&att, tokens.len(), n_frames_seg);
-        let words = crate::dtw::merge_tokens_to_words(&token_tuples, &alignments, seg_t0, 0.02);
+        let words = alignment
+            .and_then(|alignment| {
+                let start = locate_segment_alignment(alignment, &text_tokens, dtw_cursor)?;
+                let alignments = &alignment.alignments[start..start + text_tokens.len()];
+                Some(merge_tokens_to_words_clamped(
+                    &token_tuples,
+                    alignments,
+                    seg_t0,
+                    seg_t1,
+                    alignment.seek_time,
+                    0.02,
+                ))
+            })
+            .unwrap_or_else(|| {
+                // No calibrated heads, no text, or an unexpected token order:
+                // fall back to the uniform layout approximation, which is not
+                // acoustic alignment.
+                approximate_word_timings(&token_tuples, seg_t0, seg_t1, 0.02)
+            });
 
         Segment::with_stats(
             seg_t0,
@@ -1013,6 +1063,146 @@ impl WhisperContext {
             stats.avg_entropy,
         )
     }
+
+    /// Align every text token of one audio window with the decoder's real
+    /// cross-attention.
+    ///
+    /// A single decoder pass runs over `SOT + [language] + NOT + text + EOT`
+    /// while capturing the selected alignment heads, mirroring whisper.cpp's
+    /// `whisper_exp_compute_token_level_timestamps_dtw`. The captured weights
+    /// are normalized over the token axis, median-filtered along audio, and
+    /// reduced to a DTW cost matrix. Returns `None` when no calibration head
+    /// applies to this model or the window carries no text tokens.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_window_alignment(
+        &self,
+        state: &mut WhisperState,
+        preset: crate::dtw::AlignmentHeadsPreset,
+        tokens: &[i32],
+        enc_out: &[f32],
+        seek_time: f64,
+        lang_idx: usize,
+        total_audio_sec: f64,
+        beg: i32,
+    ) -> Option<WindowAlignment> {
+        let heads: Vec<(usize, usize)> = get_alignment_heads(preset)
+            .iter()
+            .copied()
+            .filter(|&(layer, head)| layer < self.decoder.n_layers && head < self.decoder.n_heads)
+            .collect();
+        if heads.is_empty() || enc_out.is_empty() {
+            return None;
+        }
+
+        let eot = self.tokenizer.eot();
+        let text_tokens: Vec<i32> = tokens
+            .iter()
+            .copied()
+            .filter(|&tok| tok >= 0 && tok < eot)
+            .collect();
+        if text_tokens.is_empty() {
+            return None;
+        }
+
+        let sot = self.tokenizer.sot();
+        let mut align_tokens = Vec::with_capacity(text_tokens.len() + 4);
+        align_tokens.push(sot);
+        if self.model.hparams.is_multilingual() {
+            align_tokens.push(sot + 1 + lang_idx as i32);
+        }
+        align_tokens.push(self.tokenizer.not());
+        let prefix = align_tokens.len();
+        align_tokens.extend_from_slice(&text_tokens);
+        align_tokens.push(eot);
+
+        let n_audio_ctx = enc_out.len() / self.decoder.d_model;
+        if n_audio_ctx == 0 {
+            return None;
+        }
+
+        // Drop the encoder padding past the audio the window actually
+        // consumed: whisper.cpp clamps the DTW audio extent to the last
+        // emitted timestamp, and padded frames only add noise to the cost.
+        let rel_end = tokens
+            .iter()
+            .filter(|&&tok| tok >= beg)
+            .map(|&tok| (tok - beg) as usize)
+            .max()
+            .filter(|&frames| frames > 0)
+            .unwrap_or_else(|| (((total_audio_sec - seek_time).max(0.0)) / 0.02).ceil() as usize);
+        let n_audio = rel_end.max(1).min(n_audio_ctx);
+
+        // The alignment pass is independent of the sampling pass. Reuse the
+        // state's arena and activation workspace, but force the cross-attention
+        // projections to be recomputed for this encoder output.
+        state.cache.clear();
+        state.cache.invalidate_cross();
+        let _ = self.decoder.decode_with_alignment_heads(
+            &align_tokens,
+            enc_out,
+            &mut state.cache,
+            &mut state.workspace,
+            &heads,
+        );
+        let attention = state.workspace.alignment_attention();
+        let cost_full =
+            dtw_cost_from_attention(attention, align_tokens.len(), n_audio_ctx, heads.len(), 7);
+        if cost_full.len() != align_tokens.len() * n_audio_ctx {
+            return None;
+        }
+
+        // DTW runs over the text rows only; the SOT/language/NOT prefix and the
+        // trailing EOT still contribute to the normalization statistics.
+        let n_text = text_tokens.len();
+        let mut cost = vec![0.0f32; n_text * n_audio];
+        for (i, row) in cost.chunks_exact_mut(n_audio).enumerate() {
+            let src = (prefix + i) * n_audio_ctx;
+            row.copy_from_slice(&cost_full[src..src + n_audio]);
+        }
+
+        let alignments = align_dtw_from_cost(&cost, n_text, n_audio);
+        if alignments.len() != n_text {
+            return None;
+        }
+
+        Some(WindowAlignment {
+            seek_time,
+            text_tokens,
+            alignments,
+        })
+    }
+}
+
+/// Find the slice of a window alignment that belongs to one segment.
+///
+/// Segments are emitted in token order, so the shared cursor normally matches
+/// directly. A forward search keeps the mapping correct if a caller ever
+/// reorders segment construction; it never rewinds past tokens already used.
+fn locate_segment_alignment(
+    alignment: &WindowAlignment,
+    text_tokens: &[i32],
+    cursor: &mut usize,
+) -> Option<usize> {
+    if text_tokens.is_empty() {
+        return None;
+    }
+    let n = text_tokens.len();
+    let available = alignment.text_tokens.len();
+    if *cursor + n <= available && alignment.text_tokens[*cursor..*cursor + n] == *text_tokens {
+        let start = *cursor;
+        *cursor += n;
+        return Some(start);
+    }
+    if available < n {
+        return None;
+    }
+    for start in *cursor..=available - n {
+        if alignment.text_tokens[start..start + n] == *text_tokens {
+            *cursor = start + n;
+            return Some(start);
+        }
+    }
+    None
 }
 
 /// Evaluates the optional encoder-begin callback; `true` means the pass may run.
@@ -1101,6 +1291,18 @@ struct SegmentStats {
     avg_logprob: f32,
     no_speech_prob: f32,
     avg_entropy: f32,
+}
+
+/// Token-level DTW alignment for one audio window.
+///
+/// Captured once per window so every segment in that window shares the same
+/// cross-attention cost matrix, exactly like whisper.cpp's
+/// `whisper_exp_compute_token_level_timestamps_dtw`. Frame indices are
+/// relative to the window start.
+struct WindowAlignment {
+    seek_time: f64,
+    text_tokens: Vec<i32>,
+    alignments: Vec<(usize, usize, usize)>,
 }
 
 pub struct WindowPromptBuilder<'a> {

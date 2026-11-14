@@ -51,6 +51,8 @@ pub struct WhisperParams {
     pub on_progress: Option<ProgressCallback>,
     /// Pre-calibrated alignment heads preset for DTW word-level timestamps
     pub dtw_aheads_preset: crate::dtw::AlignmentHeadsPreset,
+    /// Enable the extra alignment pass that produces real word timestamps
+    pub dtw_token_timestamps: bool,
     /// Repetition penalty (> 1.0 penalizes already generated tokens, default 1.0)
     pub repetition_penalty: f32,
     /// Maximum character length per subtitle segment (0 = disabled)
@@ -159,7 +161,8 @@ impl Default for WhisperParams {
             n_threads: 4,
             flash_attn: false,
             tdrz_enable: false,
-            dtw_aheads_preset: crate::dtw::AlignmentHeadsPreset::TinyEn,
+            dtw_aheads_preset: crate::dtw::AlignmentHeadsPreset::None,
+            dtw_token_timestamps: false,
             max_len: 0,
             split_on_word: false,
             repetition_penalty: 1.0,

@@ -883,6 +883,28 @@ unsafe fn build_rust_params(
     let abort_callback = wrap_abort_callback(params);
     let on_encoder_begin = wrap_encoder_begin_callback(ctx, state, params);
     let on_logits = wrap_logits_callback(ctx, state, params);
+    let context = &*ctx;
+    let dtw_token_timestamps = context.params.dtw_token_timestamps || params.token_timestamps;
+    let dtw_aheads_preset = match context.params.dtw_aheads_preset {
+        3 => whisper_rs::dtw::AlignmentHeadsPreset::TinyEn,
+        4 => whisper_rs::dtw::AlignmentHeadsPreset::Tiny,
+        5 => whisper_rs::dtw::AlignmentHeadsPreset::BaseEn,
+        6 => whisper_rs::dtw::AlignmentHeadsPreset::Base,
+        7 => whisper_rs::dtw::AlignmentHeadsPreset::SmallEn,
+        8 => whisper_rs::dtw::AlignmentHeadsPreset::Small,
+        9 => whisper_rs::dtw::AlignmentHeadsPreset::MediumEn,
+        10 => whisper_rs::dtw::AlignmentHeadsPreset::Medium,
+        11 => whisper_rs::dtw::AlignmentHeadsPreset::LargeV1,
+        12 => whisper_rs::dtw::AlignmentHeadsPreset::LargeV2,
+        13 => whisper_rs::dtw::AlignmentHeadsPreset::LargeV3,
+        14 => whisper_rs::dtw::AlignmentHeadsPreset::LargeV3Turbo,
+        _ if dtw_token_timestamps => whisper_rs::dtw::preset_for_model(
+            context.inner.model.hparams.model_type,
+            context.inner.model.hparams.is_multilingual(),
+        ),
+        _ => whisper_rs::dtw::AlignmentHeadsPreset::None,
+    };
+
     let vad_model_path = if params.vad_model.is_null() {
         None
     } else {
@@ -984,6 +1006,8 @@ unsafe fn build_rust_params(
         vad_min_silence_duration_ms: params.vad_params.min_silence_duration_ms.max(0) as usize,
         vad_speech_pad_ms: params.vad_params.speech_pad_ms.max(0) as usize,
         vad_model_path,
+        dtw_token_timestamps,
+        dtw_aheads_preset,
         on_progress,
         abort_callback,
         on_encoder_begin,

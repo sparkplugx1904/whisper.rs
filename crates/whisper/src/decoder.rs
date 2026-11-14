@@ -303,6 +303,11 @@ pub struct DecoderWorkspace {
     final_norm: Vec<f32>,
     logits: Vec<f32>,
     logits_len: usize,
+    /// Cross-attention weights captured for the selected DTW alignment heads,
+    /// laid out `[row][selected_head][n_audio_tokens]`.
+    aheads_attn: Vec<f32>,
+    /// Scratch row used to softmax one alignment head at a time.
+    aheads_scores: Vec<f32>,
 }
 
 impl DecoderWorkspace {
@@ -344,6 +349,18 @@ impl DecoderWorkspace {
         self.final_norm.clear();
         self.logits.clear();
         self.logits_len = 0;
+        self.aheads_attn.clear();
+        self.aheads_scores.clear();
+    }
+
+    /// Cross-attention weights captured by the last
+    /// [`WhisperDecoder::decode_with_alignment_heads`] call.
+    ///
+    /// The flat layout is `[row][selected_head][n_audio_tokens]`, where
+    /// `selected_head` follows the order of the head slice passed to the
+    /// decoder.
+    pub fn alignment_attention(&self) -> &[f32] {
+        &self.aheads_attn
     }
 
     fn ensure(&mut self, n_tokens: usize, d_model: usize, d_mlp: usize, n_vocab: usize) {
@@ -453,6 +470,43 @@ impl WhisperDecoder {
         cache: &mut DecoderKvCache,
         ws: &'a mut DecoderWorkspace,
     ) -> &'a mut [f32] {
+        self.decode_batch_inner(seqs, encoder_output, cache, ws, None)
+    }
+
+    /// Decode `tokens` in slot 0 and capture the cross-attention weights of
+    /// the selected `(layer, head)` pairs.
+    ///
+    /// `heads` indexes the model as `(text_layer, attention_head)`, matching
+    /// [`crate::dtw::AlignmentHeadsPreset`]. Weights are stored in
+    /// [`DecoderWorkspace::alignment_attention`] in
+    /// `[row][selected_head][n_audio_tokens]` order. The capture is a bounded
+    /// buffer owned by the workspace, not a per-token allocation, and the
+    /// extra arithmetic touches only the listed heads.
+    pub fn decode_with_alignment_heads<'a>(
+        &self,
+        tokens: &[i32],
+        encoder_output: &[f32],
+        cache: &mut DecoderKvCache,
+        ws: &'a mut DecoderWorkspace,
+        heads: &[(usize, usize)],
+    ) -> &'a mut [f32] {
+        self.decode_batch_inner(
+            &[DecodeSlot { slot: 0, tokens }],
+            encoder_output,
+            cache,
+            ws,
+            Some(heads),
+        )
+    }
+
+    fn decode_batch_inner<'a>(
+        &self,
+        seqs: &[DecodeSlot<'_>],
+        encoder_output: &[f32],
+        cache: &mut DecoderKvCache,
+        ws: &'a mut DecoderWorkspace,
+        aheads: Option<&[(usize, usize)]>,
+    ) -> &'a mut [f32] {
         let total_tokens: usize = seqs.iter().map(|s| s.tokens.len()).sum();
         if total_tokens == 0 {
             ws.logits_len = 0;
@@ -464,6 +518,21 @@ impl WhisperDecoder {
         let n_vocab = self.n_vocab;
 
         let n_audio_tokens = encoder_output.len() / d_model;
+
+        // Alignment-head capture uses one bounded row per output token. Only
+        // the requested heads are materialized; the normal decode path leaves
+        // both buffers empty.
+        let capture = aheads.filter(|heads| !heads.is_empty());
+        if let Some(heads) = capture {
+            resize_exact(
+                &mut ws.aheads_attn,
+                total_tokens * heads.len() * n_audio_tokens,
+            );
+            resize_exact(&mut ws.aheads_scores, n_audio_tokens);
+        } else {
+            ws.aheads_attn.clear();
+            ws.aheads_scores.clear();
+        }
 
         // The cross-attention tensors depend on the audio window, not on the
         // text history. Recompute them only when they are absent or sized for a
@@ -607,11 +676,21 @@ impl WhisperDecoder {
             );
 
             // (g) Cross-attention against the shared encoder key/value tensors.
+            let layer_heads: Vec<(usize, usize)> = capture
+                .map(|heads| {
+                    heads
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, &(layer, head))| (layer == l).then_some((slot, head)))
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut start = 0usize;
             for seq in seqs {
                 let n = seq.tokens.len();
-                let lo = start * d_model;
-                let hi = (start + n) * d_model;
+                let row_offset = start;
+                let lo = row_offset * d_model;
+                let hi = (row_offset + n) * d_model;
                 start += n;
                 if n == 0 {
                     continue;
@@ -627,6 +706,21 @@ impl WhisperDecoder {
                     false,
                     &mut ws.attn_out[lo..hi],
                 );
+                if !layer_heads.is_empty() {
+                    capture_cross_attention_heads(
+                        &ws.q_buf[lo..hi],
+                        &cache.k_cross[l],
+                        n,
+                        n_audio_tokens,
+                        self.n_heads,
+                        d_model,
+                        &layer_heads,
+                        capture.map_or(0, |heads| heads.len()),
+                        row_offset,
+                        &mut ws.aheads_attn,
+                        &mut ws.aheads_scores,
+                    );
+                }
             }
 
             // (h) Cross-attention output projection and residual.
@@ -690,6 +784,46 @@ impl WhisperDecoder {
 
         ws.logits_len = total_tokens * n_vocab;
         ws.logits_mut()
+    }
+}
+
+/// Compute softmax cross-attention weights for the selected heads.
+///
+/// `selected` pairs the caller's output slot with the model's head index.
+/// `out` is laid out `[row][selected_slot][n_audio]`, so one capture buffer is
+/// enough for every layer while the caller's head order is preserved.
+#[allow(clippy::too_many_arguments)]
+fn capture_cross_attention_heads(
+    q: &[f32],
+    k: &[f32],
+    n_tokens: usize,
+    n_audio: usize,
+    n_heads: usize,
+    d_model: usize,
+    selected: &[(usize, usize)],
+    n_selected: usize,
+    row_offset: usize,
+    out: &mut [f32],
+    scores: &mut [f32],
+) {
+    let d_head = d_model / n_heads;
+    let scale = 1.0f32 / (d_head as f32).sqrt();
+    debug_assert!(scores.len() >= n_audio);
+    debug_assert!(out.len() >= (row_offset + n_tokens) * n_selected * n_audio);
+
+    for i in 0..n_tokens {
+        for &(slot, head) in selected {
+            let head_offset = head * d_head;
+            let q_vec = &q[i * d_model + head_offset..i * d_model + head_offset + d_head];
+            for (j, score) in scores[..n_audio].iter_mut().enumerate() {
+                let k_vec = &k[j * d_model + head_offset..j * d_model + head_offset + d_head];
+                *score = whisper_tensor::simd::dot_f32(q_vec, k_vec) * scale;
+            }
+            whisper_tensor::ops::softmax_inplace(&mut scores[..n_audio]);
+
+            let dst = ((row_offset + i) * n_selected + slot) * n_audio;
+            out[dst..dst + n_audio].copy_from_slice(&scores[..n_audio]);
+        }
     }
 }
 

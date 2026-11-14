@@ -535,6 +535,11 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         language: args.language.clone(),
         translate: args.translate,
         beam_size: args.beam_size,
+        dtw_token_timestamps: args.word_timestamps,
+        dtw_aheads_preset: whisper_rs::dtw::preset_for_model(
+            ctx.model.hparams.model_type,
+            ctx.model.hparams.is_multilingual(),
+        ),
         initial_prompt: args.prompt.clone(),
         no_timestamps: args.no_timestamps,
         n_threads: args.threads,
