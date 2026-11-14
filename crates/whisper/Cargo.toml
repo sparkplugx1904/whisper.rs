@@ -13,6 +13,7 @@ whisper-grammar = { path = "../grammar" }
 whisper-vad = { path = "../vad" }
 thiserror = { workspace = true }
 regex = "1.10"
+rayon = { workspace = true }
 
 [dev-dependencies]
 byteorder = { workspace = true }

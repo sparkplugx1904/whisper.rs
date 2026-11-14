@@ -62,6 +62,23 @@ impl WhisperContext {
         params: &WhisperParams,
         samples: &[f32],
     ) -> Result<(), AudioError> {
+        // Every tensor operator uses the current Rayon pool. Building one here
+        // makes `n_threads` real for the whole call instead of falling back to
+        // the process-wide pool, and keeps two concurrent contexts from
+        // oversubscribing each other's workers.
+        let threads = params.n_threads.max(1);
+        match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+            Ok(pool) => pool.install(|| self.full_inner(state, params, samples)),
+            Err(_) => self.full_inner(state, params, samples),
+        }
+    }
+
+    fn full_inner(
+        &self,
+        state: &mut WhisperState,
+        params: &WhisperParams,
+        samples: &[f32],
+    ) -> Result<(), AudioError> {
         state.clear();
         if samples.len() < 1600 {
             return Ok(());
