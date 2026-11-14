@@ -897,11 +897,15 @@ impl WhisperContext {
                 }
 
                 let advanced_frames = ((last_end_time - seek_time) / 0.01).round() as usize;
-                if advanced_frames >= 100 {
-                    seek_frame += advanced_frames;
+                // Advance by the last emitted timestamp even when it is shorter
+                // than one second; jumping a full window here drops the audio
+                // between the last segment and the window end.
+                let step = if advanced_frames > 0 {
+                    advanced_frames
                 } else {
-                    seek_frame += chunk_frames;
-                }
+                    chunk_frames
+                };
+                seek_frame += step;
                 // Keep only ordinary text tokens; timestamps and all special tokens
                 // (including <|notimestamps|>) must not enter the next prompt.
                 history_tokens.extend(tokens_cur.iter().copied().filter(|&t| t >= 0 && t < eot));
