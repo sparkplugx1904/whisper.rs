@@ -27,7 +27,7 @@ OUT_BASE="$WORK/out/merged"
     -f "$WAV_PATH" \
     -l id \
     -t 4 \
-    -b 5 \
+    -b "${BEAM_SIZE:-5}" \
     --output-json \
     --output-txt \
     -o "$OUT_BASE" \
