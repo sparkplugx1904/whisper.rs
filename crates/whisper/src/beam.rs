@@ -429,3 +429,27 @@ impl BeamSearch {
         }
     }
 }
+
+#[cfg(test)]
+mod repetition_tests {
+    use super::repeats_ngram;
+
+    #[test]
+    fn blocks_third_copy_of_a_four_gram() {
+        let tokens = [1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3];
+        assert!(repeats_ngram(&tokens, 4, 100));
+    }
+
+    #[test]
+    fn allows_second_copy() {
+        let tokens = [1, 2, 3, 4, 1, 2, 3];
+        assert!(!repeats_ngram(&tokens, 4, 100));
+    }
+
+    #[test]
+    fn never_blocks_eot_or_timestamps() {
+        let tokens = [1, 2, 3, 4, 1, 2, 3];
+        assert!(!repeats_ngram(&tokens, 100, 100));
+        assert!(!repeats_ngram(&tokens, 150, 100));
+    }
+}

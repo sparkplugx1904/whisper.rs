@@ -1310,3 +1310,21 @@ impl FallbackEvaluation {
         }
     }
 }
+
+#[cfg(test)]
+mod repetition_guard_tests {
+    use super::has_repetition_loop;
+
+    #[test]
+    fn detects_a_repeated_eight_gram() {
+        let text = "dan menerima kasih ".repeat(12);
+        assert!(has_repetition_loop(&text));
+    }
+
+    #[test]
+    fn leaves_varied_speech_alone() {
+        let text =
+            "Sobat Trisma hari ini kita bakal ngebahas tentang perayaan unik di bulan Desember";
+        assert!(!has_repetition_loop(text));
+    }
+}
