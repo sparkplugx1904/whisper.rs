@@ -1066,6 +1066,15 @@ impl<'a> WindowPromptBuilder<'a> {
                 window_prompt.push(self.not_token);
             }
         }
+        // The decoder context is 448 positions and generation can consume up
+        // to 224 more. Keep the prompt at half the context, dropping the oldest
+        // history first; the trailing SOT/language/task tokens must survive.
+        const MAX_PROMPT_TOKENS: usize = 224;
+        if window_prompt.len() > MAX_PROMPT_TOKENS {
+            let drop = window_prompt.len() - MAX_PROMPT_TOKENS;
+            window_prompt.drain(..drop);
+        }
+
         window_prompt
     }
 }

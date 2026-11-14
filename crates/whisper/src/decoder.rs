@@ -237,6 +237,30 @@ impl DecoderKvCache {
     pub fn slot_len(&self, slot: usize) -> usize {
         self.t_past[slot]
     }
+
+    /// Make room for `n_new` tokens in `slot`, dropping the oldest cached rows
+    /// when the total would exceed `max_ctx`. Returns the position the first new
+    /// token occupies.
+    ///
+    /// The learned positional embedding has exactly `max_ctx` entries, so a
+    /// long prompt followed by a full generation must slide its history rather
+    /// than index past the table.
+    pub fn slide_to_fit(&mut self, slot: usize, n_new: usize, max_ctx: usize) -> usize {
+        let mut t_past = self.t_past[slot];
+        if t_past + n_new > max_ctx {
+            let drop = (t_past + n_new - max_ctx).min(t_past);
+            let drop_values = drop * self.d_model;
+            for layer in &mut self.k_self {
+                layer[slot].drain(..drop_values);
+            }
+            for layer in &mut self.v_self {
+                layer[slot].drain(..drop_values);
+            }
+            t_past -= drop;
+            self.t_past[slot] = t_past;
+        }
+        t_past
+    }
 }
 
 /// Copy `len` floats between two slots of the same layer without going through
@@ -462,11 +486,17 @@ impl WhisperDecoder {
         // 1. Token embedding lookup plus learned positional embedding.
         let mut row = 0usize;
         for seq in seqs {
-            let t_past = cache.t_past[seq.slot];
+            let n = seq.tokens.len();
+            // The learned positional embedding covers exactly `max_ctx`
+            // positions. A long window prompt plus a full generation can push
+            // the running offset past it, so slide the oldest rows out of the
+            // slot instead of indexing out of bounds.
+            let t_past = cache.slide_to_fit(seq.slot, n, self.max_ctx);
             for (i, &tok) in seq.tokens.iter().enumerate() {
                 let dst = &mut ws.x[row * d_model..(row + 1) * d_model];
                 self.weights.token_embedding.row_into(tok as usize, dst);
                 let pos = t_past + i;
+                debug_assert!(pos < self.max_ctx, "position {pos} outside the context");
                 let pe = &self.weights.positional_embedding[pos * d_model..(pos + 1) * d_model];
                 for (value, &offset) in dst.iter_mut().zip(pe) {
                     *value += offset;
@@ -724,5 +754,38 @@ fn multi_head_attention_with_cache(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod context_window_tests {
+    use super::DecoderKvCache;
+
+    #[test]
+    fn slide_to_fit_drops_oldest_rows() {
+        let mut cache = DecoderKvCache::new(1, 1, 2);
+        cache.t_past[0] = 4;
+        cache.k_self[0][0] = vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0];
+        cache.v_self[0][0] = cache.k_self[0][0].clone();
+
+        // 4 cached + 2 new against a 4-token context must drop the two oldest.
+        let pos = cache.slide_to_fit(0, 2, 4);
+
+        assert_eq!(pos, 2);
+        assert_eq!(cache.t_past[0], 2);
+        assert_eq!(cache.k_self[0][0], vec![3.0, 3.0, 4.0, 4.0]);
+        assert_eq!(cache.v_self[0][0], vec![3.0, 3.0, 4.0, 4.0]);
+    }
+
+    #[test]
+    fn slide_to_fit_is_a_noop_when_room_exists() {
+        let mut cache = DecoderKvCache::new(1, 1, 2);
+        cache.t_past[0] = 3;
+        cache.k_self[0][0] = vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
+        cache.v_self[0][0] = cache.k_self[0][0].clone();
+
+        assert_eq!(cache.slide_to_fit(0, 1, 8), 3);
+        assert_eq!(cache.t_past[0], 3);
+        assert_eq!(cache.k_self[0][0].len(), 6);
     }
 }
