@@ -411,6 +411,7 @@ impl WhisperContext {
                 .and_then(|g| whisper_grammar::GbnfGrammar::parse(g).ok());
 
             // Temperature fallback loop (e.g. 0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+            let mut force_greedy = false;
             while temperature <= 1.0 {
                 tokens_cur.clear();
                 token_logprobs.clear();
@@ -425,7 +426,7 @@ impl WhisperContext {
                 let mut cache =
                     DecoderKvCache::new(self.decoder.n_layers, n_slots, self.decoder.d_model);
 
-                if params.beam_size > 1 && temperature == 0.0 {
+                if params.beam_size > 1 && temperature == 0.0 && !force_greedy {
                     // BEAM SEARCH
                     let n_vocab = self.decoder.n_vocab;
                     let mut beam = BeamSearch::new(params.beam_size, &mut cache);
@@ -738,6 +739,14 @@ impl WhisperContext {
 
                 if !eval.fallback_needed || params.temperature_inc <= 0.0 {
                     break;
+                }
+                // A beam path that produced a repetition loop gets one clean
+                // greedy retry before the temperature ladder. Greedy does not
+                // share the beam's degenerate branch, and a sampled retry was
+                // still able to reproduce the same loop.
+                if params.beam_size > 1 && !force_greedy && temperature == 0.0 {
+                    force_greedy = true;
+                    continue;
                 }
                 // Trigger temperature fallback
                 temperature += params.temperature_inc;
