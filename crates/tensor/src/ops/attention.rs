@@ -1,5 +1,30 @@
 use crate::ops::softmax::softmax_inplace;
 use rayon::prelude::*;
+
+/// Query rows processed per tile by [`flash_attention_2`].
+///
+/// With a 64-wide head a query tile is `128 * 64 * 4 = 32 KiB` of query panel
+/// and the same of output accumulator. 128 rows give one task per head per
+/// 128 decoder positions: for 6 heads and a 1500-frame encoder that is 72
+/// independent tasks, wide enough to fill a large core count while keeping the
+/// per-task scratch below 100 KiB. Smaller tiles re-read the K/V stream more
+/// often (traffic scales with `t_kv / Q_TILE`); larger tiles gain little and
+/// inflate the scratch that every rayon worker keeps live.
+pub const Q_TILE: usize = 128;
+
+/// Keys processed per tile by [`flash_attention_2`].
+///
+/// 128 is a multiple of the 8-lane f32 micro-kernel used by `matrixmultiply`,
+/// so only the last tile of a sequence has a ragged edge. The score tile is
+/// `Q_TILE * KV_TILE * 4 = 64 KiB`, which does not fit a 32 KiB L1D but does
+/// fit a 512 KiB L2 together with the 32 KiB query and accumulator panels;
+/// it is written once and read twice per key tile, so L2 residency is what
+/// matters. The K and V panels (`KV_TILE * d_head * 4 = 32 KiB` each) are
+/// streamed sequentially and prefetched by hardware. Doubling the key tile
+/// halves the number of passes over the query/accumulator panels and the
+/// `sgemm` dispatch count, but pushes the score tile out of L2 entirely.
+pub const KV_TILE: usize = 128;
+
 #[allow(clippy::too_many_arguments)]
 pub fn multi_head_attention(
     q: &[f32],
@@ -15,9 +40,30 @@ pub fn multi_head_attention(
     flash_attention_2(q, k, v, t_q, t_kv, n_heads, d_model, causal, output);
 }
 
-/// Flash Attention 2 algorithm with Tiled Online Softmax.
-/// Processes Query in blocks of $B_r = 64$ and Key/Value in blocks of $B_c = 64$,
-/// computing exact attention without materializing the $T_q \times T_{kv}$ score matrix.
+/// Flash Attention 2 with tiled online softmax.
+///
+/// The kernel never materializes the $T_q \times T_{kv}$ score matrix. Work is
+/// split into `(head, query tile)` tasks; each task walks the key tiles of its
+/// head in order and maintains, per query row, the running row maximum `m`,
+/// the running normalizer `l` and the unnormalized output accumulator `acc`
+/// (the online-softmax recurrence of Dao et al.). A key tile contributes
+///
+/// ```text
+/// m_new = max(m, max_j s_j)
+/// l     = l * exp(m - m_new) + sum_j exp(s_j - m_new)
+/// acc   = acc * exp(m - m_new) + sum_j exp(s_j - m_new) * v_j
+/// ```
+///
+/// and the final output is `acc / l`. Because the statistics are folded in as
+/// the key tiles stream past, only a `Q_TILE x KV_TILE` score tile, a
+/// `Q_TILE x d_head` accumulator and two `Q_TILE` row vectors are live: no
+/// `T_q * T_kv` buffer is allocated and the score matrix is never written to
+/// or read from memory beyond the L1-resident tile.
+///
+/// `causal` masks keys with `j > i` (clamped to `t_kv`) and skips key tiles
+/// that lie entirely beyond the last query of the tile. Both matrix products
+/// are f32 `matrixmultiply` calls with runtime AVX2/FMA dispatch; the scalar
+/// fallback of that crate keeps the same f32 numerics on other targets.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attention_2(
     q: &[f32],
@@ -30,76 +76,168 @@ pub fn flash_attention_2(
     causal: bool,
     output: &mut [f32],
 ) {
+    assert!(n_heads > 0, "n_heads must be non-zero");
+    assert!(
+        d_model.is_multiple_of(n_heads),
+        "d_model ({d_model}) is not divisible by n_heads ({n_heads})"
+    );
     let d_head = d_model / n_heads;
     assert_eq!(q.len(), t_q * d_model);
     assert_eq!(k.len(), t_kv * d_model);
     assert_eq!(v.len(), t_kv * d_model);
     assert_eq!(output.len(), t_q * d_model);
 
-    if t_q == 1 && d_head == 64 {
+    if t_q == 0 {
+        return;
+    }
+    if t_kv == 0 {
+        output.fill(0.0);
+        return;
+    }
+
+    // A single decoder query has no query-tile dimension worth tiling and the
+    // dedicated kernel keeps the row statistics in registers. Causal
+    // single-query attention still needs the general path: it may only look at
+    // the first key, which the decode kernel does not mask.
+    if t_q == 1 && d_head == 64 && !causal {
         single_token_mha_d64(q, k, v, t_kv, n_heads, d_model, output);
         return;
     }
 
     let scale = 1.0f32 / (d_head as f32).sqrt();
+    let n_q_tiles = t_q.div_ceil(Q_TILE);
     let out_ptr = output.as_mut_ptr() as usize;
 
-    (0..n_heads).into_par_iter().for_each(|h| {
+    (0..n_heads * n_q_tiles).into_par_iter().for_each(|task| {
+        let h = task / n_q_tiles;
+        let i0 = (task % n_q_tiles) * Q_TILE;
+        let tr = (t_q - i0).min(Q_TILE);
         let head_offset = h * d_head;
-        let mut scores = vec![0.0f32; t_q * t_kv];
 
-        // 1. S_h = scale * (Q_h * K_h^T)
-        unsafe {
-            matrixmultiply::sgemm(
-                t_q,
-                d_head,
-                t_kv,
-                scale,
-                q.as_ptr().add(head_offset),
-                d_model as isize,
-                1,
-                k.as_ptr().add(head_offset),
-                1,
-                d_model as isize,
-                0.0,
-                scores.as_mut_ptr(),
-                t_kv as isize,
-                1,
-            );
-        }
+        // Scratch is owned by one `(head, query tile)` task and reused for
+        // every key tile, so the tiling loops below never allocate. Only `tr`
+        // rows are ever touched, which keeps short decoder calls cheap.
+        let mut scores = vec![0.0f32; tr * KV_TILE];
+        let mut acc = vec![0.0f32; tr * d_head];
+        let mut row_max = [f32::NEG_INFINITY; Q_TILE];
+        let mut row_sum = [0.0f32; Q_TILE];
 
-        // 2. Softmax per row
-        for i in 0..t_q {
-            let row = &mut scores[i * t_kv..(i + 1) * t_kv];
-            if causal {
-                let valid_len = (i + 1).min(t_kv);
-                softmax_inplace(&mut row[..valid_len]);
-                if valid_len < t_kv {
-                    row[valid_len..].fill(0.0);
-                }
-            } else {
-                softmax_inplace(row);
+        let p_q = unsafe { q.as_ptr().add(i0 * d_model + head_offset) };
+        let p_out = out_ptr as *mut f32;
+
+        let mut j0 = 0usize;
+        while j0 < t_kv {
+            // Under a causal mask no query of this tile can reach a key past
+            // `i0 + tr - 1`, so stop instead of masking whole tiles.
+            if causal && j0 > i0 + tr - 1 {
+                break;
             }
+            let tc = (t_kv - j0).min(KV_TILE);
+
+            // S = scale * Q_tile * K_tile^T. Rows use a fixed KV_TILE stride
+            // so a ragged final tile only shortens the row, it does not
+            // change the layout the two passes below index.
+            unsafe {
+                matrixmultiply::sgemm(
+                    tr,
+                    d_head,
+                    tc,
+                    scale,
+                    p_q,
+                    d_model as isize,
+                    1,
+                    k.as_ptr().add(j0 * d_model + head_offset),
+                    1,
+                    d_model as isize,
+                    0.0,
+                    scores.as_mut_ptr(),
+                    KV_TILE as isize,
+                    1,
+                );
+            }
+
+            for r in 0..tr {
+                let row = &mut scores[r * KV_TILE..r * KV_TILE + tc];
+                let end = if causal {
+                    (i0 + r + 1).saturating_sub(j0).min(tc)
+                } else {
+                    tc
+                };
+                if end == 0 {
+                    // The whole tile is masked for this row; clear the raw
+                    // scores so the PV product contributes nothing.
+                    row.fill(0.0);
+                    continue;
+                }
+
+                let mut m_tile = f32::NEG_INFINITY;
+                for &s in &row[..end] {
+                    m_tile = m_tile.max(s);
+                }
+                let m_prev = row_max[r];
+                let m_new = m_prev.max(m_tile);
+                let alpha = if m_prev == f32::NEG_INFINITY {
+                    0.0
+                } else {
+                    (m_prev - m_new).exp()
+                };
+
+                let mut l_tile = 0.0f32;
+                for s in &mut row[..end] {
+                    let p = (*s - m_new).exp();
+                    *s = p;
+                    l_tile += p;
+                }
+                // Masked columns and the ragged tail must multiply to zero.
+                row[end..].fill(0.0);
+
+                row_max[r] = m_new;
+                row_sum[r] = row_sum[r] * alpha + l_tile;
+                if alpha != 1.0 {
+                    let acc_row = &mut acc[r * d_head..(r + 1) * d_head];
+                    for a in acc_row.iter_mut() {
+                        *a *= alpha;
+                    }
+                }
+            }
+
+            // acc = acc + P_tile * V_tile. Rows that were fully masked hold a
+            // zero probability row and leave `acc` untouched.
+            unsafe {
+                matrixmultiply::sgemm(
+                    tr,
+                    tc,
+                    d_head,
+                    1.0,
+                    scores.as_ptr(),
+                    KV_TILE as isize,
+                    1,
+                    v.as_ptr().add(j0 * d_model + head_offset),
+                    d_model as isize,
+                    1,
+                    1.0,
+                    acc.as_mut_ptr(),
+                    d_head as isize,
+                    1,
+                );
+            }
+
+            j0 += KV_TILE;
         }
 
-        // 3. O_h = S_h * V_h
-        unsafe {
-            matrixmultiply::sgemm(
-                t_q,
-                t_kv,
-                d_head,
-                1.0,
-                scores.as_ptr(),
-                t_kv as isize,
-                1,
-                v.as_ptr().add(head_offset),
-                d_model as isize,
-                1,
-                0.0,
-                (out_ptr as *mut f32).add(head_offset),
-                d_model as isize,
-                1,
-            );
+        for r in 0..tr {
+            let inv_sum = if row_sum[r] > 0.0 {
+                1.0 / row_sum[r]
+            } else {
+                0.0
+            };
+            let dst = unsafe { p_out.add((i0 + r) * d_model + head_offset) };
+            let acc_row = &acc[r * d_head..(r + 1) * d_head];
+            for (d, &a) in acc_row.iter().enumerate() {
+                unsafe {
+                    *dst.add(d) = a * inv_sum;
+                }
+            }
         }
     });
 }
