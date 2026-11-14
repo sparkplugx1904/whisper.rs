@@ -614,6 +614,10 @@ impl WhisperContext {
 
                     // `_NO_SPEECH_` id for this model's vocabulary.
                     let no_speech_token = self.model.vocab.token_nosp;
+                    let mut rng_state = (seek_frame as u64)
+                        .wrapping_mul(0x9e3779b97f4a7c15)
+                        .wrapping_add(0x2545f4914f6cdd1d)
+                        | 1;
                     for step in 0..max_steps {
                         if params.abort_callback.as_ref().is_some_and(|cb| cb()) {
                             break;
@@ -669,15 +673,23 @@ impl WhisperContext {
                             step_logits[not_idx] = f32::NEG_INFINITY;
                         }
 
-                        // Greedy argmax & logprob calculation
-                        let mut best_id = 0;
-                        let mut best_logit = f32::NEG_INFINITY;
-                        for (i, &l) in step_logits.iter().enumerate() {
-                            if l > best_logit {
-                                best_logit = l;
-                                best_id = i as i32;
+                        // At temperature zero this is argmax; the fallback
+                        // ladder raises the temperature, and upstream then
+                        // samples from the distribution instead of repeating
+                        // the same argmax forever.
+                        let (best_id, best_logit) = if temperature > 0.0 {
+                            sample_token(step_logits, &mut rng_state)
+                        } else {
+                            let mut best_id = 0i32;
+                            let mut best_logit = f32::NEG_INFINITY;
+                            for (i, &l) in step_logits.iter().enumerate() {
+                                if l > best_logit {
+                                    best_logit = l;
+                                    best_id = i as i32;
+                                }
                             }
-                        }
+                            (best_id, best_logit)
+                        };
 
                         let max_l = step_logits
                             .iter()
@@ -1165,6 +1177,74 @@ fn log_softmax(logits: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+/// Draw one token from a logits row with an xorshift64 generator.
+fn sample_token(logits: &[f32], state: &mut u64) -> (i32, f32) {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if max == f32::NEG_INFINITY {
+        return (0, f32::NEG_INFINITY);
+    }
+    let mut sum = 0.0f64;
+    let mut weights = Vec::with_capacity(logits.len());
+    for &value in logits {
+        let weight = if value > f32::NEG_INFINITY {
+            ((value - max) as f64).exp()
+        } else {
+            0.0
+        };
+        sum += weight;
+        weights.push(weight);
+    }
+    if sum <= 0.0 {
+        return (0, f32::NEG_INFINITY);
+    }
+
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    let mut target = (*state as f64 / u64::MAX as f64) * sum;
+    for (index, weight) in weights.iter().enumerate() {
+        target -= weight;
+        if target <= 0.0 {
+            return (index as i32, logits[index]);
+        }
+    }
+    (logits.len() as i32 - 1, logits[logits.len() - 1])
+}
+
+/// True when the text contains an obvious repetition loop.
+///
+/// The compression-ratio check catches many loops, but a repeated phrase inside
+/// an otherwise varied window can slip under the 2.4 threshold. A repeated
+/// 8-gram is a direct signal that the decoder is stuck, which is exactly when
+/// the temperature fallback must retry.
+fn has_repetition_loop(text: &str) -> bool {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() < 32 {
+        return false;
+    }
+
+    let mut counts: std::collections::HashMap<[u64; 8], u32> = std::collections::HashMap::new();
+    for window in words.windows(8) {
+        let mut key = [0u64; 8];
+        for (slot, word) in key.iter_mut().zip(window) {
+            // FNV-1a keeps the key cheap; collisions only make the detector
+            // slightly conservative.
+            let mut hash = 0xcbf29ce484222325u64;
+            for byte in word.as_bytes() {
+                hash ^= *byte as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            *slot = hash;
+        }
+        let entry = counts.entry(key).or_insert(0);
+        *entry += 1;
+        if *entry >= 4 {
+            return true;
+        }
+    }
+    false
+}
+
 /// Evaluator for decoding quality metrics against temperature fallback criteria.
 #[derive(Debug, Clone, Copy)]
 pub struct FallbackEvaluation {
@@ -1196,6 +1276,7 @@ impl FallbackEvaluation {
 
         let cr = compression_ratio(text);
         let fallback_needed = cr > params.compression_ratio_threshold
+            || has_repetition_loop(text)
             || (avg_logprob < params.logprob_threshold as f32
                 && no_speech_prob < params.no_speech_threshold as f32)
             || (token_entropies.len() >= 32 && avg_entropy > params.entropy_thold);
