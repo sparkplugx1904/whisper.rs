@@ -17,6 +17,9 @@ pub struct BeamCandidate {
     pub slot: usize,
     pub completed: bool,
     pub last_timestamp: Option<i32>,
+    /// Number of tokens up to and including the last timestamp after the
+    /// leading `<|0.00|>` marker. whisper.cpp scores only this prefix.
+    pub result_len: usize,
 }
 
 pub struct BeamSearch {
@@ -43,13 +46,19 @@ fn sequence_score(candidate: &BeamCandidate, length_penalty: f32) -> f64 {
         return f64::NEG_INFINITY;
     }
 
-    let len = candidate.tokens.len() as f64;
+    let len = candidate.result_len.max(1) as f64;
     let penalty = if length_penalty > 0.0 {
         ((5.0 + len) / 6.0).powf(length_penalty as f64)
     } else {
         len
     };
-    candidate.cumulative_logprob / penalty
+    let score: f64 = candidate
+        .token_logprobs
+        .iter()
+        .take(candidate.result_len)
+        .map(|&value| value as f64)
+        .sum();
+    score / penalty
 }
 
 impl BeamSearch {
@@ -70,6 +79,7 @@ impl BeamSearch {
             slot: 0,
             completed: false,
             last_timestamp: None,
+            result_len: 0,
         };
 
         Self {
@@ -252,6 +262,11 @@ impl BeamSearch {
 
                 let mut token_logprobs = cand.token_logprobs.clone();
                 token_logprobs.push(logp);
+                let result_len = if tok > beg {
+                    new_tokens.len()
+                } else {
+                    cand.result_len
+                };
                 let branch = BeamCandidate {
                     tokens: new_tokens,
                     token_logprobs,
@@ -259,7 +274,13 @@ impl BeamSearch {
                     slot: cand.slot,
                     completed: is_completed,
                     last_timestamp: new_ts,
+                    result_len,
                 };
+                // A completion with no timestamp after the initial marker is
+                // the jingle/station-ID failure mode: upstream rejects it.
+                if is_completed && result_len == 0 && !no_timestamps {
+                    continue;
+                }
                 if is_completed {
                     self.completed_candidates.push(branch);
                 } else {
@@ -335,33 +356,14 @@ impl BeamSearch {
         self.candidates.is_empty()
     }
 
-    pub fn best_candidate(&self, length_penalty: f32, beg: i32) -> Option<&BeamCandidate> {
-        // Prefer a finished hypothesis that covers the most of the window.
-        // Length-normalized logprob alone picks a station-ID-sized EOT branch
-        // over a longer transcript, which then makes the caller skip the rest
-        // of the window. Ties fall back to the usual sequence score.
-        let rank = |candidate: &BeamCandidate| {
-            let last_timestamp = candidate
-                .tokens
-                .iter()
-                .rev()
-                .find(|&&token| token >= beg)
-                .copied()
-                .unwrap_or(beg);
-            (last_timestamp, sequence_score(candidate, length_penalty))
-        };
-
+    pub fn best_candidate(&self, length_penalty: f32) -> Option<&BeamCandidate> {
         self.candidates
             .iter()
             .chain(&self.completed_candidates)
             .max_by(|a, b| {
-                let (ts_a, score_a) = rank(a);
-                let (ts_b, score_b) = rank(b);
-                ts_a.cmp(&ts_b).then_with(|| {
-                    score_a
-                        .partial_cmp(&score_b)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+                sequence_score(a, length_penalty)
+                    .partial_cmp(&sequence_score(b, length_penalty))
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
     }
 

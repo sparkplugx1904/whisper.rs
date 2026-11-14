@@ -470,6 +470,15 @@ impl WhisperContext {
                             self.tokenizer.clone(),
                         ));
                     }
+                    // The no-speech probability must be read from the raw row.
+                    // The timestamp-mass rule masks every text token, including
+                    // `_NO_SPEECH_`, so reading it after filtering reports 0 for
+                    // any window that opens with a timestamp.
+                    let no_speech_idx = self.model.vocab.token_nosp as usize;
+                    if no_speech_idx < step_logits.len() {
+                        no_speech_prob = softmax_prob_at(step_logits, no_speech_idx);
+                    }
+
                     let seed_ctx = LogitFilterContext {
                         step: 0,
                         tokens_cur: &[],
@@ -477,35 +486,16 @@ impl WhisperContext {
                     };
                     beam_pipeline.apply(step_logits, &seed_ctx);
 
-                    // The beam path used to leave no_speech_prob at its 0.01
-                    // placeholder, which disabled the silence gate and made
-                    // every fallback report look identical.
-                    let max_logit = step_logits
-                        .iter()
-                        .copied()
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    let sum_exp: f32 = step_logits
-                        .iter()
-                        .map(|&value| {
-                            if value > f32::NEG_INFINITY {
-                                (value - max_logit).exp()
-                            } else {
-                                0.0
-                            }
-                        })
-                        .sum();
-                    let log_sum_exp = max_logit + sum_exp.max(1e-10).ln();
-                    let no_speech_idx = self.model.vocab.token_nosp as usize;
-                    if no_speech_idx < step_logits.len() {
-                        no_speech_prob = (step_logits[no_speech_idx] - log_sum_exp)
-                            .exp()
-                            .clamp(0.0, 1.0);
-                    }
+                    // Seed branches compete on log-probability, like every later
+                    // step; the raw projection output is a logit, not a log-prob.
+                    let seed_log_probs = log_softmax(step_logits);
 
                     let mut seed_tokens = Vec::new();
-                    for (tok, &l) in step_logits.iter().enumerate() {
+                    for (tok, (&l, &logprob)) in
+                        step_logits.iter().zip(seed_log_probs.iter()).enumerate()
+                    {
                         if l > f32::NEG_INFINITY {
-                            seed_tokens.push((tok as i32, l));
+                            seed_tokens.push((tok as i32, logprob));
                         }
                     }
                     seed_tokens
@@ -533,6 +523,7 @@ impl WhisperContext {
                                     slot,
                                     completed: tok == eot,
                                     last_timestamp: if tok >= beg { Some(tok) } else { None },
+                                    result_len: usize::from(tok > beg),
                                 }
                             })
                             .collect(),
@@ -569,7 +560,7 @@ impl WhisperContext {
                     } else {
                         0.7
                     };
-                    if let Some(best) = beam.best_candidate(length_penalty, beg) {
+                    if let Some(best) = beam.best_candidate(length_penalty) {
                         tokens_cur = best.tokens.clone();
                         token_logprobs = best.token_logprobs.clone();
                     }
@@ -649,6 +640,16 @@ impl WhisperContext {
                         // reused workspace instead of a fresh vector per token.
                         let step_logits = &mut state.workspace.logits_mut()[start_idx..];
 
+                        // Same ordering constraint as the beam path: the
+                        // `_NO_SPEECH_` logit is a text token and the timestamp
+                        // filters can mask it, so sample it from the raw row.
+                        if step == 0 {
+                            let ns_idx = no_speech_token as usize;
+                            if ns_idx < step_logits.len() {
+                                no_speech_prob = softmax_prob_at(step_logits, ns_idx);
+                            }
+                        }
+
                         let filter_ctx = LogitFilterContext {
                             step,
                             tokens_cur: &tokens_cur,
@@ -686,20 +687,6 @@ impl WhisperContext {
 
                         let step_entropy = crate::filter::compute_distribution_entropy(step_logits);
                         token_entropies.push(step_entropy);
-
-                        // The no-speech probability comes from the dedicated
-                        // `_NO_SPEECH_` token, whose id differs between the
-                        // English-only and multilingual vocabularies (50361 vs
-                        // 50362 here). Reading a fixed index picked up the
-                        // `_NOT_` logit for English models, so every segment
-                        // reported a no-speech probability of ~0 even on
-                        // digital silence. The id now comes from the vocabulary.
-                        if step == 0 {
-                            let ns_logit = step_logits[no_speech_token as usize];
-                            if ns_logit > f32::NEG_INFINITY {
-                                no_speech_prob = (ns_logit - lse).exp().clamp(0.0, 1.0);
-                            }
-                        }
 
                         state
                             .timings
@@ -1107,11 +1094,57 @@ impl<'a> WindowPromptBuilder<'a> {
         const MAX_PROMPT_TOKENS: usize = 224;
         if window_prompt.len() > MAX_PROMPT_TOKENS {
             let drop = window_prompt.len() - MAX_PROMPT_TOKENS;
-            window_prompt.drain(..drop);
+            // `<|startofprev|>` is the only marker that distinguishes prompt
+            // conditioning from a bare prefix; never drain it with the history.
+            let start = usize::from(window_prompt.first() == Some(&self.token_prev));
+            window_prompt.drain(start..start + drop);
         }
 
         window_prompt
     }
+}
+
+/// Log-sum-exp over a finite logits row.
+fn log_sum_exp(logits: &[f32]) -> f32 {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if max == f32::NEG_INFINITY {
+        return f32::NEG_INFINITY;
+    }
+    let sum: f32 = logits
+        .iter()
+        .map(|&value| {
+            if value > f32::NEG_INFINITY {
+                (value - max).exp()
+            } else {
+                0.0
+            }
+        })
+        .sum();
+    max + sum.max(1e-10).ln()
+}
+
+/// Softmax probability of one token without allocating.
+fn softmax_prob_at(logits: &[f32], index: usize) -> f32 {
+    let lse = log_sum_exp(logits);
+    if lse == f32::NEG_INFINITY || index >= logits.len() {
+        return 0.0;
+    }
+    (logits[index] - lse).exp().clamp(0.0, 1.0)
+}
+
+/// Log-softmax for every entry, used to seed beam branches.
+fn log_softmax(logits: &[f32]) -> Vec<f32> {
+    let lse = log_sum_exp(logits);
+    logits
+        .iter()
+        .map(|&value| {
+            if value > f32::NEG_INFINITY {
+                value - lse
+            } else {
+                f32::NEG_INFINITY
+            }
+        })
+        .collect()
 }
 
 /// Evaluator for decoding quality metrics against temperature fallback criteria.
