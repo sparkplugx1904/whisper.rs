@@ -43,6 +43,29 @@ pub struct BeamSearch {
     pub logits_callback: Option<crate::params::LogitsCallback>,
 }
 
+/// True when appending `next` would create the third occurrence of a 4-gram.
+fn repeats_ngram(tokens: &[i32], next: i32, eot: i32) -> bool {
+    if next < 0 || next >= eot || tokens.len() < 4 {
+        return false;
+    }
+    let pattern = [
+        tokens[tokens.len() - 3],
+        tokens[tokens.len() - 2],
+        tokens[tokens.len() - 1],
+        next,
+    ];
+    let mut count = 0usize;
+    for window in tokens.windows(4) {
+        if window == pattern {
+            count += 1;
+            if count >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn sequence_score(candidate: &BeamCandidate, length_penalty: f32) -> f64 {
     if candidate.tokens.is_empty() {
         return f64::NEG_INFINITY;
@@ -248,11 +271,26 @@ impl BeamSearch {
             let log_sum_exp = sum_exp.max(1e-10).ln();
 
             // Find top-K tokens for this candidate into the reusable buffer.
+            // A token that would close a third copy of a 4-gram is masked so the
+            // branch cannot lock into a repetition loop; the mask is dropped if
+            // it would leave the beam with no candidate at all.
             self.top_tokens.clear();
             for (tok_id, &l) in step_logits.iter().enumerate() {
                 if l > f32::NEG_INFINITY {
+                    let token = tok_id as i32;
+                    if repeats_ngram(&cand.tokens, token, eot) {
+                        continue;
+                    }
                     let logprob = (l - max_l) - log_sum_exp;
-                    self.top_tokens.push((tok_id as i32, logprob));
+                    self.top_tokens.push((token, logprob));
+                }
+            }
+            if self.top_tokens.is_empty() {
+                for (tok_id, &l) in step_logits.iter().enumerate() {
+                    if l > f32::NEG_INFINITY {
+                        let logprob = (l - max_l) - log_sum_exp;
+                        self.top_tokens.push((tok_id as i32, logprob));
+                    }
                 }
             }
             self.top_tokens
