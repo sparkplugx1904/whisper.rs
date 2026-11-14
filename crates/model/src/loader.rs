@@ -502,11 +502,11 @@ impl WhisperModel {
     /// Returns a 2D weight tensor as a [`whisper_tensor::LinearWeight`], preserving its
     /// on-disk storage format.
     ///
-    /// Quantized tensors are deliberately not expanded to `f32` here. Single-token
+    /// Neither quantized nor f16 tensors are expanded to `f32` here. Single-token
     /// autoregressive decoding is memory-bandwidth bound: each step streams the whole
     /// weight matrix through the CPU for an $M=1$ GEMV, so keeping the compact block
-    /// layout cuts memory traffic by 4x to 8x. Only F32/F16 tensors, which are already
-    /// float data, are materialized into a `Vec<f32>`.
+    /// layout cuts memory traffic by 4x to 8x, and keeping f16 halves packed cuts
+    /// it by 2x. Only F32 tensors are already dense floats and need no conversion.
     pub fn get_linear_weight(
         &self,
         name: &str,
@@ -536,7 +536,12 @@ impl WhisperModel {
         }
 
         match raw.dtype {
-            DType::F32 | DType::F16 => {
+            DType::F16 => Ok(whisper_tensor::LinearWeight::from_f16(
+                rows,
+                cols,
+                raw.data.to_vec(),
+            )),
+            DType::F32 => {
                 let data = raw.dequantize().map_err(|e| {
                     ModelError::FormatError(format!("Failed to dequantize '{}': {}", name, e))
                 })?;

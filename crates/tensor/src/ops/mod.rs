@@ -11,7 +11,8 @@ pub use gelu::{gelu_inplace, gelu_scalar};
 pub use matmul::{add_inplace, linear};
 pub use norm::layer_norm;
 pub use quant::{
-    quantized_gemv_parallel, quantized_linear, quantized_linear_vector, quantized_matmul,
-    vec_dot_q4_0_f32, vec_dot_q4_1_f32, vec_dot_q5_0_f32, vec_dot_q5_1_f32, vec_dot_q8_0_f32,
+    f16_gemv_parallel, f16_linear, f16_linear_vector, quantized_gemv_parallel, quantized_linear,
+    quantized_linear_vector, quantized_matmul, vec_dot_f16_f32, vec_dot_q4_0_f32, vec_dot_q4_1_f32,
+    vec_dot_q5_0_f32, vec_dot_q5_1_f32, vec_dot_q8_0_f32,
 };
 pub use softmax::softmax_inplace;

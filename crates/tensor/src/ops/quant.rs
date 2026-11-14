@@ -184,6 +184,157 @@ pub fn quantized_gemv_parallel(
     quantized_linear_vector(weight_bytes, dtype, rows, cols, x, bias, output, n_threads);
 }
 
+/// Dot product between one row of raw little-endian f16 halves and a float vector.
+///
+/// This is the primitive used by the native F16 weight path: the halves are
+/// converted inside the SIMD kernel and never expanded into a `Vec<f32>`.
+pub fn vec_dot_f16_f32(row_bytes: &[u8], x: &[f32]) -> f32 {
+    assert_eq!(row_bytes.len(), x.len() * 2);
+    crate::simd::dot_f16_f32(row_bytes, x)
+}
+
+/// Single-token F16 matrix-vector product with an explicit thread count.
+///
+/// `weight_bytes` holds `rows * cols` little-endian halves in row-major order.
+/// Rows are split into contiguous chunks so each worker streams its own slice
+/// of the matrix; the row kernel converts halves to f32 on the fly and
+/// accumulates in f32 for numerical parity with the dense path.
+#[allow(clippy::too_many_arguments)]
+pub fn f16_linear_vector(
+    weight_bytes: &[u8],
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+    bias: Option<&[f32]>,
+    output: &mut [f32],
+    n_threads: usize,
+) {
+    assert_eq!(x.len(), cols);
+    assert_eq!(output.len(), rows);
+    if let Some(b) = bias {
+        assert_eq!(b.len(), rows);
+    }
+
+    let bytes_per_row = cols * 2;
+    assert_eq!(weight_bytes.len(), rows * bytes_per_row);
+
+    if rows == 0 || cols == 0 {
+        return;
+    }
+
+    use rayon::prelude::*;
+
+    let n_threads = n_threads.clamp(1, 16);
+    let chunk_size = rows.div_ceil(n_threads);
+
+    output
+        .par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(chunk_idx, out_chunk)| {
+            let r_start = chunk_idx * chunk_size;
+
+            for (r_rel, out_val) in out_chunk.iter_mut().enumerate() {
+                let r_abs = r_start + r_rel;
+                let row_bytes = &weight_bytes[r_abs * bytes_per_row..(r_abs + 1) * bytes_per_row];
+                let dot = crate::simd::dot_f16_f32(row_bytes, x);
+                *out_val = match bias {
+                    Some(b) => dot + b[r_abs],
+                    None => dot,
+                };
+            }
+        });
+}
+
+/// Single-token F16 GEMV using every available core.
+///
+/// Decoding is bandwidth bound on the weight stream, and half precision halves
+/// that stream relative to an f32 copy while avoiding any load-time expansion.
+pub fn f16_gemv_parallel(
+    weight_bytes: &[u8],
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+    bias: Option<&[f32]>,
+    output: &mut [f32],
+) {
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16);
+    f16_linear_vector(weight_bytes, rows, cols, x, bias, output, n_threads);
+}
+
+/// F16 matrix-matrix product: `output[t * rows + r] = W[r] · x[t] + bias[r]`.
+///
+/// Rows are streamed once and evaluated against every token while still hot, so
+/// prompt evaluation does not re-read the weight matrix per token. The
+/// per-chunk results land in a row-major scratch buffer because that keeps each
+/// row's token accumulators contiguous; the final transpose into the token-major
+/// public layout is a linear copy. No allocation happens per row or per token.
+#[allow(clippy::too_many_arguments)]
+pub fn f16_linear(
+    weight_bytes: &[u8],
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+    bias: Option<&[f32]>,
+    num_tokens: usize,
+    output: &mut [f32],
+) {
+    assert_eq!(x.len(), num_tokens * cols);
+    assert_eq!(output.len(), num_tokens * rows);
+    if let Some(b) = bias {
+        assert_eq!(b.len(), rows);
+    }
+
+    if num_tokens == 0 || rows == 0 || cols == 0 {
+        return;
+    }
+
+    if num_tokens == 1 {
+        f16_gemv_parallel(weight_bytes, rows, cols, x, bias, output);
+        return;
+    }
+
+    let bytes_per_row = cols * 2;
+    assert_eq!(weight_bytes.len(), rows * bytes_per_row);
+
+    use rayon::prelude::*;
+
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16);
+    let chunk_rows = rows.div_ceil(n_threads).max(1);
+
+    let mut row_major = vec![0.0f32; rows * num_tokens];
+    row_major
+        .par_chunks_mut(chunk_rows * num_tokens)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let r_start = chunk_idx * chunk_rows;
+            for (r_rel, row_out) in chunk.chunks_mut(num_tokens).enumerate() {
+                let r_abs = r_start + r_rel;
+                let row_bytes = &weight_bytes[r_abs * bytes_per_row..(r_abs + 1) * bytes_per_row];
+                let b = bias.map(|b| b[r_abs]);
+                for (t, out_val) in row_out.iter_mut().enumerate() {
+                    let x_t = &x[t * cols..(t + 1) * cols];
+                    let dot = crate::simd::dot_f16_f32(row_bytes, x_t);
+                    *out_val = match b {
+                        Some(b) => dot + b,
+                        None => dot,
+                    };
+                }
+            }
+        });
+
+    for (r, src) in row_major.chunks_exact(num_tokens).enumerate() {
+        for (t, &val) in src.iter().enumerate() {
+            output[t * rows + r] = val;
+        }
+    }
+}
+
 /// Quantized matrix-matrix product: `output[t * rows + r] = W[r] · x[t] + bias[r]`.
 ///
 /// Prompt evaluation feeds several tokens through the same weight matrix. Doing

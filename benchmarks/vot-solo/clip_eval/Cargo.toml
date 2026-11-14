@@ -1,0 +1,17 @@
+[package]
+name = "clip-eval"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+whisper-rs = { path = "../../../crates/whisper" }
+whisper-audio = { path = "../../../crates/audio" }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

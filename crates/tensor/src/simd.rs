@@ -580,3 +580,120 @@ unsafe fn vec_dot_q4_k_f32_avx2(raw_blocks: &[u8], x: &[f32]) -> f32 {
 
     total_sum
 }
+
+/// Dot product between a row of little-endian f16 halves and an f32 vector.
+///
+/// Half precision is the native on-disk format of most GGML checkpoints. The
+/// kernel converts eight halves per vector register and accumulates in f32, so
+/// the weight stream is half the size of a dequantized copy and no temporary
+/// row buffer is needed.
+#[inline(always)]
+pub fn dot_f16_f32(row_bytes: &[u8], x: &[f32]) -> f32 {
+    debug_assert_eq!(row_bytes.len(), x.len() * 2);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && is_x86_feature_detected!("f16c")
+        {
+            return unsafe { dot_f16_f32_avx2(row_bytes, x) };
+        }
+    }
+
+    dot_f16_f32_scalar(row_bytes, x)
+}
+
+#[inline(always)]
+fn f16_at(bytes: &[u8], offset: usize) -> f32 {
+    half::f16::from_bits(u16::from_le_bytes([bytes[offset], bytes[offset + 1]])).to_f32()
+}
+
+pub fn dot_f16_f32_scalar(row_bytes: &[u8], x: &[f32]) -> f32 {
+    assert_eq!(row_bytes.len(), x.len() * 2);
+
+    let len = x.len();
+    let mut acc0 = 0.0f32;
+    let mut acc1 = 0.0f32;
+    let mut acc2 = 0.0f32;
+    let mut acc3 = 0.0f32;
+    let mut i = 0;
+
+    while i + 4 <= len {
+        let base = i * 2;
+        acc0 += f16_at(row_bytes, base) * x[i];
+        acc1 += f16_at(row_bytes, base + 2) * x[i + 1];
+        acc2 += f16_at(row_bytes, base + 4) * x[i + 2];
+        acc3 += f16_at(row_bytes, base + 6) * x[i + 3];
+        i += 4;
+    }
+
+    let mut sum = (acc0 + acc1) + (acc2 + acc3);
+    while i < len {
+        sum += f16_at(row_bytes, i * 2) * x[i];
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn dot_f16_f32_avx2(row_bytes: &[u8], x: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+
+    let len = x.len();
+    let p_w = row_bytes.as_ptr();
+    let p_x = x.as_ptr();
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+
+    // Four independent accumulator chains hide the FMA latency; each step
+    // consumes 32 halves (64 bytes) of weights.
+    let n_blocks = len / 32;
+    for i in 0..n_blocks {
+        let w_off = i * 64;
+        let w0 = _mm_loadu_si128(p_w.add(w_off) as *const __m128i);
+        let w1 = _mm_loadu_si128(p_w.add(w_off + 16) as *const __m128i);
+        let w2 = _mm_loadu_si128(p_w.add(w_off + 32) as *const __m128i);
+        let w3 = _mm_loadu_si128(p_w.add(w_off + 48) as *const __m128i);
+
+        let x_off = i * 32;
+        acc0 = _mm256_fmadd_ps(_mm256_cvtph_ps(w0), _mm256_loadu_ps(p_x.add(x_off)), acc0);
+        acc1 = _mm256_fmadd_ps(
+            _mm256_cvtph_ps(w1),
+            _mm256_loadu_ps(p_x.add(x_off + 8)),
+            acc1,
+        );
+        acc2 = _mm256_fmadd_ps(
+            _mm256_cvtph_ps(w2),
+            _mm256_loadu_ps(p_x.add(x_off + 16)),
+            acc2,
+        );
+        acc3 = _mm256_fmadd_ps(
+            _mm256_cvtph_ps(w3),
+            _mm256_loadu_ps(p_x.add(x_off + 24)),
+            acc3,
+        );
+    }
+
+    let acc01 = _mm256_add_ps(acc0, acc1);
+    let acc23 = _mm256_add_ps(acc2, acc3);
+    let mut acc = _mm256_add_ps(acc01, acc23);
+
+    let mut i = n_blocks * 32;
+    while i + 8 <= len {
+        let w = _mm_loadu_si128(p_w.add(i * 2) as *const __m128i);
+        acc = _mm256_fmadd_ps(_mm256_cvtph_ps(w), _mm256_loadu_ps(p_x.add(i)), acc);
+        i += 8;
+    }
+
+    let mut result = hsum256_ps(acc);
+    while i < len {
+        result += f16_at(row_bytes, i * 2) * *p_x.add(i);
+        i += 1;
+    }
+    result
+}

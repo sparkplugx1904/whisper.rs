@@ -799,9 +799,11 @@ impl WhisperContext {
                         seek_time,
                         t1,
                         chunk,
-                        avg_logprob,
-                        no_speech_prob,
-                        avg_entropy,
+                        SegmentStats {
+                            avg_logprob,
+                            no_speech_prob,
+                            avg_entropy,
+                        },
                     );
                     if !seg.text.trim().is_empty() {
                         if let Some(cb) = &params.on_new_segment {
@@ -835,9 +837,11 @@ impl WhisperContext {
                                 seg_t0,
                                 abs_sec,
                                 &seg_tokens,
-                                avg_logprob,
-                                no_speech_prob,
-                                avg_entropy,
+                                SegmentStats {
+                                    avg_logprob,
+                                    no_speech_prob,
+                                    avg_entropy,
+                                },
                             );
                             if !seg.text.trim().is_empty() {
                                 if let Some(cb) = &params.on_new_segment {
@@ -863,9 +867,11 @@ impl WhisperContext {
                                 seg_t0,
                                 t_mid,
                                 &seg_tokens,
-                                avg_logprob,
-                                no_speech_prob,
-                                avg_entropy,
+                                SegmentStats {
+                                    avg_logprob,
+                                    no_speech_prob,
+                                    avg_entropy,
+                                },
                             );
                             if !seg.text.trim().is_empty() {
                                 if let Some(cb) = &params.on_new_segment {
@@ -889,9 +895,11 @@ impl WhisperContext {
                         seg_t0,
                         t1,
                         &seg_tokens,
-                        avg_logprob,
-                        no_speech_prob,
-                        avg_entropy,
+                        SegmentStats {
+                            avg_logprob,
+                            no_speech_prob,
+                            avg_entropy,
+                        },
                     );
                     if !seg.text.trim().is_empty() {
                         if let Some(cb) = &params.on_new_segment {
@@ -941,9 +949,7 @@ impl WhisperContext {
         seg_t0: f64,
         seg_t1: f64,
         tokens: &[i32],
-        avg_logprob: f32,
-        no_speech_prob: f32,
-        avg_entropy: f32,
+        stats: SegmentStats,
     ) -> Segment {
         let mut text = self.tokenizer.decode(tokens, true);
         if tdrz_enable
@@ -976,9 +982,9 @@ impl WhisperContext {
             text,
             tokens.to_vec(),
             words,
-            avg_logprob,
-            no_speech_prob,
-            avg_entropy,
+            stats.avg_logprob,
+            stats.no_speech_prob,
+            stats.avg_entropy,
         )
     }
 }
@@ -1065,6 +1071,12 @@ fn split_segments_by_max_len(
 
 /// Helper responsible for assembling window prompts according to transcription parameters.
 #[derive(Debug)]
+struct SegmentStats {
+    avg_logprob: f32,
+    no_speech_prob: f32,
+    avg_entropy: f32,
+}
+
 pub struct WindowPromptBuilder<'a> {
     pub prompt_base: &'a [i32],
     pub is_multilingual: bool,
