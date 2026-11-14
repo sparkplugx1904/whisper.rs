@@ -10,6 +10,8 @@ use crate::decoder::{DecodeSlot, DecoderKvCache, DecoderWorkspace, WhisperDecode
 #[derive(Clone)]
 pub struct BeamCandidate {
     pub tokens: Vec<i32>,
+    /// Per-token log-probability, used for the fallback average-logprob check.
+    pub token_logprobs: Vec<f32>,
     pub cumulative_logprob: f64,
     /// Arena slot holding this hypothesis' self-attention history.
     pub slot: usize,
@@ -63,6 +65,7 @@ impl BeamSearch {
 
         let root = BeamCandidate {
             tokens: Vec::new(),
+            token_logprobs: Vec::new(),
             cumulative_logprob: 0.0,
             slot: 0,
             completed: false,
@@ -247,8 +250,11 @@ impl BeamSearch {
                     cand.last_timestamp
                 };
 
+                let mut token_logprobs = cand.token_logprobs.clone();
+                token_logprobs.push(logp);
                 let branch = BeamCandidate {
                     tokens: new_tokens,
+                    token_logprobs,
                     cumulative_logprob: cand.cumulative_logprob + (logp as f64),
                     slot: cand.slot,
                     completed: is_completed,

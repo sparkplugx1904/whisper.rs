@@ -477,6 +477,31 @@ impl WhisperContext {
                     };
                     beam_pipeline.apply(step_logits, &seed_ctx);
 
+                    // The beam path used to leave no_speech_prob at its 0.01
+                    // placeholder, which disabled the silence gate and made
+                    // every fallback report look identical.
+                    let max_logit = step_logits
+                        .iter()
+                        .copied()
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let sum_exp: f32 = step_logits
+                        .iter()
+                        .map(|&value| {
+                            if value > f32::NEG_INFINITY {
+                                (value - max_logit).exp()
+                            } else {
+                                0.0
+                            }
+                        })
+                        .sum();
+                    let log_sum_exp = max_logit + sum_exp.max(1e-10).ln();
+                    let no_speech_idx = self.model.vocab.token_nosp as usize;
+                    if no_speech_idx < step_logits.len() {
+                        no_speech_prob = (step_logits[no_speech_idx] - log_sum_exp)
+                            .exp()
+                            .clamp(0.0, 1.0);
+                    }
+
                     let mut seed_tokens = Vec::new();
                     for (tok, &l) in step_logits.iter().enumerate() {
                         if l > f32::NEG_INFINITY {
@@ -503,6 +528,7 @@ impl WhisperContext {
                                 }
                                 crate::beam::BeamCandidate {
                                     tokens: vec![tok],
+                                    token_logprobs: vec![l],
                                     cumulative_logprob: l as f64,
                                     slot,
                                     completed: tok == eot,
@@ -545,6 +571,7 @@ impl WhisperContext {
                     };
                     if let Some(best) = beam.best_candidate(length_penalty, beg) {
                         tokens_cur = best.tokens.clone();
+                        token_logprobs = best.token_logprobs.clone();
                     }
                 } else {
                     // GREEDY DECODING
