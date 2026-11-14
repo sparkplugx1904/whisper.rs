@@ -784,6 +784,7 @@ impl WhisperContext {
                 for chunk in tokens_cur.chunks(max_tok) {
                     let t1 = (seek_time + chunk_sec).min(total_audio_sec);
                     let seg = self.build_segment(
+                        params.tdrz_enable,
                         seek_time,
                         t1,
                         chunk,
@@ -819,6 +820,7 @@ impl WhisperContext {
                             seg_t0 = abs_sec;
                         } else {
                             let seg = self.build_segment(
+                                params.tdrz_enable,
                                 seg_t0,
                                 abs_sec,
                                 &seg_tokens,
@@ -846,6 +848,7 @@ impl WhisperContext {
                             let t_mid =
                                 (seg_t0 + (seg_tokens.len() as f64 * 0.2)).min(total_audio_sec);
                             let seg = self.build_segment(
+                                params.tdrz_enable,
                                 seg_t0,
                                 t_mid,
                                 &seg_tokens,
@@ -871,6 +874,7 @@ impl WhisperContext {
                 if !seg_tokens.is_empty() && (!params.single_segment || segments.is_empty()) {
                     let t1 = (seek_time + 30.0).min(total_audio_sec);
                     let seg = self.build_segment(
+                        params.tdrz_enable,
                         seg_t0,
                         t1,
                         &seg_tokens,
@@ -916,6 +920,7 @@ impl WhisperContext {
 
     fn build_segment(
         &self,
+        tdrz_enable: bool,
         seg_t0: f64,
         seg_t1: f64,
         tokens: &[i32],
@@ -924,7 +929,10 @@ impl WhisperContext {
         avg_entropy: f32,
     ) -> Segment {
         let mut text = self.tokenizer.decode(tokens, true);
-        if tokens.iter().any(|&t| t == 50363 || t == 50364) && !text.starts_with("[SPEAKER_TURN]") {
+        if tdrz_enable
+            && tokens.iter().any(|&t| t == 50363 || t == 50364)
+            && !text.starts_with("[SPEAKER_TURN]")
+        {
             text = format!("[SPEAKER_TURN] {}", text.trim());
         }
         let token_tuples: Vec<(&str, f32)> = tokens
