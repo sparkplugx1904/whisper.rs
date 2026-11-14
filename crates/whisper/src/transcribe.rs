@@ -357,6 +357,7 @@ impl WhisperContext {
                 }
             }
             let seek_time = seek_frame as f64 * 0.01;
+            let chunk_sec = chunk_frames as f64 * 0.01;
             let enc_out = if seek_frame == 0 {
                 // Encode window 0 on first use, then reuse it if the loop
                 // returns here; a VAD-skipped opening window never pays for it.
@@ -791,7 +792,6 @@ impl WhisperContext {
                 } else {
                     tokens_cur.len().max(1)
                 };
-                let chunk_sec = chunk_frames as f64 * 0.01;
                 for chunk in tokens_cur.chunks(max_tok) {
                     let t1 = (seek_time + chunk_sec).min(total_audio_sec);
                     let seg = self.build_segment(
@@ -823,11 +823,13 @@ impl WhisperContext {
                 let mut seg_tokens = Vec::new();
                 let mut seg_t0 = seek_time;
                 let mut last_end_time = seek_time;
+                let mut last_ts_time = seek_time;
 
                 for &tok in &tokens_cur {
                     if tok >= beg {
                         let rel_sec = (tok - beg) as f64 * 0.02;
                         let abs_sec = seek_time + rel_sec;
+                        last_ts_time = abs_sec;
 
                         if seg_tokens.is_empty() {
                             seg_t0 = abs_sec;
@@ -889,7 +891,15 @@ impl WhisperContext {
                     }
                 }
                 if !seg_tokens.is_empty() && (!params.single_segment || segments.is_empty()) {
-                    let t1 = (seek_time + 30.0).min(total_audio_sec);
+                    // Do not claim the whole window for an unclosed tail: the
+                    // next seek must start where the last timestamp ended so
+                    // the remaining audio is decoded instead of skipped.
+                    let window_end = (seek_time + chunk_sec).min(total_audio_sec);
+                    let t1 = if last_ts_time > seg_t0 {
+                        last_ts_time.min(window_end)
+                    } else {
+                        window_end
+                    };
                     let seg = self.build_segment(
                         params.tdrz_enable,
                         seg_t0,
