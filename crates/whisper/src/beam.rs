@@ -20,6 +20,10 @@ pub struct BeamCandidate {
 pub struct BeamSearch {
     pub beam_size: usize,
     pub candidates: Vec<BeamCandidate>,
+    /// Finished hypotheses. They no longer need a KV slot and must not compete
+    /// with active branches for beam width; whisper.cpp keeps them in separate
+    /// decoder states for exactly this reason.
+    pub completed_candidates: Vec<BeamCandidate>,
     pub suppress_indices: Vec<usize>,
     /// Scratch row used for filtering one candidate's logits in place.
     logits_buf: Vec<f32>,
@@ -30,6 +34,20 @@ pub struct BeamSearch {
     /// Optional user callback invoked with each candidate's token history and
     /// logits before any built-in suppression runs.
     pub logits_callback: Option<crate::params::LogitsCallback>,
+}
+
+fn sequence_score(candidate: &BeamCandidate, length_penalty: f32) -> f64 {
+    if candidate.tokens.is_empty() {
+        return f64::NEG_INFINITY;
+    }
+
+    let len = candidate.tokens.len() as f64;
+    let penalty = if length_penalty > 0.0 {
+        ((5.0 + len) / 6.0).powf(length_penalty as f64)
+    } else {
+        len
+    };
+    candidate.cumulative_logprob / penalty
 }
 
 impl BeamSearch {
@@ -54,6 +72,7 @@ impl BeamSearch {
         Self {
             beam_size,
             candidates: vec![root],
+            completed_candidates: Vec::new(),
             suppress_indices: Vec::new(),
             logits_buf: Vec::new(),
             slot_reserved: Vec::new(),
@@ -78,11 +97,11 @@ impl BeamSearch {
         eot: i32,
         beg: i32,
         no_timestamps: bool,
+        max_initial_ts: f32,
         suppress_blank: bool,
         grammar: Option<&whisper_grammar::GbnfGrammar>,
         vocab: &whisper_model::Vocab,
         tokenizer: &whisper_tokenizer::Tokenizer,
-        length_penalty: f32,
         cache: &mut DecoderKvCache,
         ws: &mut DecoderWorkspace,
     ) {
@@ -132,11 +151,6 @@ impl BeamSearch {
             Vec::with_capacity(self.candidates.len() * self.beam_size);
 
         for cand in &self.candidates {
-            if cand.completed {
-                branches.push(cand.clone());
-                continue;
-            }
-
             let row = rows
                 .binary_search_by_key(&cand.slot, |&(slot, _)| slot)
                 .ok()
@@ -169,14 +183,19 @@ impl BeamSearch {
                 step_logits[eot as usize] = f32::NEG_INFINITY;
             }
 
-            // 2. Timestamps suppression
-            if no_timestamps {
-                step_logits[(beg as usize)..n_vocab].fill(f32::NEG_INFINITY);
-            } else if let Some(last_ts) = cand.last_timestamp {
-                if (last_ts as usize) > (beg as usize) {
-                    step_logits[(beg as usize)..(last_ts as usize)].fill(f32::NEG_INFINITY);
-                }
-            }
+            // 2. Timestamp grammar (pairing, monotonicity, initial limit,
+            // and the timestamp-mass rule). This must match the greedy filter;
+            // otherwise beam branches can repeat a timestamp indefinitely.
+            crate::filter::apply_timestamp_rules(
+                step_logits,
+                &cand.tokens,
+                beg as usize,
+                eot as usize,
+                n_vocab,
+                no_timestamps,
+                max_initial_ts,
+                false,
+            );
 
             // Suppress regex / custom token indices
             for &idx in &self.suppress_indices {
@@ -228,32 +247,35 @@ impl BeamSearch {
                     cand.last_timestamp
                 };
 
-                // The branch inherits the parent slot until the survivors are
-                // known; slots are reassigned below.
-                branches.push(BeamCandidate {
+                let branch = BeamCandidate {
                     tokens: new_tokens,
                     cumulative_logprob: cand.cumulative_logprob + (logp as f64),
                     slot: cand.slot,
                     completed: is_completed,
                     last_timestamp: new_ts,
-                });
+                };
+                if is_completed {
+                    self.completed_candidates.push(branch);
+                } else {
+                    // Active branches inherit the parent slot until the
+                    // survivors are known; slots are reassigned below.
+                    branches.push(branch);
+                }
             }
         }
 
-        // Rank branches by normalized cumulative logprob: score / (len^alpha)
-        let alpha = (length_penalty as f64).clamp(0.0, 2.0);
+        // Prune by raw cumulative log-probability. whisper.cpp only applies the
+        // length penalty when ranking the finished sequences; normalizing here
+        // lets a short completed branch (for example after a station jingle)
+        // permanently outrank longer partial transcripts and stops decoding
+        // early.
         branches.sort_by(|a, b| {
-            let len_a = (a.tokens.len().max(1) as f64).powf(alpha);
-            let len_b = (b.tokens.len().max(1) as f64).powf(alpha);
-            let score_a = a.cumulative_logprob / len_a;
-            let score_b = b.cumulative_logprob / len_b;
-            score_b
-                .partial_cmp(&score_a)
+            b.cumulative_logprob
+                .partial_cmp(&a.cumulative_logprob)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         branches.truncate(self.beam_size);
-
         // Hand out arena slots to the retained branches.
         //
         // Each parent slot may have produced several surviving children. The
@@ -300,17 +322,54 @@ impl BeamSearch {
     }
 
     pub fn is_all_completed(&self) -> bool {
-        self.candidates.iter().all(|c| c.completed)
+        self.candidates.is_empty() && !self.completed_candidates.is_empty()
     }
 
-    pub fn is_completed(&self, patience: f32) -> bool {
-        let target = ((self.beam_size as f32) * patience).round() as usize;
-        let target = target.clamp(1, self.beam_size);
-        let completed_count = self.candidates.iter().filter(|c| c.completed).count();
-        completed_count >= target
+    pub fn is_completed(&self, _patience: f32) -> bool {
+        self.candidates.is_empty()
     }
 
-    pub fn best_candidate(&self) -> Option<&BeamCandidate> {
-        self.candidates.first()
+    pub fn best_candidate(&self, length_penalty: f32, beg: i32) -> Option<&BeamCandidate> {
+        // Prefer a finished hypothesis that covers the most of the window.
+        // Length-normalized logprob alone picks a station-ID-sized EOT branch
+        // over a longer transcript, which then makes the caller skip the rest
+        // of the window. Ties fall back to the usual sequence score.
+        let rank = |candidate: &BeamCandidate| {
+            let last_timestamp = candidate
+                .tokens
+                .iter()
+                .rev()
+                .find(|&&token| token >= beg)
+                .copied()
+                .unwrap_or(beg);
+            (last_timestamp, sequence_score(candidate, length_penalty))
+        };
+
+        self.candidates
+            .iter()
+            .chain(&self.completed_candidates)
+            .max_by(|a, b| {
+                let (ts_a, score_a) = rank(a);
+                let (ts_b, score_b) = rank(b);
+                ts_a.cmp(&ts_b).then_with(|| {
+                    score_a
+                        .partial_cmp(&score_b)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            })
+    }
+
+    /// Replace the seeded candidates, routing already-finished seeds into the
+    /// completed pool so they cannot occupy active beam slots.
+    pub fn set_seeds(&mut self, mut seeds: Vec<BeamCandidate>) {
+        self.candidates.clear();
+        self.completed_candidates.clear();
+        for seed in seeds.drain(..) {
+            if seed.completed {
+                self.completed_candidates.push(seed);
+            } else {
+                self.candidates.push(seed);
+            }
+        }
     }
 }

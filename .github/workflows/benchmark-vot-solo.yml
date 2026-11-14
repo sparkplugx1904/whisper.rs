@@ -5,6 +5,8 @@ on:
   push:
     paths:
       - "benchmarks/vot-solo/**"
+      - "crates/whisper/**"
+      - "crates/cli/**"
       - ".github/workflows/benchmark-vot-solo.yml"
 
 permissions:

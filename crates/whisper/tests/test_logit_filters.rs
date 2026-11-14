@@ -52,7 +52,7 @@ fn test_logit_filter_pipeline_combination() {
     let mut pipeline = LogitFilterPipeline::new();
     pipeline.add(SuppressBlankFilter::new(5, 6));
     pipeline.add(RepetitionPenaltyFilter::new(2.0));
-    pipeline.add(TimestampLogitFilter::new(50, 100, true));
+    pipeline.add(TimestampLogitFilter::new(50, 40, 100, true));
 
     let history = vec![10];
     let ctx = LogitFilterContext {
@@ -116,7 +116,7 @@ fn test_timestamp_logit_filter_max_initial_ts() {
     let beg = 50;
     let n_vocab = 100;
     let max_initial_ts = 0.5f32; // 0.5s / 0.02 = 25 tokens. Max initial ts token = 50 + 25 = 75.
-    let filter = TimestampLogitFilter::with_max_initial_ts(beg, n_vocab, false, max_initial_ts);
+    let filter = TimestampLogitFilter::with_max_initial_ts(beg, 40, n_vocab, false, max_initial_ts);
 
     let mut logits = vec![1.0f32; 100];
     let ctx_step0 = LogitFilterContext {
@@ -140,21 +140,51 @@ fn test_timestamp_logit_filter_max_initial_ts() {
         );
     }
 
-    // At step 1, initial ts suppression is not applied
+    // A text token followed by a timestamp opens a pair: text is masked and
+    // timestamps may only move forward.
     let mut logits_step1 = vec![1.0f32; 100];
     let ctx_step1 = LogitFilterContext {
         step: 1,
-        tokens_cur: &[70],
+        tokens_cur: &[10, 60],
         last_timestamp_token: Some(60),
     };
     filter.apply(&mut logits_step1, &ctx_step1);
-    // Timestamps prior to last_timestamp (beg..60) suppressed so timestamps cannot regress
-    for i in beg..60 {
-        assert_eq!(logits_step1[i], f32::NEG_INFINITY);
+    for i in 0..40 {
+        assert_eq!(
+            logits_step1[i],
+            f32::NEG_INFINITY,
+            "Text token {} must be masked inside a timestamp pair",
+            i
+        );
     }
-    // Timestamps >= 60 remain unsuppressed at step 1
+    for i in beg..60 {
+        assert_eq!(
+            logits_step1[i],
+            f32::NEG_INFINITY,
+            "Timestamp {} must not regress",
+            i
+        );
+    }
     for i in 60..100 {
         assert_eq!(logits_step1[i], 1.0);
+    }
+
+    // Two consecutive timestamps close the pair, so no further timestamp may
+    // follow until text is emitted.
+    let mut logits_pair = vec![1.0f32; 100];
+    let ctx_pair = LogitFilterContext {
+        step: 2,
+        tokens_cur: &[60, 70],
+        last_timestamp_token: Some(70),
+    };
+    filter.apply(&mut logits_pair, &ctx_pair);
+    for i in beg..100 {
+        assert_eq!(
+            logits_pair[i],
+            f32::NEG_INFINITY,
+            "Timestamp {} must be masked after a closed pair",
+            i
+        );
     }
 }
 

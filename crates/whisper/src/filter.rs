@@ -284,19 +284,113 @@ impl LogitFilter for RegexFilter {
     }
 }
 
+/// Apply whisper.cpp's timestamp grammar to one logits row.
+///
+/// Timestamps are emitted in pairs: after a timestamp the next token is another
+/// timestamp, then text follows. Without these rules a beam can repeat the same
+/// timestamp until `max_tokens`, or stop at a station jingle because a short
+/// EOT branch looks cheaper than the rest of the window.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_timestamp_rules(
+    logits: &mut [f32],
+    tokens_cur: &[i32],
+    beg: usize,
+    eot: usize,
+    n_vocab: usize,
+    no_timestamps: bool,
+    max_initial_ts: f32,
+    is_initial: bool,
+) {
+    let limit = n_vocab.min(logits.len());
+    if beg >= limit {
+        return;
+    }
+
+    if no_timestamps {
+        logits[beg..limit].fill(f32::NEG_INFINITY);
+        return;
+    }
+
+    let last_was_timestamp = tokens_cur
+        .last()
+        .is_some_and(|&token| token >= 0 && token as usize >= beg);
+    let penultimate_was_timestamp = tokens_cur.len() < 2
+        || tokens_cur[tokens_cur.len() - 2] >= 0
+            && tokens_cur[tokens_cur.len() - 2] as usize >= beg;
+
+    // Timestamps must appear in pairs, except directly before EOT.
+    if last_was_timestamp {
+        if penultimate_was_timestamp {
+            logits[beg..limit].fill(f32::NEG_INFINITY);
+        } else {
+            let text_end = eot.min(limit);
+            logits[..text_end].fill(f32::NEG_INFINITY);
+        }
+    }
+
+    // The initial timestamp cannot be later than max_initial_ts.
+    if is_initial && max_initial_ts >= 0.0 {
+        let max_ts_idx = beg + (max_initial_ts / 0.02).round() as usize;
+        let start_suppress = (max_ts_idx + 1).max(beg);
+        if start_suppress < limit {
+            logits[start_suppress..limit].fill(f32::NEG_INFINITY);
+        }
+    }
+
+    // Timestamps must be non-decreasing.
+    if let Some(&last_ts) = tokens_cur
+        .iter()
+        .rev()
+        .find(|&&token| token >= 0 && token as usize >= beg)
+    {
+        let ts_idx = (last_ts as usize).min(limit);
+        if ts_idx > beg {
+            logits[beg..ts_idx].fill(f32::NEG_INFINITY);
+        }
+    }
+
+    // If the total probability mass over timestamps exceeds the best text
+    // token, force a timestamp. This is the rule that closes a text segment
+    // instead of letting the decoder run into EOT or a repetition loop.
+    let mut max_ts = f32::NEG_INFINITY;
+    for &value in &logits[beg..limit] {
+        if value > max_ts {
+            max_ts = value;
+        }
+    }
+    if max_ts > f32::NEG_INFINITY {
+        let mut sum = 0.0f32;
+        for &value in &logits[beg..limit] {
+            if value > f32::NEG_INFINITY {
+                sum += (value - max_ts).exp();
+            }
+        }
+        let timestamp_logit = max_ts + sum.max(1e-10).ln();
+        let max_text = logits[..beg.min(limit)]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        if timestamp_logit > max_text {
+            logits[..beg.min(limit)].fill(f32::NEG_INFINITY);
+        }
+    }
+}
+
 /// Filter that constrains timestamp token generation order or suppresses timestamps altogether.
 #[derive(Debug, Clone, Copy)]
 pub struct TimestampLogitFilter {
     pub beg: usize,
+    pub eot: usize,
     pub n_vocab: usize,
     pub no_timestamps: bool,
     pub max_initial_ts: f32,
 }
 
 impl TimestampLogitFilter {
-    pub fn new(beg: usize, n_vocab: usize, no_timestamps: bool) -> Self {
+    pub fn new(beg: usize, eot: usize, n_vocab: usize, no_timestamps: bool) -> Self {
         Self {
             beg,
+            eot,
             n_vocab,
             no_timestamps,
             max_initial_ts: 1.0,
@@ -305,12 +399,14 @@ impl TimestampLogitFilter {
 
     pub fn with_max_initial_ts(
         beg: usize,
+        eot: usize,
         n_vocab: usize,
         no_timestamps: bool,
         max_initial_ts: f32,
     ) -> Self {
         Self {
             beg,
+            eot,
             n_vocab,
             no_timestamps,
             max_initial_ts,
@@ -320,26 +416,16 @@ impl TimestampLogitFilter {
 
 impl LogitFilter for TimestampLogitFilter {
     fn apply(&self, logits: &mut [f32], ctx: &LogitFilterContext) {
-        let limit = self.n_vocab.min(logits.len());
-        if self.no_timestamps {
-            if self.beg < limit {
-                logits[self.beg..limit].fill(f32::NEG_INFINITY);
-            }
-        } else {
-            if ctx.step == 0 && self.max_initial_ts >= 0.0 {
-                let max_ts_idx = self.beg + (self.max_initial_ts / 0.02).round() as usize;
-                let start_suppress = (max_ts_idx + 1).max(self.beg);
-                if start_suppress < limit {
-                    logits[start_suppress..limit].fill(f32::NEG_INFINITY);
-                }
-            }
-            if let Some(last_ts) = ctx.last_timestamp_token {
-                let ts_idx = (last_ts as usize).min(limit);
-                if ts_idx > self.beg {
-                    logits[self.beg..ts_idx].fill(f32::NEG_INFINITY);
-                }
-            }
-        }
+        apply_timestamp_rules(
+            logits,
+            ctx.tokens_cur,
+            self.beg,
+            self.eot,
+            self.n_vocab,
+            self.no_timestamps,
+            self.max_initial_ts,
+            ctx.step == 0,
+        );
     }
 }
 

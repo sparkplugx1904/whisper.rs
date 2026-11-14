@@ -454,6 +454,7 @@ impl WhisperContext {
                     }
                     beam_pipeline.add(TimestampLogitFilter::with_max_initial_ts(
                         beg as usize,
+                        eot as usize,
                         n_vocab,
                         params.no_timestamps,
                         params.max_initial_ts,
@@ -489,25 +490,27 @@ impl WhisperContext {
                         .timings
                         .add_sample(sample_start.elapsed().as_micros() as u64);
 
-                    beam.candidates = seed_tokens
-                        .into_iter()
-                        .enumerate()
-                        .map(|(slot, (tok, l))| {
-                            // Slot 0 already holds the prompt KV; the remaining
-                            // seed branches fork from it instead of replaying the
-                            // prompt through the decoder.
-                            if slot > 0 {
-                                cache.copy_slot(slot, 0);
-                            }
-                            crate::beam::BeamCandidate {
-                                tokens: vec![tok],
-                                cumulative_logprob: l as f64,
-                                slot,
-                                completed: tok == eot,
-                                last_timestamp: if tok >= beg { Some(tok) } else { None },
-                            }
-                        })
-                        .collect();
+                    beam.set_seeds(
+                        seed_tokens
+                            .into_iter()
+                            .enumerate()
+                            .map(|(slot, (tok, l))| {
+                                // Slot 0 already holds the prompt KV; the remaining
+                                // seed branches fork from it instead of replaying the
+                                // prompt through the decoder.
+                                if slot > 0 {
+                                    cache.copy_slot(slot, 0);
+                                }
+                                crate::beam::BeamCandidate {
+                                    tokens: vec![tok],
+                                    cumulative_logprob: l as f64,
+                                    slot,
+                                    completed: tok == eot,
+                                    last_timestamp: if tok >= beg { Some(tok) } else { None },
+                                }
+                            })
+                            .collect(),
+                    );
 
                     let max_steps = 224;
                     for step in 1..max_steps {
@@ -522,15 +525,11 @@ impl WhisperContext {
                             eot,
                             beg,
                             params.no_timestamps,
+                            params.max_initial_ts,
                             params.suppress_blank,
                             gbnf_grammar.as_ref(),
                             &self.model.vocab,
                             &self.tokenizer,
-                            if params.length_penalty > 0.0 {
-                                params.length_penalty
-                            } else {
-                                0.7
-                            },
                             &mut cache,
                             &mut state.workspace,
                         );
@@ -539,7 +538,12 @@ impl WhisperContext {
                             .add_batch_decode(batch_start.elapsed().as_micros() as u64);
                     }
 
-                    if let Some(best) = beam.best_candidate() {
+                    let length_penalty = if params.length_penalty > 0.0 {
+                        params.length_penalty
+                    } else {
+                        0.7
+                    };
+                    if let Some(best) = beam.best_candidate(length_penalty, beg) {
                         tokens_cur = best.tokens.clone();
                     }
                 } else {
@@ -569,6 +573,7 @@ impl WhisperContext {
                     }
                     greedy_pipeline.add(TimestampLogitFilter::with_max_initial_ts(
                         beg as usize,
+                        eot as usize,
                         n_vocab,
                         params.no_timestamps,
                         params.max_initial_ts,
