@@ -485,6 +485,14 @@ impl WhisperContext {
                         last_timestamp_token: None,
                     };
                     beam_pipeline.apply(step_logits, &seed_ctx);
+                    // `<|notimestamps|>` is never a generation token; upstream
+                    // masks it unconditionally. Leaving it in the seed set puts
+                    // a special token into the history prompt and can trigger
+                    // repetition loops on later windows.
+                    let not_idx = self.model.vocab.token_not as usize;
+                    if not_idx < step_logits.len() {
+                        step_logits[not_idx] = f32::NEG_INFINITY;
+                    }
 
                     // Seed branches compete on log-probability, like every later
                     // step; the raw projection output is a logit, not a log-prob.
@@ -656,6 +664,10 @@ impl WhisperContext {
                             last_timestamp_token,
                         };
                         greedy_pipeline.apply(step_logits, &filter_ctx);
+                        let not_idx = self.model.vocab.token_not as usize;
+                        if not_idx < step_logits.len() {
+                            step_logits[not_idx] = f32::NEG_INFINITY;
+                        }
 
                         // Greedy argmax & logprob calculation
                         let mut best_id = 0;
@@ -890,7 +902,9 @@ impl WhisperContext {
                 } else {
                     seek_frame += chunk_frames;
                 }
-                history_tokens.extend(tokens_cur.iter().copied().filter(|&t| t < beg && t != eot));
+                // Keep only ordinary text tokens; timestamps and all special tokens
+                // (including <|notimestamps|>) must not enter the next prompt.
+                history_tokens.extend(tokens_cur.iter().copied().filter(|&t| t >= 0 && t < eot));
             }
         }
 

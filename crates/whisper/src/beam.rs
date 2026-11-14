@@ -190,6 +190,12 @@ impl BeamSearch {
                 (cb)(&cand.tokens, step_logits);
             }
 
+            // `<|notimestamps|>` is always invalid output.
+            let not_idx = vocab.token_not as usize;
+            if not_idx < step_logits.len() {
+                step_logits[not_idx] = f32::NEG_INFINITY;
+            }
+
             // 1. Suppress blank at start
             if suppress_blank && step_idx == 0 {
                 step_logits[220] = f32::NEG_INFINITY;
