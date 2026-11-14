@@ -56,3 +56,25 @@ computed on the full concatenated transcript and is the primary metric.
 - `worst_error_share` shows how concentrated the errors are: a small set of
   clips dominating the error mass is usually a content problem (names, numbers,
   music), not a uniform model weakness.
+## Measurement cadence
+
+Use two loops, not one:
+
+- **Fast loop** for every edit: `cargo test -p <crate> --lib`, the specific
+  integration test, `models/ggml-tiny.en.bin` or `ggml-tiny.bin`, and 30-60 s of
+  audio. No workspace build and no full benchmark.
+- **Slow loop** at milestones only: the full 33.27 min run in
+  `benchmark-vot-solo.yml`, one run per batch of changes. Pushes to engine crates
+  no longer trigger it; only `benchmarks/vot-solo/**` does.
+
+Measured runs (large-v3-turbo F16, 4 threads, beam 5):
+
+| commit | WER | wall | RTF | peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| `236d89d` baseline | 14.88% | 2038 s | 1.021 | 5522 MB |
+| `13782e1` beam/timestamp/seek + loop fallback | 45.04% | 2830 s | 1.418 | 5532 MB |
+| `268464e` packed F16 + tail seek | 46.11% | 3785 s | 1.896 | 4016 MB |
+| `5e1a0ab` n-gram mask + greedy retry + clean prompt | running | - | - | - |
+
+The post-baseline WER numbers are dominated by a repetition-loop failure that
+the later guards target; use the guarded run as the next comparison point.

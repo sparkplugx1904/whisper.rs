@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - "benchmarks/vot-solo/**"
+      - "!benchmarks/vot-solo/**.md"
       - ".github/workflows/benchmark-vot-solo.yml"
 
 permissions:
