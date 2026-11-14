@@ -412,7 +412,16 @@ impl WhisperContext {
 
             // Temperature fallback loop (e.g. 0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
             let mut force_greedy = false;
+            // A looped window also poisons the rolling history. The greedy
+            // retry therefore uses a prompt without prior text instead of
+            // feeding the loop back into the next decode.
+            let clean_prompt = prompt_builder.build(seek_frame, &[], params, &self.tokenizer);
             while temperature <= 1.0 {
+                let active_prompt = if force_greedy {
+                    &clean_prompt
+                } else {
+                    &window_prompt
+                };
                 tokens_cur.clear();
                 token_logprobs.clear();
                 token_entropies.clear();
@@ -435,7 +444,7 @@ impl WhisperContext {
                     beam.logits_callback = params.on_logits.clone();
                     let decode_start = Instant::now();
                     let logits = self.decoder.decode(
-                        &window_prompt,
+                        active_prompt,
                         &enc_out,
                         &mut cache,
                         &mut state.workspace,
@@ -628,7 +637,7 @@ impl WhisperContext {
                             // steps append only the token chosen previously, so
                             // the KV cache keeps the whole history.
                             let step_input: &[i32] = if step == 0 {
-                                &window_prompt
+                                active_prompt
                             } else {
                                 &tokens_cur[tokens_cur.len() - 1..]
                             };
