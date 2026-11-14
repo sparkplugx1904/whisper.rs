@@ -497,14 +497,12 @@ impl WhisperContext {
 
                     // Seed branches compete on log-probability, like every later
                     // step; the raw projection output is a logit, not a log-prob.
-                    let seed_log_probs = log_softmax(step_logits);
+                    let seed_lse = log_sum_exp(step_logits);
 
                     let mut seed_tokens = Vec::new();
-                    for (tok, (&l, &logprob)) in
-                        step_logits.iter().zip(seed_log_probs.iter()).enumerate()
-                    {
+                    for (tok, &l) in step_logits.iter().enumerate() {
                         if l > f32::NEG_INFINITY {
-                            seed_tokens.push((tok as i32, logprob));
+                            seed_tokens.push((tok as i32, l - seed_lse));
                         }
                     }
                     seed_tokens
@@ -1184,38 +1182,21 @@ fn softmax_prob_at(logits: &[f32], index: usize) -> f32 {
     (logits[index] - lse).exp().clamp(0.0, 1.0)
 }
 
-/// Log-softmax for every entry, used to seed beam branches.
-fn log_softmax(logits: &[f32]) -> Vec<f32> {
-    let lse = log_sum_exp(logits);
-    logits
-        .iter()
-        .map(|&value| {
-            if value > f32::NEG_INFINITY {
-                value - lse
-            } else {
-                f32::NEG_INFINITY
-            }
-        })
-        .collect()
-}
-
 /// Draw one token from a logits row with an xorshift64 generator.
 fn sample_token(logits: &[f32], state: &mut u64) -> (i32, f32) {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     if max == f32::NEG_INFINITY {
         return (0, f32::NEG_INFINITY);
     }
-    let mut sum = 0.0f64;
-    let mut weights = Vec::with_capacity(logits.len());
-    for &value in logits {
-        let weight = if value > f32::NEG_INFINITY {
+    let weight = |value: f32| -> f64 {
+        if value > f32::NEG_INFINITY {
             ((value - max) as f64).exp()
         } else {
             0.0
-        };
-        sum += weight;
-        weights.push(weight);
-    }
+        }
+    };
+
+    let sum: f64 = logits.iter().map(|&value| weight(value)).sum();
     if sum <= 0.0 {
         return (0, f32::NEG_INFINITY);
     }
@@ -1224,10 +1205,10 @@ fn sample_token(logits: &[f32], state: &mut u64) -> (i32, f32) {
     *state ^= *state >> 7;
     *state ^= *state << 17;
     let mut target = (*state as f64 / u64::MAX as f64) * sum;
-    for (index, weight) in weights.iter().enumerate() {
-        target -= weight;
+    for (index, &value) in logits.iter().enumerate() {
+        target -= weight(value);
         if target <= 0.0 {
-            return (index as i32, logits[index]);
+            return (index as i32, value);
         }
     }
     (logits.len() as i32 - 1, logits[logits.len() - 1])

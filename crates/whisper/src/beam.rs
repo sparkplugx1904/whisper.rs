@@ -32,6 +32,8 @@ pub struct BeamSearch {
     pub suppress_indices: Vec<usize>,
     /// Scratch row used for filtering one candidate's logits in place.
     logits_buf: Vec<f32>,
+    /// Scratch top-K buffer reused for every candidate and step.
+    top_tokens: Vec<(i32, f32)>,
     /// Scratch flags: slots that a retained branch claims as its parent slot.
     slot_reserved: Vec<bool>,
     /// Scratch flags: slots already handed to a retained branch.
@@ -88,6 +90,7 @@ impl BeamSearch {
             completed_candidates: Vec::new(),
             suppress_indices: Vec::new(),
             logits_buf: Vec::new(),
+            top_tokens: Vec::new(),
             slot_reserved: Vec::new(),
             slot_claimed: Vec::new(),
             logits_callback: None,
@@ -244,18 +247,19 @@ impl BeamSearch {
             }
             let log_sum_exp = sum_exp.max(1e-10).ln();
 
-            // Find top-K tokens for this candidate
-            let mut top_tokens: Vec<(i32, f32)> = Vec::new();
+            // Find top-K tokens for this candidate into the reusable buffer.
+            self.top_tokens.clear();
             for (tok_id, &l) in step_logits.iter().enumerate() {
                 if l > f32::NEG_INFINITY {
                     let logprob = (l - max_l) - log_sum_exp;
-                    top_tokens.push((tok_id as i32, logprob));
+                    self.top_tokens.push((tok_id as i32, logprob));
                 }
             }
-            top_tokens.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            top_tokens.truncate(self.beam_size);
+            self.top_tokens
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            self.top_tokens.truncate(self.beam_size);
 
-            for (tok, logp) in top_tokens {
+            for &(tok, logp) in &self.top_tokens {
                 let mut new_tokens = cand.tokens.clone();
                 new_tokens.push(tok);
 
