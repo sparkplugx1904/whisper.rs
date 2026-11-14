@@ -2,6 +2,135 @@
 use crate::dtype::DType;
 use half::f16;
 
+/// Number of activation elements in one quantized block.
+pub const QK_ACT: usize = 32;
+
+/// One 32-element activation block quantized to int8.
+///
+/// This mirrors the `block_q8_1` layout used by ggml: a float scale `d`, the
+/// exact integer sum `sum_q` of the quantized values (needed by the formats
+/// whose `min` term multiplies the activation sum), and the int8 payload.
+/// Keeping `d` and the sum at full precision avoids the f16 rounding of the
+/// reference struct, which only ever costs accuracy here.
+#[derive(Clone, Copy, Debug)]
+pub struct Q8Block {
+    /// Scale mapping `qs` back to floats: `q * d`.
+    pub d: f32,
+    /// Exact sum of the int8 values.
+    pub sum_q: i32,
+    /// Quantized activations, always in `[-127, 127]`.
+    pub qs: [i8; QK_ACT],
+}
+
+/// A row of activations quantized into 32-element Q8 blocks.
+///
+/// Quantizing activations once per token lets every weight macro-block be
+/// consumed by integer multiply-adds, so the weight matrix is streamed in its
+/// compressed layout and the activation never has to be re-expanded into f32
+/// for each row.
+///
+/// Each value carries at most half a quantization step (`amax / 254`) of
+/// error, so a dot product against a row `w` is off by at most
+/// `(amax / 254) * sum(|w|)` plus f32 rounding. Callers that need the exact
+/// f32 activation result should not use the Q8 path.
+#[derive(Clone, Debug)]
+pub struct Q8Activation {
+    blocks: Vec<Q8Block>,
+}
+
+impl Q8Activation {
+    /// Quantize `x` into Q8 blocks.
+    ///
+    /// Returns `None` for empty inputs, lengths that are not a multiple of
+    /// [`QK_ACT`], or non-finite values; callers then keep using the f32
+    /// activation kernels, which have no quantization error.
+    pub fn quantize(x: &[f32]) -> Option<Self> {
+        if x.is_empty() || !x.len().is_multiple_of(QK_ACT) {
+            return None;
+        }
+        if !x.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+
+        let mut blocks = Vec::with_capacity(x.len() / QK_ACT);
+        for chunk in x.chunks_exact(QK_ACT) {
+            let amax = chunk.iter().fold(0.0f32, |acc, &v| acc.max(v.abs()));
+            let d = amax / 127.0;
+            // A subnormal scale would invert to infinity and turn zero-valued
+            // elements into NaNs on the multiply; such blocks are all far
+            // below any audible signal, so quantize them to zero instead.
+            let id = if d.is_normal() { 1.0 / d } else { 0.0 };
+
+            let mut qs = [0i8; QK_ACT];
+            let mut sum_q = 0i32;
+            for (dst, &v) in qs.iter_mut().zip(chunk) {
+                // Clamping to +-127 keeps every int8 pair sum inside the
+                // i16 range of `vpmaddubsw`, so no saturation can occur.
+                let q = (v * id).round().clamp(-127.0, 127.0) as i32;
+                *dst = q as i8;
+                sum_q += q;
+            }
+
+            blocks.push(Q8Block { d, sum_q, qs });
+        }
+
+        Some(Self { blocks })
+    }
+
+    /// Quantized blocks in row order.
+    #[inline]
+    pub fn blocks(&self) -> &[Q8Block] {
+        &self.blocks
+    }
+
+    /// Number of blocks.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Whether the row is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+}
+
+/// Whether a Q8-activation integer kernel exists for `dtype`.
+///
+/// The K-quants keep the f32 activation kernels; their sub-block scales vary
+/// every 32 elements within a 256-element super-block, and the Q8 activation
+/// path only pays off for the plain 32-element formats.
+#[inline]
+pub fn has_q8_activation_kernel(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::Q4_0 | DType::Q4_1 | DType::Q5_0 | DType::Q5_1 | DType::Q8_0
+    )
+}
+
+/// Dot product between one quantized row and a pre-quantized activation row.
+#[inline]
+fn row_dot_q8(dtype: DType, row_bytes: &[u8], act: &Q8Activation) -> f32 {
+    match dtype {
+        DType::Q4_0 => crate::simd::dot_q4_0_q8(row_bytes, act),
+        DType::Q4_1 => crate::simd::dot_q4_1_q8(row_bytes, act),
+        DType::Q5_0 => crate::simd::dot_q5_0_q8(row_bytes, act),
+        DType::Q5_1 => crate::simd::dot_q5_1_q8(row_bytes, act),
+        DType::Q8_0 => crate::simd::dot_q8_0_q8(row_bytes, act),
+        _ => unreachable!("no Q8 activation kernel for {:?}", dtype),
+    }
+}
+
+/// Quantize the activations of one row when the format and length allow it.
+#[inline]
+fn activation_for(dtype: DType, cols: usize, x: &[f32]) -> Option<Q8Activation> {
+    if !has_q8_activation_kernel(dtype) || cols == 0 || !cols.is_multiple_of(QK_ACT) {
+        return None;
+    }
+    Q8Activation::quantize(x)
+}
+
 /// Direct dot product between Q8_0 quantized blocks and float32 slice.
 /// `raw_blocks` contains (cols / 32) blocks of 34 bytes each (scale f16 + 32 int8).
 pub fn vec_dot_q8_0_f32(raw_blocks: &[u8], x: &[f32]) -> f32 {
@@ -109,6 +238,10 @@ pub fn vec_dot_q5_1_f32(raw_blocks: &[u8], x: &[f32]) -> f32 {
 
 /// Direct matrix-vector multiplication with quantized weights: y = W * x + bias
 /// Rows of W are quantized directly without dequantizing the full matrix.
+///
+/// For the plain block formats the activation row is quantized to Q8 once and
+/// every weight row is consumed by integer dot kernels; lengths that are not a
+/// multiple of [`QK_ACT`] and non-finite inputs keep the f32 activation path.
 #[allow(clippy::too_many_arguments)]
 pub fn quantized_linear_vector(
     weight_bytes: &[u8],
@@ -129,6 +262,10 @@ pub fn quantized_linear_vector(
     let bytes_per_row = dtype.byte_size_for(cols);
     assert_eq!(weight_bytes.len(), rows * bytes_per_row);
 
+    // Quantize the activation row once and reuse it for every weight row.
+    // Non-block-multiple or non-finite inputs keep the f32 kernels.
+    let activation = activation_for(dtype, cols, x);
+
     use rayon::prelude::*;
 
     let n_threads = n_threads.clamp(1, 16);
@@ -147,7 +284,10 @@ pub fn quantized_linear_vector(
                 // One dispatch table for every dtype, so the plain F32/F16 and
                 // Q8_1 byte layouts degrade to a dequantize-then-dot instead of
                 // panicking when they reach this path.
-                let dot = row_dot(dtype, row_bytes, x);
+                let dot = match &activation {
+                    Some(act) => row_dot_q8(dtype, row_bytes, act),
+                    None => row_dot(dtype, row_bytes, x),
+                };
 
                 let val = if let Some(b) = bias {
                     dot + b[r_abs]
@@ -344,6 +484,10 @@ pub fn f16_linear(
 /// evaluates every token against a row while its bytes are still in cache, so
 /// each quantized row is fetched once per step regardless of token count.
 ///
+/// The plain block formats quantize each token's activation row to Q8 once and
+/// stream every weight row through integer kernels; that keeps the compressed
+/// bytes in play for every batch size and never materializes a dense matrix.
+///
 /// The F32, F16 and Q8_1 byte layouts are accepted here even though the loader
 /// normally dequantizes F32/F16 into `LinearWeight::F32`. Supporting them keeps
 /// a single code path for every GGML dtype, so `LinearWeight` never needs a
@@ -370,15 +514,40 @@ pub fn quantized_linear(
         return;
     }
 
+    if num_tokens == 0 || rows == 0 {
+        return;
+    }
+    if cols == 0 {
+        // Every dot is an empty sum; keep the bias-only result.
+        for t in 0..num_tokens {
+            for r in 0..rows {
+                output[t * rows + r] = bias.map_or(0.0, |b| b[r]);
+            }
+        }
+        return;
+    }
+
+    // Quantize every token's activation once up front. Each quantized weight
+    // row is then evaluated against all tokens while its bytes are still in
+    // cache, and no token ever re-expands the matrix or its activation.
+    let activations: Option<Vec<Q8Activation>> =
+        if has_q8_activation_kernel(dtype) && cols.is_multiple_of(QK_ACT) {
+            x.chunks_exact(cols)
+                .map(Q8Activation::quantize)
+                .collect::<Option<Vec<_>>>()
+        } else {
+            None
+        };
+
     // Prompt evaluation of the encoder feeds ~1500 rows through each weight
-    // matrix. At that size the per-block dot kernels lose to a blocked GEMM:
-    // measured on tiny.en, a 1152x384 Q8_0 projection takes 141 ms with the
-    // quantized kernels and 19 ms after one 1.3 ms dequantization pass plus
-    // `sgemm`. The crossover sits well above the beam widths used during
-    // decoding, so only large batches take the dequantize path; single-token
-    // and beam steps keep streaming the compressed bytes.
+    // matrix. The K-quants have no integer activation kernel yet, and at that
+    // batch size their per-block f32 kernels lose to a blocked GEMM: measured
+    // on tiny.en, a 1152x384 projection took 141 ms with the f32 activation
+    // kernels and 19 ms after one 1.3 ms dequantization pass plus `sgemm`.
+    // Formats with a Q8 activation kernel take the streaming integer path at
+    // every batch size, so only the remaining ones use that fallback.
     const DEQUANT_GEMM_MIN_TOKENS: usize = 32;
-    if num_tokens >= DEQUANT_GEMM_MIN_TOKENS {
+    if activations.is_none() && num_tokens >= DEQUANT_GEMM_MIN_TOKENS {
         let dense = dtype
             .dequantize_to_f32(weight_bytes, rows * cols)
             .expect("validated weight bytes must dequantize");
@@ -411,8 +580,10 @@ pub fn quantized_linear(
                 let row_bytes = &weight_bytes[r_abs * bytes_per_row..(r_abs + 1) * bytes_per_row];
                 let b = bias.map(|b| b[r_abs]);
                 for (t, out_val) in row_out.iter_mut().enumerate() {
-                    let x_t = &x[t * cols..(t + 1) * cols];
-                    let dot = row_dot(dtype, row_bytes, x_t);
+                    let dot = match &activations {
+                        Some(acts) => row_dot_q8(dtype, row_bytes, &acts[t]),
+                        None => row_dot(dtype, row_bytes, &x[t * cols..(t + 1) * cols]),
+                    };
                     *out_val = if let Some(b) = b { dot + b } else { dot };
                 }
             }

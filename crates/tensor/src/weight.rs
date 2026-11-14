@@ -329,13 +329,23 @@ mod tests {
 
         weight.linear(&x, Some(&bias), 1, &mut out);
 
+        // Activations are quantized to Q8 before the integer dot kernel, so
+        // each activation carries at most half a quantization step of error.
+        // The dot error is bounded by that half step times the row's weight
+        // magnitude; this is the accuracy contract of the Q8 activation path.
+        let amax = x.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        let half_step = amax / 254.0;
         for r in 0..rows {
-            let expected = manual_dot(&reference[r * cols..(r + 1) * cols], &x) + bias[r];
+            let row = &reference[r * cols..(r + 1) * cols];
+            let expected = manual_dot(row, &x) + bias[r];
+            let weight_abs: f32 = row.iter().map(|v| v.abs()).sum();
+            let tol = half_step * weight_abs + 1e-4;
             assert!(
-                (out[r] - expected).abs() < 1e-3,
-                "row {r}: {} vs {}",
+                (out[r] - expected).abs() < tol,
+                "row {r}: {} vs {} (bound {})",
                 out[r],
-                expected
+                expected,
+                tol
             );
         }
     }

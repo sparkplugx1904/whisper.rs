@@ -1,3 +1,5 @@
+use crate::ops::quant::Q8Activation;
+
 #[inline(always)]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
@@ -696,4 +698,358 @@ unsafe fn dot_f16_f32_avx2(row_bytes: &[u8], x: &[f32]) -> f32 {
         i += 1;
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// Integer dot kernels against pre-quantized Q8 activations.
+//
+// The activation row is quantized once (see `Q8Activation`) and then every
+// weight row is consumed by integer multiply-adds. All products are exact:
+// the quantizer clamps to +-127, so a pair sum can never exceed 2*127*127 and
+// `vpmaddubsw`/`vpmaddwd` cannot saturate. Only the per-block scale product is
+// accumulated in f32, which keeps the result close to the f32 activation path.
+// ---------------------------------------------------------------------------
+
+/// Dot product between Q4_0 blocks and a Q8 activation row.
+#[inline(always)]
+pub fn dot_q4_0_q8(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    assert_eq!(raw_blocks.len(), act.len() * 18);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { vec_dot_q4_0_q8_avx2(raw_blocks, act) };
+        }
+    }
+    dot_q4_0_q8_scalar(raw_blocks, act)
+}
+
+#[allow(clippy::chunks_exact_to_as_chunks, clippy::needless_range_loop)]
+pub fn dot_q4_0_q8_scalar(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    let mut sum = 0.0f32;
+    for (chunk, b) in raw_blocks.chunks_exact(18).zip(act.blocks()) {
+        let d = half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+        let qs = &chunk[2..18];
+
+        let mut idot = 0i32;
+        for j in 0..16 {
+            idot += ((qs[j] & 0x0F) as i32 - 8) * b.qs[j] as i32;
+            idot += ((qs[j] >> 4) as i32 - 8) * b.qs[j + 16] as i32;
+        }
+        sum += d * b.d * idot as f32;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn vec_dot_q4_0_q8_avx2(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    use core::arch::x86_64::*;
+
+    let mask = _mm_set1_epi8(0x0F);
+    let one16 = _mm256_set1_epi16(1);
+    // Each block's integer partial stays in a vector lane and is scaled into
+    // this f32 accumulator, so the horizontal sum happens once per row instead
+    // of once per block.
+    let mut acc = _mm256_setzero_ps();
+    let mut corr = 0.0f32;
+
+    for (i, b) in act.blocks().iter().enumerate() {
+        let chunk = raw_blocks.get_unchecked(i * 18..(i + 1) * 18);
+        let d = half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+
+        let q16 = _mm_loadu_si128(chunk.as_ptr().add(2) as *const __m128i);
+        let q_lo = _mm_and_si128(q16, mask);
+        let q_hi = _mm_and_si128(_mm_srli_epi16(q16, 4), mask);
+        let qv = _mm256_set_m128i(q_hi, q_lo);
+
+        let xv = _mm256_loadu_si256(b.qs.as_ptr() as *const __m256i);
+        let partial = _mm256_madd_epi16(_mm256_maddubs_epi16(qv, xv), one16);
+
+        // The stored nibbles are unsigned 0..15, so the signed weight is q - 8.
+        // The activation sum is exact in `sum_q`: sum(x) = d_act * sum_q.
+        let scale = d * b.d;
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(partial), _mm256_set1_ps(scale), acc);
+        corr -= 8.0 * scale * b.sum_q as f32;
+    }
+    hsum256_ps(acc) + corr
+}
+
+/// Dot product between Q4_1 blocks and a Q8 activation row.
+#[inline(always)]
+pub fn dot_q4_1_q8(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    assert_eq!(raw_blocks.len(), act.len() * 20);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { vec_dot_q4_1_q8_avx2(raw_blocks, act) };
+        }
+    }
+    dot_q4_1_q8_scalar(raw_blocks, act)
+}
+
+#[allow(clippy::chunks_exact_to_as_chunks, clippy::needless_range_loop)]
+pub fn dot_q4_1_q8_scalar(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    let mut sum = 0.0f32;
+    for (chunk, b) in raw_blocks.chunks_exact(20).zip(act.blocks()) {
+        let d = half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+        let m = half::f16::from_bits(u16::from_le_bytes([chunk[2], chunk[3]])).to_f32();
+        let qs = &chunk[4..20];
+
+        let mut idot = 0i32;
+        for j in 0..16 {
+            idot += (qs[j] & 0x0F) as i32 * b.qs[j] as i32;
+            idot += (qs[j] >> 4) as i32 * b.qs[j + 16] as i32;
+        }
+        sum += d * b.d * idot as f32 + m * b.d * b.sum_q as f32;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn vec_dot_q4_1_q8_avx2(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    use core::arch::x86_64::*;
+
+    let mask = _mm_set1_epi8(0x0F);
+    let one16 = _mm256_set1_epi16(1);
+    let mut acc = _mm256_setzero_ps();
+    let mut corr = 0.0f32;
+
+    for (i, b) in act.blocks().iter().enumerate() {
+        let chunk = raw_blocks.get_unchecked(i * 20..(i + 1) * 20);
+        let d = half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+        let m = half::f16::from_bits(u16::from_le_bytes([chunk[2], chunk[3]])).to_f32();
+
+        let q16 = _mm_loadu_si128(chunk.as_ptr().add(4) as *const __m128i);
+        let q_lo = _mm_and_si128(q16, mask);
+        let q_hi = _mm_and_si128(_mm_srli_epi16(q16, 4), mask);
+        let qv = _mm256_set_m128i(q_hi, q_lo);
+
+        let xv = _mm256_loadu_si256(b.qs.as_ptr() as *const __m256i);
+        let partial = _mm256_madd_epi16(_mm256_maddubs_epi16(qv, xv), one16);
+
+        let scale = d * b.d;
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(partial), _mm256_set1_ps(scale), acc);
+        corr += m * b.d * b.sum_q as f32;
+    }
+    hsum256_ps(acc) + corr
+}
+
+/// Dot product between Q5_0 blocks and a Q8 activation row.
+#[inline(always)]
+pub fn dot_q5_0_q8(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    assert_eq!(raw_blocks.len(), act.len() * 22);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { vec_dot_q5_0_q8_avx2(raw_blocks, act) };
+        }
+    }
+    dot_q5_0_q8_scalar(raw_blocks, act)
+}
+
+#[allow(clippy::chunks_exact_to_as_chunks, clippy::needless_range_loop)]
+pub fn dot_q5_0_q8_scalar(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    let mut sum = 0.0f32;
+    for (chunk, b) in raw_blocks.chunks_exact(22).zip(act.blocks()) {
+        let d = half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+        let qh = u32::from_le_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]);
+        let qs = &chunk[6..22];
+
+        let mut idot = 0i32;
+        for j in 0..16 {
+            let h0 = ((qh >> j) & 1) as i32;
+            let h1 = ((qh >> (j + 16)) & 1) as i32;
+            idot += (((qs[j] & 0x0F) as i32) | (h0 << 4)) * b.qs[j] as i32;
+            idot += ((((qs[j] >> 4) & 0x0F) as i32) | (h1 << 4)) * b.qs[j + 16] as i32;
+        }
+        // Stored values are unsigned 0..31; the signed weight is q - 16.
+        sum += d * b.d * (idot - 16 * b.sum_q) as f32;
+    }
+    sum
+}
+
+/// Expand the 32 high bits of a Q5 block into one byte per element.
+///
+/// Each element contributes `0x10` when its fifth bit is set. The broadcast
+/// places the four `qh` bytes in every 32-bit lane; a per-lane byte shuffle
+/// then selects byte 0 for elements 0..7 and byte 1 for elements 8..15, which
+/// maps every byte of the 256-bit result onto one element.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn q5_high_bits(qh: u32) -> core::arch::x86_64::__m256i {
+    use core::arch::x86_64::*;
+
+    let lo = _mm_set1_epi32(qh as i32);
+    let hi = _mm_set1_epi32((qh >> 16) as i32);
+    let src = _mm256_set_m128i(hi, lo);
+
+    let idx = _mm256_setr_epi8(
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1,
+        1, 1,
+    );
+    // 0x80 is `-128` as an i8 literal; it is the mask for bit 7 of a byte.
+    let bit = _mm256_setr_epi8(
+        1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        1, 2, 4, 8, 16, 32, 64, -128,
+    );
+
+    let bytes = _mm256_shuffle_epi8(src, idx);
+    let hit = _mm256_and_si256(bytes, bit);
+    let unset = _mm256_cmpeq_epi8(hit, _mm256_setzero_si256());
+    _mm256_andnot_si256(unset, _mm256_set1_epi8(0x10))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn vec_dot_q5_0_q8_avx2(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    use core::arch::x86_64::*;
+
+    let mask = _mm_set1_epi8(0x0F);
+    let one16 = _mm256_set1_epi16(1);
+    let mut acc = _mm256_setzero_ps();
+    let mut corr = 0.0f32;
+
+    for (i, b) in act.blocks().iter().enumerate() {
+        let chunk = raw_blocks.get_unchecked(i * 22..(i + 1) * 22);
+        let d = half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+        let qh = u32::from_le_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]);
+
+        let q16 = _mm_loadu_si128(chunk.as_ptr().add(6) as *const __m128i);
+        let q_lo = _mm_and_si128(q16, mask);
+        let q_hi = _mm_and_si128(_mm_srli_epi16(q16, 4), mask);
+        let qv = _mm256_or_si256(_mm256_set_m128i(q_hi, q_lo), q5_high_bits(qh));
+
+        let xv = _mm256_loadu_si256(b.qs.as_ptr() as *const __m256i);
+        let partial = _mm256_madd_epi16(_mm256_maddubs_epi16(qv, xv), one16);
+
+        // Stored values are unsigned 0..31, so the signed weight is q - 16 and
+        // the activation sum comes from the exact `sum_q`.
+        let scale = d * b.d;
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(partial), _mm256_set1_ps(scale), acc);
+        corr -= 16.0 * scale * b.sum_q as f32;
+    }
+    hsum256_ps(acc) + corr
+}
+
+/// Dot product between Q5_1 blocks and a Q8 activation row.
+#[inline(always)]
+pub fn dot_q5_1_q8(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    assert_eq!(raw_blocks.len(), act.len() * 24);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { vec_dot_q5_1_q8_avx2(raw_blocks, act) };
+        }
+    }
+    dot_q5_1_q8_scalar(raw_blocks, act)
+}
+
+#[allow(clippy::chunks_exact_to_as_chunks, clippy::needless_range_loop)]
+pub fn dot_q5_1_q8_scalar(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    let mut sum = 0.0f32;
+    for (chunk, b) in raw_blocks.chunks_exact(24).zip(act.blocks()) {
+        let d = half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+        let m = half::f16::from_bits(u16::from_le_bytes([chunk[2], chunk[3]])).to_f32();
+        let qh = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        let qs = &chunk[8..24];
+
+        let mut idot = 0i32;
+        for j in 0..16 {
+            let h0 = ((qh >> j) & 1) as i32;
+            let h1 = ((qh >> (j + 16)) & 1) as i32;
+            idot += (((qs[j] & 0x0F) as i32) | (h0 << 4)) * b.qs[j] as i32;
+            idot += ((((qs[j] >> 4) & 0x0F) as i32) | (h1 << 4)) * b.qs[j + 16] as i32;
+        }
+        sum += d * b.d * idot as f32 + m * b.d * b.sum_q as f32;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn vec_dot_q5_1_q8_avx2(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    use core::arch::x86_64::*;
+
+    let mask = _mm_set1_epi8(0x0F);
+    let one16 = _mm256_set1_epi16(1);
+    let mut acc = _mm256_setzero_ps();
+    let mut corr = 0.0f32;
+
+    for (i, b) in act.blocks().iter().enumerate() {
+        let chunk = raw_blocks.get_unchecked(i * 24..(i + 1) * 24);
+        let d = half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+        let m = half::f16::from_bits(u16::from_le_bytes([chunk[2], chunk[3]])).to_f32();
+        let qh = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+
+        let q16 = _mm_loadu_si128(chunk.as_ptr().add(8) as *const __m128i);
+        let q_lo = _mm_and_si128(q16, mask);
+        let q_hi = _mm_and_si128(_mm_srli_epi16(q16, 4), mask);
+        let qv = _mm256_or_si256(_mm256_set_m128i(q_hi, q_lo), q5_high_bits(qh));
+
+        let xv = _mm256_loadu_si256(b.qs.as_ptr() as *const __m256i);
+        let partial = _mm256_madd_epi16(_mm256_maddubs_epi16(qv, xv), one16);
+
+        let scale = d * b.d;
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(partial), _mm256_set1_ps(scale), acc);
+        corr += m * b.d * b.sum_q as f32;
+    }
+    hsum256_ps(acc) + corr
+}
+
+/// Dot product between Q8_0 blocks and a Q8 activation row.
+#[inline(always)]
+pub fn dot_q8_0_q8(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    assert_eq!(raw_blocks.len(), act.len() * 34);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { vec_dot_q8_0_q8_avx2(raw_blocks, act) };
+        }
+    }
+    dot_q8_0_q8_scalar(raw_blocks, act)
+}
+
+#[allow(clippy::chunks_exact_to_as_chunks, clippy::needless_range_loop)]
+pub fn dot_q8_0_q8_scalar(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    let mut sum = 0.0f32;
+    for (chunk, b) in raw_blocks.chunks_exact(34).zip(act.blocks()) {
+        let d = half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+        let qs = &chunk[2..34];
+
+        let mut idot = 0i32;
+        for j in 0..32 {
+            idot += (qs[j] as i8 as i32) * b.qs[j] as i32;
+        }
+        sum += d * b.d * idot as f32;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn vec_dot_q8_0_q8_avx2(raw_blocks: &[u8], act: &Q8Activation) -> f32 {
+    use core::arch::x86_64::*;
+
+    let one16 = _mm256_set1_epi16(1);
+    let mut acc = _mm256_setzero_ps();
+
+    for (i, b) in act.blocks().iter().enumerate() {
+        let chunk = raw_blocks.get_unchecked(i * 34..(i + 1) * 34);
+        let d = half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+
+        let qv = _mm256_loadu_si256(chunk.as_ptr().add(2) as *const __m256i);
+        let xv = _mm256_loadu_si256(b.qs.as_ptr() as *const __m256i);
+
+        // vpmaddubsw needs an unsigned first operand: take |q| and fold the
+        // sign into the activation bytes, which leaves the product unchanged.
+        let signed_x = _mm256_sign_epi8(xv, qv);
+        let abs_q = _mm256_abs_epi8(qv);
+        let partial = _mm256_madd_epi16(_mm256_maddubs_epi16(abs_q, signed_x), one16);
+
+        let scale = d * b.d;
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(partial), _mm256_set1_ps(scale), acc);
+    }
+    hsum256_ps(acc)
 }

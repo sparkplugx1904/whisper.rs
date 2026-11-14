@@ -145,18 +145,26 @@ fn test_quantized_linear_vector() {
         2,
     );
 
-    // Verify each row
+    // Verify each row against the dense reference. The activation row is
+    // quantized to Q8 before the integer dot, so each activation carries at
+    // most half a quantization step and the dot error is bounded by that half
+    // step times the row's weight magnitude.
+    let amax = x.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+    let half_step = amax / 254.0;
     for r in 0..rows {
         let row_slice = &weight_bytes[r * bytes_per_row..(r + 1) * bytes_per_row];
         let dequant = DType::Q8_0.dequantize_to_f32(row_slice, cols).unwrap();
         let expected = dot_f32(&dequant, &x) + bias[r];
+        let weight_abs: f32 = dequant.iter().map(|v| v.abs()).sum();
+        let tol = half_step * weight_abs + 1e-4;
         let diff = (out[r] - expected).abs();
         assert!(
-            diff < 1e-4,
-            "Row {}: got {}, expected {}",
+            diff < tol,
+            "Row {}: got {}, expected {} (bound {})",
             r,
             out[r],
-            expected
+            expected,
+            tol
         );
     }
 }
