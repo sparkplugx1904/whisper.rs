@@ -44,7 +44,7 @@ pub struct BeamSearch {
 }
 
 /// True when appending `next` would create the third occurrence of a 4-gram.
-fn repeats_ngram(tokens: &[i32], next: i32, eot: i32) -> bool {
+pub(crate) fn repeats_ngram(tokens: &[i32], next: i32, eot: i32) -> bool {
     if next < 0 || next >= eot || tokens.len() < 4 {
         return false;
     }

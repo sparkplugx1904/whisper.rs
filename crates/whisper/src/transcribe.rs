@@ -710,13 +710,28 @@ impl WhisperContext {
                         let (best_id, best_logit) = if temperature > 0.0 {
                             sample_token(step_logits, &mut rng_state)
                         } else {
-                            let mut best_id = 0i32;
-                            let mut best_logit = f32::NEG_INFINITY;
-                            for (i, &l) in step_logits.iter().enumerate() {
-                                if l > best_logit {
-                                    best_logit = l;
-                                    best_id = i as i32;
+                            // Greedy can lock into the same phrase as beam. When
+                            // the argmax would close a third 4-gram, mask that
+                            // token and take the next-best one.
+                            let mut best_id;
+                            let mut best_logit;
+                            loop {
+                                best_id = 0i32;
+                                best_logit = f32::NEG_INFINITY;
+                                for (i, &l) in step_logits.iter().enumerate() {
+                                    if l > best_logit {
+                                        best_logit = l;
+                                        best_id = i as i32;
+                                    }
                                 }
+                                if best_id >= 0
+                                    && best_id < eot
+                                    && crate::beam::repeats_ngram(&tokens_cur, best_id, eot)
+                                {
+                                    step_logits[best_id as usize] = f32::NEG_INFINITY;
+                                    continue;
+                                }
+                                break;
                             }
                             (best_id, best_logit)
                         };
