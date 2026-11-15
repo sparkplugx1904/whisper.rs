@@ -308,7 +308,11 @@ fn test_c_abi_param_allocators_and_deleters() {
             whisper_sampling_strategy::WHISPER_SAMPLING_GREEDY
         );
         assert_eq!((*fparams_greedy).n_threads, 4);
+        assert_eq!((*fparams_greedy).n_max_text_ctx, 16384);
         assert!((*fparams_greedy).print_timestamps);
+
+        (*fparams_greedy).n_max_text_ctx = 64;
+        assert_eq!((*fparams_greedy).n_max_text_ctx, 64);
 
         (*fparams_greedy).n_threads = 8;
         assert_eq!((*fparams_greedy).n_threads, 8);
@@ -597,7 +601,9 @@ fn test_c_abi_vad_standalone_api() {
         assert_eq!(vad_params.threshold, 0.5);
         assert_eq!(vad_params.min_speech_duration_ms, 250);
         assert_eq!(vad_params.min_silence_duration_ms, 100);
+        assert_eq!(vad_params.max_speech_duration_s, f32::MAX);
         assert_eq!(vad_params.speech_pad_ms, 30);
+        assert_eq!(vad_params.samples_overlap, 0.1);
 
         let vad_cparams = whisper_vad_default_context_params();
         assert_eq!(vad_cparams.n_threads, 4);

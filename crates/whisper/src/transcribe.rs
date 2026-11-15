@@ -302,17 +302,28 @@ impl WhisperContext {
         let beg = self.tokenizer.beg();
         let not_token = self.tokenizer.not();
 
+        let max_prompt_ctx =
+            prompt_token_budget(params, self.model.hparams.n_text_ctx.max(0) as usize);
         let mut prompt_base = Vec::new();
 
-        // 1. Initial prompt injection (raw tokens or text)
-        if !params.prompt_tokens.is_empty() {
-            prompt_base.push(self.model.vocab.token_prev);
-            prompt_base.extend_from_slice(&params.prompt_tokens);
-        } else if let Some(prompt_text) = &params.initial_prompt {
-            if !prompt_text.trim().is_empty() {
+        // 1. Initial prompt injection (raw tokens or text). whisper.cpp keeps
+        // the last `max_prompt_ctx - 1` tokens; without this cap a large prompt
+        // can exceed the decoder's positional table before the first decode.
+        if max_prompt_ctx > 0 {
+            let budget = max_prompt_ctx.saturating_sub(1).max(1);
+            if !params.prompt_tokens.is_empty() {
                 prompt_base.push(self.model.vocab.token_prev);
-                let encoded_prompt = self.tokenizer.encode(prompt_text);
-                prompt_base.extend(encoded_prompt);
+                let start = params.prompt_tokens.len().saturating_sub(budget);
+                prompt_base.extend_from_slice(&params.prompt_tokens[start..]);
+            } else if let Some(prompt_text) = &params.initial_prompt {
+                if !prompt_text.trim().is_empty() {
+                    prompt_base.push(self.model.vocab.token_prev);
+                    let mut encoded_prompt = self.tokenizer.encode(prompt_text);
+                    if encoded_prompt.len() > budget {
+                        encoded_prompt.drain(..encoded_prompt.len() - budget);
+                    }
+                    prompt_base.extend(encoded_prompt);
+                }
             }
         }
 
@@ -416,6 +427,7 @@ impl WhisperContext {
                 sot,
                 not_token,
                 token_prev: self.model.vocab.token_prev,
+                n_text_ctx: self.model.hparams.n_text_ctx.max(0) as usize,
             };
             let window_prompt =
                 prompt_builder.build(seek_frame, &history_tokens, params, &self.tokenizer);
@@ -1434,6 +1446,39 @@ pub struct WindowPromptBuilder<'a> {
     pub sot: i32,
     pub not_token: i32,
     pub token_prev: i32,
+    pub n_text_ctx: usize,
+}
+
+/// Effective history budget, mirroring whisper.cpp's
+/// `min(n_max_text_ctx, n_text_ctx / 2)`. Zero means no history conditioning.
+fn prompt_token_budget(params: &WhisperParams, n_text_ctx: usize) -> usize {
+    if params.n_max_text_ctx <= 0 {
+        0
+    } else {
+        (params.n_max_text_ctx as usize).min(n_text_ctx / 2)
+    }
+}
+
+/// Drop the oldest history tokens first. `<|startofprev|>` and the trailing
+/// SOT/language/task tokens must survive, so the drain starts after the marker.
+fn cap_prompt_tokens(
+    window_prompt: &mut Vec<i32>,
+    max_prompt_ctx: usize,
+    token_prev: i32,
+    keep_tail: usize,
+) {
+    if max_prompt_ctx == 0 || window_prompt.len() <= max_prompt_ctx {
+        return;
+    }
+    let drop = window_prompt.len() - max_prompt_ctx;
+    let start = usize::from(window_prompt.first() == Some(&token_prev));
+    // Never drain the SOT/language/task suffix: a tiny n_max_text_ctx limits
+    // the history budget, not the tokens that identify the decoder task.
+    let available = window_prompt
+        .len()
+        .saturating_sub(keep_tail)
+        .saturating_sub(start);
+    window_prompt.drain(start..start + drop.min(available));
 }
 
 impl<'a> WindowPromptBuilder<'a> {
@@ -1444,12 +1489,16 @@ impl<'a> WindowPromptBuilder<'a> {
         params: &WhisperParams,
         tokenizer: &Tokenizer,
     ) -> Vec<i32> {
+        let max_prompt_ctx = prompt_token_budget(params, self.n_text_ctx);
+        let keep_tail =
+            1 + usize::from(self.is_multilingual) * 2 + usize::from(params.no_timestamps);
+        let prompt_cap = max_prompt_ctx.max(keep_tail);
         let mut window_prompt = Vec::new();
-        if seek_frame == 0 || params.no_context {
+        if seek_frame == 0 || params.no_context || max_prompt_ctx == 0 {
             window_prompt.extend_from_slice(self.prompt_base);
         } else {
-            let prev_tokens_slice = if history_tokens.len() > 224 {
-                &history_tokens[history_tokens.len() - 224..]
+            let prev_tokens_slice = if history_tokens.len() > max_prompt_ctx {
+                &history_tokens[history_tokens.len() - max_prompt_ctx..]
             } else {
                 history_tokens
             };
@@ -1457,10 +1506,16 @@ impl<'a> WindowPromptBuilder<'a> {
             if !prev_tokens_slice.is_empty() {
                 window_prompt.push(self.token_prev);
                 if params.carry_initial_prompt {
+                    let budget = max_prompt_ctx.saturating_sub(1).max(1);
                     if !params.prompt_tokens.is_empty() {
-                        window_prompt.extend_from_slice(&params.prompt_tokens);
+                        let start = params.prompt_tokens.len().saturating_sub(budget);
+                        window_prompt.extend_from_slice(&params.prompt_tokens[start..]);
                     } else if let Some(prompt_text) = &params.initial_prompt {
-                        window_prompt.extend(tokenizer.encode(prompt_text));
+                        let mut encoded = tokenizer.encode(prompt_text);
+                        if encoded.len() > budget {
+                            encoded.drain(..encoded.len() - budget);
+                        }
+                        window_prompt.extend(encoded);
                     }
                 }
                 window_prompt.extend_from_slice(prev_tokens_slice);
@@ -1480,18 +1535,7 @@ impl<'a> WindowPromptBuilder<'a> {
                 window_prompt.push(self.not_token);
             }
         }
-        // The decoder context is 448 positions and generation can consume up
-        // to 224 more. Keep the prompt at half the context, dropping the oldest
-        // history first; the trailing SOT/language/task tokens must survive.
-        const MAX_PROMPT_TOKENS: usize = 224;
-        if window_prompt.len() > MAX_PROMPT_TOKENS {
-            let drop = window_prompt.len() - MAX_PROMPT_TOKENS;
-            // `<|startofprev|>` is the only marker that distinguishes prompt
-            // conditioning from a bare prefix; never drain it with the history.
-            let start = usize::from(window_prompt.first() == Some(&self.token_prev));
-            window_prompt.drain(start..start + drop);
-        }
-
+        cap_prompt_tokens(&mut window_prompt, prompt_cap, self.token_prev, keep_tail);
         window_prompt
     }
 }
@@ -1704,6 +1748,53 @@ mod repetition_guard_tests {
         let text =
             "Sobat Trisma hari ini kita bakal ngebahas tentang perayaan unik di bulan Desember";
         assert!(!has_repetition_loop(text));
+    }
+}
+
+#[cfg(test)]
+mod prompt_budget_tests {
+    use super::{cap_prompt_tokens, prompt_token_budget};
+    use crate::params::WhisperParams;
+
+    #[test]
+    fn matches_upstream_budget_rule() {
+        let mut params = WhisperParams::default();
+        assert_eq!(prompt_token_budget(&params, 448), 224);
+        params.n_max_text_ctx = 64;
+        assert_eq!(prompt_token_budget(&params, 448), 64);
+        params.n_max_text_ctx = 0;
+        assert_eq!(prompt_token_budget(&params, 448), 0);
+        params.n_max_text_ctx = 16384;
+        assert_eq!(prompt_token_budget(&params, 1024), 512);
+    }
+
+    #[test]
+    fn cap_drops_oldest_history_and_keeps_the_marker_and_base() {
+        let mut prompt = vec![7];
+        prompt.extend(0..300);
+        prompt.extend([10, 11, 12]);
+        cap_prompt_tokens(&mut prompt, 50, 7, 3);
+        assert_eq!(prompt.len(), 50);
+        assert_eq!(prompt[0], 7);
+        assert_eq!(&prompt[47..], &[10, 11, 12]);
+    }
+
+    #[test]
+    fn huge_prompt_is_bounded_before_decode() {
+        let mut prompt = vec![7];
+        prompt.extend(0..500);
+        prompt.extend([10, 11, 12]);
+        cap_prompt_tokens(&mut prompt, 224, 7, 3);
+        assert!(prompt.len() <= 224);
+        assert_eq!(prompt[0], 7);
+        assert_eq!(&prompt[prompt.len() - 3..], &[10, 11, 12]);
+    }
+
+    #[test]
+    fn cap_never_drops_the_task_suffix() {
+        let mut prompt = vec![7, 8, 9, 10, 11];
+        cap_prompt_tokens(&mut prompt, 3, 7, 3);
+        assert_eq!(prompt, vec![7, 9, 10, 11]);
     }
 }
 

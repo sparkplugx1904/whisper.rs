@@ -125,6 +125,10 @@ pub struct Args {
     #[arg(short = 'd', long = "duration", default_value_t = 0)]
     pub duration: i32,
 
+    /// Maximum number of text context tokens used as prompt (0 disables history)
+    #[arg(long = "max-context", alias = "mc", default_value_t = 16384)]
+    pub max_context: i32,
+
     /// Maximum initial timestamp at step 0 (in seconds)
     #[arg(long = "max-initial-ts", default_value_t = 1.0)]
     pub max_initial_ts: f32,
@@ -176,6 +180,14 @@ pub struct Args {
     /// Padding in milliseconds added around each detected speech region
     #[arg(long = "vad-speech-pad-ms", default_value_t = 300)]
     pub vad_speech_pad_ms: usize,
+
+    /// Maximum speech segment duration in seconds before VAD splits it
+    #[arg(long = "vad-max-speech-duration-s", alias = "vmsd", default_value_t = f32::MAX)]
+    pub vad_max_speech_duration_s: f32,
+
+    /// Overlap in seconds between adjacent VAD segments
+    #[arg(long = "vad-samples-overlap", alias = "vo", default_value_t = 0.1)]
+    pub vad_samples_overlap: f32,
 
     /// Sampling temperature (0.0 = greedy or beam search)
     #[arg(long = "temperature", default_value_t = 0.0)]
@@ -253,6 +265,7 @@ impl Default for Args {
             no_prints: false,
             offset_t: 0,
             duration: 0,
+            max_context: 16384,
             max_initial_ts: 1.0,
             single_segment: false,
             suppress_regex: None,
@@ -265,6 +278,8 @@ impl Default for Args {
             vad_min_speech_duration_ms: 250,
             vad_min_silence_duration_ms: 100,
             vad_speech_pad_ms: 300,
+            vad_max_speech_duration_s: f32::MAX,
+            vad_samples_overlap: 0.1,
             temperature: 0.0,
             temperature_inc: 0.2,
             no_fallback: false,
@@ -324,6 +339,9 @@ where
             "-olrc" => out.push("--output-lrc".to_string()),
             "-np" => out.push("--no-prints".to_string()),
             "-ot" => out.push("--offset-t".to_string()),
+            "-mc" => out.push("--max-context".to_string()),
+            "-vmsd" => out.push("--vad-max-speech-duration-s".to_string()),
+            "-vo" => out.push("--vad-samples-overlap".to_string()),
             "-d" => out.push("--duration".to_string()),
             "-ss" => out.push("--single-segment".to_string()),
             "-pc" => out.push("--print-colors".to_string()),
@@ -546,6 +564,7 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         tdrz_enable: args.tinydiarize,
         offset_ms: args.offset_t,
         duration_ms: args.duration,
+        n_max_text_ctx: args.max_context,
         max_initial_ts: args.max_initial_ts,
         single_segment: args.single_segment,
         suppress_regex: args.suppress_regex.clone(),
@@ -554,6 +573,8 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         vad_min_speech_duration_ms: args.vad_min_speech_duration_ms,
         vad_min_silence_duration_ms: args.vad_min_silence_duration_ms,
         vad_speech_pad_ms: args.vad_speech_pad_ms,
+        vad_max_speech_duration_s: args.vad_max_speech_duration_s,
+        vad_samples_overlap: args.vad_samples_overlap,
         temperature: args.temperature,
         temperature_inc: if args.no_fallback {
             0.0
@@ -1115,6 +1136,34 @@ mod tests {
                 "--font-path=/another/font.ttf",
             ]
         );
+    }
+
+    #[test]
+    fn test_parse_args_vad_duration_and_overlap() {
+        let input = vec![
+            "whisper-cli",
+            "-vmsd",
+            "2.5",
+            "-vo",
+            "0.25",
+            "-m",
+            "tiny.bin",
+            "-f",
+            "a.wav",
+        ];
+        let normalized = normalize_cli_args(input);
+        let args = Args::try_parse_from(normalized).expect("Parse VAD flags");
+        assert_eq!(args.vad_max_speech_duration_s, 2.5);
+        assert_eq!(args.vad_samples_overlap, 0.25);
+        assert_eq!(args.vad_speech_pad_ms, 300);
+    }
+
+    #[test]
+    fn test_parse_args_max_context() {
+        let input = vec!["whisper-cli", "-mc", "64", "-m", "tiny.bin", "-f", "a.wav"];
+        let normalized = normalize_cli_args(input);
+        let args = Args::try_parse_from(normalized).expect("Parse --max-context");
+        assert_eq!(args.max_context, 64);
     }
 
     #[test]

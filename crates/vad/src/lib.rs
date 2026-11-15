@@ -140,5 +140,100 @@ pub fn detect_speech_segments(samples: &[f32], params: &VadParams) -> Vec<Speech
     }
 
     // If no voice segment was detected (pure silence), returns empty list
-    segments
+    split_long_segments(segments, params)
+}
+
+/// Split speech segments longer than `max_speech_duration_s`.
+///
+/// The Silero path splits while scanning probabilities; the energy detector has
+/// no probability trace, so the split is applied afterwards. The overlap is
+/// clamped below the chunk length so the loop always advances.
+fn split_long_segments(segments: Vec<SpeechSegment>, params: &VadParams) -> Vec<SpeechSegment> {
+    let max_s = params.max_speech_duration_s;
+    if !max_s.is_finite() || max_s <= 0.0 {
+        return segments;
+    }
+    // The Silero path subtracts one analysis window and two padding margins
+    // before splitting; a limit that small means "do not split" (the upstream
+    // code falls back to INT_MAX/2). The energy detector has no analysis window,
+    // so only the padding term applies. The comparison stays in f32 because the
+    // parameter is f32: widening one side would make an exact boundary such as
+    // 0.6 s with a 300 ms pad fall on the wrong side of the test.
+    let pad_s = params.speech_pad_ms as f32 / 1000.0;
+    if max_s - 2.0 * pad_s <= 1e-6 {
+        return segments;
+    }
+    let max_s = max_s as f64;
+    let overlap = (params.samples_overlap.max(0.0) as f64).min(max_s * 0.5);
+    let mut split = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let mut t0 = segment.t0;
+        while segment.t1 - t0 > max_s + 1e-9 {
+            let t1 = (t0 + max_s).min(segment.t1);
+            split.push(SpeechSegment::new(t0, t1));
+            t0 = (t1 - overlap).max(t0 + 1e-9);
+        }
+        split.push(SpeechSegment::new(t0, segment.t1));
+    }
+    split
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{split_long_segments, SpeechSegment, VadParams};
+
+    #[test]
+    fn splits_long_speech_with_overlap() {
+        let params = VadParams {
+            max_speech_duration_s: 1.0,
+            samples_overlap: 0.1,
+            ..VadParams::default()
+        };
+        let split = split_long_segments(vec![SpeechSegment::new(0.0, 3.0)], &params);
+        assert_eq!(split.len(), 4);
+        assert!((split[0].t1 - split[0].t0 - 1.0).abs() < 1e-6);
+        assert!((split[1].t0 - 0.9).abs() < 1e-6);
+        assert!((split[3].t1 - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn limit_below_two_padding_margins_does_not_split() {
+        let params = VadParams {
+            max_speech_duration_s: 0.05,
+            speech_pad_ms: 30,
+            ..VadParams::default()
+        };
+        let segments = vec![SpeechSegment::new(0.0, 3.0)];
+        assert_eq!(split_long_segments(segments.clone(), &params), segments);
+    }
+
+    #[test]
+    fn exact_two_padding_margins_does_not_split() {
+        let params = VadParams {
+            max_speech_duration_s: 0.6,
+            speech_pad_ms: 300,
+            ..VadParams::default()
+        };
+        let segments = vec![SpeechSegment::new(0.0, 3.0)];
+        assert_eq!(split_long_segments(segments.clone(), &params), segments);
+    }
+
+    #[test]
+    fn unbounded_max_duration_is_a_noop() {
+        let params = VadParams::default();
+        let segments = vec![SpeechSegment::new(0.0, 30.0)];
+        assert_eq!(split_long_segments(segments.clone(), &params), segments);
+    }
+
+    #[test]
+    fn overlap_longer_than_chunk_still_advances() {
+        let params = VadParams {
+            max_speech_duration_s: 1.0,
+            samples_overlap: 5.0,
+            ..VadParams::default()
+        };
+        let split = split_long_segments(vec![SpeechSegment::new(0.0, 3.0)], &params);
+        assert!(split.len() >= 3);
+        assert!(split.windows(2).all(|pair| pair[1].t0 > pair[0].t0));
+    }
 }

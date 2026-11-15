@@ -30,6 +30,60 @@ pub struct SpeechMap {
     ranges: Vec<(usize, usize)>,
 }
 
+/// Convert VAD segments to absolute mel-frame ranges.
+///
+/// whisper.cpp copies every segment plus `samples_overlap` seconds of the next
+/// segment into the filtered audio. The window map has no filtered buffer, so
+/// the overlap is added to the end of every segment except the last, then
+/// overlapping ranges are merged into the same continuous speech region.
+fn segments_to_ranges(
+    segments: &[SpeechSegment],
+    overlap_s: f32,
+    total_samples: usize,
+) -> Vec<(usize, usize)> {
+    let total_frames = ((total_samples as f64) / 160.0).ceil().max(1.0) as usize;
+    let overlap_frames = (overlap_s.max(0.0) as f64 * FRAMES_PER_SECOND).round() as usize;
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(segments.len());
+
+    for (index, segment) in segments.iter().enumerate() {
+        let start = (segment.t0.max(0.0) * FRAMES_PER_SECOND).floor() as usize;
+        let mut end = (segment.t1.max(0.0) * FRAMES_PER_SECOND).ceil() as usize;
+        if index + 1 < segments.len() {
+            end = end.saturating_add(overlap_frames);
+        }
+        end = end.min(total_frames);
+        if end <= start {
+            end = (start + 1).min(total_frames);
+        }
+        if end > start {
+            ranges.push((start, end));
+        }
+    }
+
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// Map the engine parameters onto the VAD detector parameters.
+fn vad_params_from(params: &WhisperParams) -> VadParams {
+    VadParams {
+        threshold: params.vad_threshold,
+        min_speech_duration_ms: params.vad_min_speech_duration_ms,
+        min_silence_duration_ms: params.vad_min_silence_duration_ms,
+        max_speech_duration_s: params.vad_max_speech_duration_s,
+        speech_pad_ms: params.vad_speech_pad_ms,
+        samples_overlap: params.vad_samples_overlap,
+        ..VadParams::default()
+    }
+}
+
 impl SpeechMap {
     /// Builds a speech map from 16 kHz mono samples.
     ///
@@ -41,14 +95,7 @@ impl SpeechMap {
             return None;
         }
 
-        let vad_params = VadParams {
-            threshold: params.vad_threshold,
-            min_speech_duration_ms: params.vad_min_speech_duration_ms,
-            min_silence_duration_ms: params.vad_min_silence_duration_ms,
-            max_speech_duration_s: f32::MAX,
-            speech_pad_ms: params.vad_speech_pad_ms,
-            ..VadParams::default()
-        };
+        let vad_params = vad_params_from(params);
 
         // The neural detector is strongly preferred when its model is
         // available: it tolerates music and noise beds that the adaptive
@@ -63,32 +110,8 @@ impl SpeechMap {
             None => detect_speech_segments(samples, &vad_params),
         };
 
-        let mut ranges: Vec<(usize, usize)> = segments
-            .iter()
-            .map(|segment| {
-                let start = (segment.t0 * FRAMES_PER_SECOND).floor() as usize;
-                let mut end = (segment.t1 * FRAMES_PER_SECOND).ceil() as usize;
-                // A segment shorter than one frame still has to cover a frame,
-                // otherwise the range would be empty and never match.
-                if end <= start {
-                    end = start + 1;
-                }
-                (start, end)
-            })
-            .collect();
-
-        ranges.sort_unstable();
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-        for (start, end) in ranges {
-            match merged.last_mut() {
-                // Overlapping or touching ranges describe one continuous
-                // speech region, so fold them together.
-                Some(last) if start <= last.1 => last.1 = last.1.max(end),
-                _ => merged.push((start, end)),
-            }
-        }
-
-        Some(Self { ranges: merged })
+        let ranges = segments_to_ranges(&segments, params.vad_samples_overlap, samples.len());
+        Some(Self { ranges })
     }
 
     /// Returns `true` when no speech was detected.
@@ -174,6 +197,32 @@ mod tests {
                 amplitude * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
             })
             .collect()
+    }
+
+    #[test]
+    fn engine_params_reach_the_detector() {
+        let params = WhisperParams {
+            vad_max_speech_duration_s: 2.5,
+            vad_samples_overlap: 0.25,
+            ..WhisperParams::default()
+        };
+        let vad = vad_params_from(&params);
+        assert_eq!(vad.max_speech_duration_s, 2.5);
+        assert_eq!(vad.samples_overlap, 0.25);
+    }
+
+    #[test]
+    fn overlap_extends_all_but_the_last_segment() {
+        let segments = [SpeechSegment::new(0.0, 1.0), SpeechSegment::new(2.0, 3.0)];
+        let ranges = segments_to_ranges(&segments, 0.1, 4 * 16_000);
+        assert_eq!(ranges, vec![(0, 110), (200, 300)]);
+    }
+
+    #[test]
+    fn overlap_that_touches_adjacent_segments_merges_them() {
+        let segments = [SpeechSegment::new(0.0, 1.0), SpeechSegment::new(1.05, 2.0)];
+        let ranges = segments_to_ranges(&segments, 0.1, 3 * 16_000);
+        assert_eq!(ranges, vec![(0, 200)]);
     }
 
     #[test]

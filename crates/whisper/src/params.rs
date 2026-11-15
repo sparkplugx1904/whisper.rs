@@ -65,6 +65,10 @@ pub struct WhisperParams {
     pub prompt_tokens: Vec<i32>,
     /// Disable context carryover between 30-second audio windows (default: false)
     pub no_context: bool,
+    /// Maximum number of history tokens used as the decoder prompt.
+    /// whisper.cpp caps this at half the model's text context; zero disables
+    /// history conditioning for every window.
+    pub n_max_text_ctx: i32,
     /// Carry over initial text prompt across subsequent 30s windows (default: false)
     pub carry_initial_prompt: bool,
     /// Entropy threshold for dynamic temperature fallback (default: 2.40)
@@ -96,6 +100,10 @@ pub struct WhisperParams {
     pub vad_min_silence_duration_ms: usize,
     /// Speech padding margin in milliseconds applied before and after detected speech (default: 300)
     pub vad_speech_pad_ms: usize,
+    /// Maximum duration of one VAD speech segment before it is split (default: unbounded)
+    pub vad_max_speech_duration_s: f32,
+    /// Seconds of audio overlap between adjacent VAD segments (default: 0.1)
+    pub vad_samples_overlap: f32,
     /// Path to a Silero VAD GGML model. When set together with `vad_enable`,
     /// the neural detector replaces the energy detector (default: None)
     pub vad_model_path: Option<String>,
@@ -169,6 +177,7 @@ impl Default for WhisperParams {
             length_penalty: 0.7,
             prompt_tokens: Vec::new(),
             no_context: false,
+            n_max_text_ctx: 16384,
             carry_initial_prompt: false,
             entropy_thold: 2.40,
             on_new_segment: None,
@@ -185,6 +194,8 @@ impl Default for WhisperParams {
             vad_min_speech_duration_ms: 250,
             vad_min_silence_duration_ms: 100,
             vad_speech_pad_ms: 300,
+            vad_max_speech_duration_s: f32::MAX,
+            vad_samples_overlap: 0.1,
             vad_model_path: None,
             on_encoder_begin: None,
             on_logits: None,
@@ -314,6 +325,13 @@ impl FullParamsBuilder {
         self
     }
 
+    /// Cap the history prompt at `n` tokens; zero disables history.
+    /// The engine further caps this at half the model's text context.
+    pub fn n_max_text_ctx(mut self, n: i32) -> Self {
+        self.params.n_max_text_ctx = n;
+        self
+    }
+
     pub fn carry_initial_prompt(mut self, carry: bool) -> Self {
         self.params.carry_initial_prompt = carry;
         self
@@ -377,6 +395,18 @@ impl FullParamsBuilder {
     /// Set speech padding margin in milliseconds applied before and after detected speech (default: 300).
     pub fn vad_speech_pad_ms(mut self, ms: usize) -> Self {
         self.params.vad_speech_pad_ms = ms;
+        self
+    }
+
+    /// Split VAD speech segments longer than `seconds`.
+    pub fn vad_max_speech_duration_s(mut self, seconds: f32) -> Self {
+        self.params.vad_max_speech_duration_s = seconds;
+        self
+    }
+
+    /// Overlap in seconds between adjacent VAD segments.
+    pub fn vad_samples_overlap(mut self, seconds: f32) -> Self {
+        self.params.vad_samples_overlap = seconds;
         self
     }
     /// Use a Silero VAD GGML model for speech detection (default: energy detector).
@@ -461,5 +491,28 @@ mod tests {
         assert!(debug_str.contains("vad_min_speech_duration_ms: 250"));
         assert!(debug_str.contains("vad_min_silence_duration_ms: 100"));
         assert!(debug_str.contains("vad_speech_pad_ms: 300"));
+    }
+
+    #[test]
+    fn test_n_max_text_ctx_default_and_builder() {
+        let params = WhisperParams::default();
+        assert_eq!(params.n_max_text_ctx, 16384);
+        let params = FullParamsBuilder::new(SamplingStrategy::Greedy { best_of: 1 })
+            .n_max_text_ctx(64)
+            .build();
+        assert_eq!(params.n_max_text_ctx, 64);
+    }
+
+    #[test]
+    fn test_vad_duration_and_overlap_default_and_builder() {
+        let params = WhisperParams::default();
+        assert_eq!(params.vad_max_speech_duration_s, f32::MAX);
+        assert_eq!(params.vad_samples_overlap, 0.1);
+        let params = FullParamsBuilder::new(SamplingStrategy::Greedy { best_of: 1 })
+            .vad_max_speech_duration_s(2.5)
+            .vad_samples_overlap(0.25)
+            .build();
+        assert_eq!(params.vad_max_speech_duration_s, 2.5);
+        assert_eq!(params.vad_samples_overlap, 0.25);
     }
 }
