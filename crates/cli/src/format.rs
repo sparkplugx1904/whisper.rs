@@ -153,16 +153,30 @@ impl OutputFormatter for VttFormatter {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct JsonFormatter {
     pub diarize: bool,
+    pub full: bool,
 }
 
 impl JsonFormatter {
     pub const fn new(diarize: bool) -> Self {
-        Self { diarize }
+        Self {
+            diarize,
+            full: false,
+        }
+    }
+
+    pub const fn new_full(diarize: bool) -> Self {
+        Self {
+            diarize,
+            full: true,
+        }
     }
 }
 
 #[allow(non_upper_case_globals)]
-pub const JsonFormatter: JsonFormatter = JsonFormatter { diarize: false };
+pub const JsonFormatter: JsonFormatter = JsonFormatter {
+    diarize: false,
+    full: false,
+};
 
 impl OutputFormatter for JsonFormatter {
     fn name(&self) -> &'static str {
@@ -199,15 +213,36 @@ impl OutputFormatter for JsonFormatter {
                 ),
                 None => String::new(),
             };
+            let token_field = if self.full {
+                let tokens = s
+                    .tokens
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &id)| {
+                        let plog = s.token_logprobs.get(index).copied().unwrap_or(f32::NAN);
+                        let p = if plog.is_finite() { plog.exp() } else { 0.0 };
+                        let vlen = s.token_vlen.get(index).copied().unwrap_or(0.0);
+                        format!(
+                            "{{\"id\": {}, \"p\": {:.6}, \"plog\": {:.6}, \"vlen\": {:.1}}}",
+                            id, p, plog, vlen
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(", \"tokens\": [{}]", tokens)
+            } else {
+                String::new()
+            };
             let json_body = if s.words.is_empty() {
                 format!(
-                    "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}{}}}",
+                    "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}{}{}}}",
                     t0,
                     t1,
                     whisper_rs::segment::escape_json(s.text.trim()),
                     s.avg_logprob,
                     s.no_speech_prob,
-                    speaker_field
+                    speaker_field,
+                    token_field
                 )
             } else {
                 let words_json = s
@@ -225,14 +260,15 @@ impl OutputFormatter for JsonFormatter {
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!(
-                    "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}, \"words\": [{}]{}}}",
+                    "{{\"start\": {:.3}, \"end\": {:.3}, \"text\": \"{}\", \"avg_logprob\": {:.4}, \"no_speech_prob\": {:.4}, \"words\": [{}]{}{}}}",
                     t0,
                     t1,
                     whisper_rs::segment::escape_json(s.text.trim()),
                     s.avg_logprob,
                     s.no_speech_prob,
                     words_json,
-                    speaker_field
+                    speaker_field,
+                    token_field
                 )
             };
             writeln!(writer, "  {}{}", json_body, comma)?;
@@ -549,6 +585,7 @@ pub struct OutputFormatOptions {
     pub output_srt: bool,
     pub output_vtt: bool,
     pub output_json: bool,
+    pub json_full: bool,
     pub output_csv: bool,
     pub output_lrc: bool,
     pub karaoke: bool,
@@ -565,6 +602,7 @@ impl Default for OutputFormatOptions {
             output_srt: false,
             output_vtt: false,
             output_json: false,
+            json_full: false,
             output_csv: false,
             output_lrc: false,
             karaoke: false,
@@ -596,6 +634,7 @@ impl OutputFormatOptions {
         if self.output_json {
             list.push(Box::new(JsonFormatter {
                 diarize: self.diarize,
+                full: self.json_full,
             }));
         }
         if self.output_csv {
@@ -976,5 +1015,24 @@ mod tests {
         };
         let active = opts.active_formatters();
         assert_eq!(active.len(), 4);
+    }
+
+    #[test]
+    fn test_json_full_emits_token_probabilities() {
+        let mut seg = Segment::new(0.0, 1.0, "Hello".to_string(), vec![1, 2]);
+        seg.token_logprobs = vec![-0.25, -0.5];
+        seg.token_vlen = vec![2.0, 3.0];
+        let formatter = JsonFormatter {
+            diarize: false,
+            full: true,
+        };
+        let mut buf = Vec::new();
+        formatter.write_segments(&[seg], &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("\"tokens\""));
+        assert!(text.contains("\"id\": 1"));
+        assert!(text.contains("\"p\": 0.778801"));
+        assert!(text.contains("\"plog\": -0.250000"));
+        assert!(text.contains("\"vlen\": 2.0"));
     }
 }

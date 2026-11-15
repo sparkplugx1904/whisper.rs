@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
 use clap::Parser;
+use std::io::Write;
+use std::sync::Arc;
+mod help;
 use std::path::Path;
 use std::time::Instant;
 pub mod download;
@@ -165,6 +168,10 @@ pub struct Args {
     #[arg(long = "vad", default_value_t = false)]
     pub vad: bool,
 
+    /// Path to a Silero VAD model; omit to use the energy detector
+    #[arg(long = "vad-model", alias = "vm")]
+    pub vad_model: Option<String>,
+
     /// VAD energy threshold (higher = stricter)
     #[arg(long = "vad-threshold", default_value_t = 0.5)]
     pub vad_threshold: f32,
@@ -236,6 +243,30 @@ pub struct Args {
     /// Detect the spoken language of the input and exit
     #[arg(long = "detect-language", default_value_t = false)]
     pub detect_language: bool,
+
+    /// Print a progress percentage for each encoder window
+    #[arg(long = "print-progress", alias = "pp", default_value_t = false)]
+    pub print_progress: bool,
+
+    /// Print segments as they are decoded instead of after the full run
+    #[arg(long = "print-realtime", default_value_t = true)]
+    pub print_realtime: bool,
+
+    /// GBNF grammar source used to constrain decoding
+    #[arg(long = "grammar")]
+    pub grammar: Option<String>,
+
+    /// Emit token-level data in the JSON output
+    #[arg(long = "output-json-full", alias = "ojf", default_value_t = false)]
+    pub output_json_full: bool,
+
+    /// Best-of width; values above one use beam search with that width
+    #[arg(long = "best-of", alias = "bo", default_value_t = 1)]
+    pub best_of: usize,
+
+    /// Print special-token ids alongside each segment
+    #[arg(long = "print-special", alias = "ps", default_value_t = false)]
+    pub print_special: bool,
 }
 
 impl Default for Args {
@@ -274,6 +305,7 @@ impl Default for Args {
             output_words: false,
             font_path: "/System/Library/Fonts/Supplemental/Courier New Bold.ttf".to_string(),
             vad: false,
+            vad_model: None,
             vad_threshold: 0.5,
             vad_min_speech_duration_ms: 250,
             vad_min_silence_duration_ms: 100,
@@ -292,6 +324,12 @@ impl Default for Args {
             carry_initial_prompt: false,
             audio_ctx: 0,
             detect_language: false,
+            print_progress: false,
+            print_realtime: true,
+            grammar: None,
+            output_json_full: false,
+            best_of: 1,
+            print_special: false,
         }
     }
 }
@@ -340,6 +378,11 @@ where
             "-np" => out.push("--no-prints".to_string()),
             "-ot" => out.push("--offset-t".to_string()),
             "-mc" => out.push("--max-context".to_string()),
+            "-vm" => out.push("--vad-model".to_string()),
+            "-vt" => out.push("--vad-threshold".to_string()),
+            "-vspd" => out.push("--vad-min-speech-duration-ms".to_string()),
+            "-vsd" => out.push("--vad-min-silence-duration-ms".to_string()),
+            "-vp" => out.push("--vad-speech-pad-ms".to_string()),
             "-vmsd" => out.push("--vad-max-speech-duration-s".to_string()),
             "-vo" => out.push("--vad-samples-overlap".to_string()),
             "-d" => out.push("--duration".to_string()),
@@ -352,6 +395,7 @@ where
             s if s.starts_with("-ot=") => out.push(format!("--offset-t={}", &s[4..])),
             s if s.starts_with("-d=") => out.push(format!("--duration={}", &s[3..])),
             s if s.starts_with("-fp=") => out.push(format!("--font-path={}", &s[4..])),
+            s if s.starts_with("-vm=") => out.push(format!("--vad-model={}", &s[4..])),
             _ => out.push(arg),
         }
     }
@@ -365,6 +409,7 @@ impl From<&Args> for OutputFormatOptions {
             output_srt: args.output_srt,
             output_vtt: args.output_vtt,
             output_json: args.output_json,
+            json_full: args.output_json_full,
             output_csv: args.output_csv,
             output_lrc: args.output_lrc,
             karaoke: args.karaoke,
@@ -470,6 +515,83 @@ pub fn write_output_files(
     Ok(())
 }
 
+fn print_segment(args: &Args, seg: &whisper_rs::Segment) {
+    if args.word_timestamps && !seg.words.is_empty() {
+        for w in &seg.words {
+            if args.print_colors {
+                println!(
+                    "  [word {:05.2}s --> {:05.2}s] \"{}\" (p={:.2})",
+                    w.t0,
+                    w.t1,
+                    format_colored_token(&w.word, w.probability),
+                    w.probability
+                );
+            } else if args.print_confidence {
+                println!(
+                    "  [word {:05.2}s --> {:05.2}s] \"{}\" (p={:.2})",
+                    w.t0,
+                    w.t1,
+                    format_confidence_token(&w.word, w.probability),
+                    w.probability
+                );
+            } else {
+                println!(
+                    "  [word {:05.2}s --> {:05.2}s] \"{}\" (p={:.2})",
+                    w.t0, w.t1, w.word, w.probability
+                );
+            }
+        }
+    }
+    let speaker_tag = match &seg.speaker {
+        Some(spk) => format!("(speaker {}) ", spk),
+        None => String::new(),
+    };
+    let formatted_text = if args.print_colors {
+        format_segment_colors(seg)
+    } else if args.print_confidence {
+        format_segment_confidence(seg)
+    } else {
+        seg.text.trim().to_string()
+    };
+    let display_text = format!("{}{}", speaker_tag, formatted_text);
+    if args.no_timestamps {
+        println!("\n {}", display_text);
+    } else {
+        let t0 = if seg.t0.is_finite() && seg.t0 >= 0.0 {
+            seg.t0
+        } else {
+            0.0
+        };
+        let t1 = if seg.t1.is_finite() && seg.t1 >= 0.0 {
+            seg.t1
+        } else {
+            0.0
+        };
+        println!(
+            "[{:02}:{:02}:{:06.3} --> {:02}:{:02}:{:06.3}]   {}",
+            (t0 / 3600.0) as u32,
+            ((t0 % 3600.0) / 60.0) as u32,
+            t0 % 60.0,
+            (t1 / 3600.0) as u32,
+            ((t1 % 3600.0) / 60.0) as u32,
+            t1 % 60.0,
+            display_text
+        );
+    }
+    if args.print_special {
+        let specials: Vec<i32> = seg
+            .tokens
+            .iter()
+            .copied()
+            .filter(|&id| id >= 50257)
+            .collect();
+        if !specials.is_empty() {
+            println!("  special tokens: {:?}", specials);
+        }
+    }
+    let _ = std::io::stdout().flush();
+}
+
 pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref dl_name) = args.download {
         let dest = download_model(dl_name, Path::new("models"))?;
@@ -549,7 +671,8 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         args.word_timestamps = true;
     }
 
-    let params = WhisperParams {
+    let stream_args = args.clone();
+    let mut params = WhisperParams {
         language: args.language.clone(),
         translate: args.translate,
         beam_size: args.beam_size,
@@ -569,6 +692,7 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         single_segment: args.single_segment,
         suppress_regex: args.suppress_regex.clone(),
         vad_enable: args.vad,
+        vad_model_path: args.vad_model.clone(),
         vad_threshold: args.vad_threshold,
         vad_min_speech_duration_ms: args.vad_min_speech_duration_ms,
         vad_min_silence_duration_ms: args.vad_min_silence_duration_ms,
@@ -590,16 +714,31 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         suppress_nst: args.suppress_nst,
         carry_initial_prompt: args.carry_initial_prompt,
         audio_ctx: args.audio_ctx,
+        grammar: args.grammar.clone(),
         ..Default::default()
     };
+
+    if !args.no_prints && args.print_realtime && !args.diarize {
+        params.on_new_segment = Some(Arc::new(move |segment| {
+            print_segment(&stream_args, segment);
+        }));
+    }
+    if !args.no_prints && args.print_progress {
+        params.on_progress = Some(Arc::new(|progress: i32| {
+            eprintln!("progress = {progress}%");
+            let _ = std::io::stderr().flush();
+        }));
+    }
 
     if !args.no_prints {
         let n_cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(args.threads);
         println!(
-            "\nsystem_info: n_threads = {} / {} | WHISPER : COREML = 0 | OPENVINO = 0 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | OPENMP = 1 | REPACK = 1 |\n",
-            args.threads, n_cores
+            "\nsystem_info: n_threads = {} / {} | WHISPER : COREML = 0 | OPENVINO = 0 | CPU : {} | OPENMP = 1 | REPACK = 1 |\n",
+            args.threads,
+            n_cores,
+            cpu_feature_banner()
         );
         let beam_str = if args.beam_size > 1 {
             format!("{} beams + best of {}", args.beam_size, args.beam_size)
@@ -623,10 +762,18 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let samples = if audio.sample_rate != 16_000 {
+        whisper_rs::audio::resample_to_16k(&audio.samples, audio.sample_rate)
+    } else {
+        audio.samples.clone()
+    };
+
+    if args.best_of > 1 {
+        return Err("--best-of is not implemented yet; use --beam-size for beam search".into());
+    }
+
     let t_trans = Instant::now();
-    let mut segments = ctx
-        .transcribe_file(&args.file, &params)
-        .map_err(|e| format!("transcription failed: {}", e))?;
+    let (mut segments, timings) = ctx.transcribe_pcm_with_timings(&samples, &params);
     let proc_dur = t_trans.elapsed();
 
     if args.diarize {
@@ -647,79 +794,28 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
-    for seg in &segments {
-        if args.word_timestamps && !seg.words.is_empty() {
-            for w in &seg.words {
-                if args.print_colors {
-                    println!(
-                        "  [word {:05.2}s --> {:05.2}s] \"{}\" (p={:.2})",
-                        w.t0,
-                        w.t1,
-                        format_colored_token(&w.word, w.probability),
-                        w.probability
-                    );
-                } else if args.print_confidence {
-                    println!(
-                        "  [word {:05.2}s --> {:05.2}s] \"{}\" (p={:.2})",
-                        w.t0,
-                        w.t1,
-                        format_confidence_token(&w.word, w.probability),
-                        w.probability
-                    );
-                } else {
-                    println!(
-                        "  [word {:05.2}s --> {:05.2}s] \"{}\" (p={:.2})",
-                        w.t0, w.t1, w.word, w.probability
-                    );
-                }
-            }
-        }
-        let speaker_tag = match &seg.speaker {
-            Some(spk) => format!("(speaker {}) ", spk),
-            None => String::new(),
-        };
-        let formatted_text = if args.print_colors {
-            format_segment_colors(seg)
-        } else if args.print_confidence {
-            format_segment_confidence(seg)
-        } else {
-            seg.text.trim().to_string()
-        };
-        let display_text = format!("{}{}", speaker_tag, formatted_text);
-        if args.no_timestamps {
-            println!("\n {}", display_text);
-        } else {
-            let t0 = if seg.t0.is_finite() && seg.t0 >= 0.0 {
-                seg.t0
-            } else {
-                0.0
-            };
-            let t1 = if seg.t1.is_finite() && seg.t1 >= 0.0 {
-                seg.t1
-            } else {
-                0.0
-            };
-            println!(
-                "[{:02}:{:02}:{:06.3} --> {:02}:{:02}:{:06.3}]   {}",
-                (t0 / 3600.0) as u32,
-                ((t0 % 3600.0) / 60.0) as u32,
-                t0 % 60.0,
-                (t1 / 3600.0) as u32,
-                ((t1 % 3600.0) / 60.0) as u32,
-                t1 % 60.0,
-                display_text
-            );
+    if !args.print_realtime || args.diarize {
+        for seg in &segments {
+            print_segment(&args, seg);
         }
     }
 
     if !args.no_prints {
         let total_ms = proc_dur.as_secs_f64() * 1000.0;
-        let mel_ms = total_ms * 0.035;
-        let sample_ms = total_ms * 0.015;
-        let encode_ms = total_ms * 0.75;
-        let decode_ms = total_ms * 0.15;
-        let batchd_ms = total_ms * 0.05;
-        let n_tokens_tot: usize = segments.iter().map(|s| s.tokens.len().max(1)).sum();
+        let us_to_ms = |us: u64| us as f64 / 1000.0;
+        let per_run = |us: u64, runs: u32| {
+            if runs == 0 {
+                0.0
+            } else {
+                us_to_ms(us) / runs as f64
+            }
+        };
+        let mel_ms = us_to_ms(timings.mel_us);
+        let sample_ms = us_to_ms(timings.sample_us);
+        let encode_ms = us_to_ms(timings.encode_us);
+        let decode_ms = us_to_ms(timings.decode_us);
+        let batchd_ms = us_to_ms(timings.batchd_us);
+        let prompt_ms = us_to_ms(timings.prompt_us);
 
         println!(
             "\nwhisper_print_timings:     load time = {:8.2} ms",
@@ -727,36 +823,38 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         );
         println!(
             "whisper_print_timings:     fallbacks = {:3} p / {:3} h",
-            0, 0
+            timings.n_fail_p, timings.n_fail_h
         );
         println!("whisper_print_timings:      mel time = {:8.2} ms", mel_ms);
         println!(
             "whisper_print_timings:   sample time = {:8.2} ms / {:5} runs ( {:8.2} ms per run)",
             sample_ms,
-            segments.len().max(1),
-            sample_ms / (segments.len().max(1) as f64)
+            timings.n_sample,
+            per_run(timings.sample_us, timings.n_sample)
         );
         println!(
             "whisper_print_timings:   encode time = {:8.2} ms / {:5} runs ( {:8.2} ms per run)",
             encode_ms,
-            segments.len().max(1),
-            encode_ms / (segments.len().max(1) as f64)
+            timings.n_encode,
+            per_run(timings.encode_us, timings.n_encode)
         );
         println!(
             "whisper_print_timings:   decode time = {:8.2} ms / {:5} runs ( {:8.2} ms per run)",
             decode_ms,
-            n_tokens_tot.max(1),
-            decode_ms / (n_tokens_tot.max(1) as f64)
+            timings.n_decode,
+            per_run(timings.decode_us, timings.n_decode)
         );
         println!(
             "whisper_print_timings:   batchd time = {:8.2} ms / {:5} runs ( {:8.2} ms per run)",
             batchd_ms,
-            (segments.len() * 2).max(1),
-            batchd_ms / ((segments.len() * 2).max(1) as f64)
+            timings.n_batchd,
+            per_run(timings.batchd_us, timings.n_batchd)
         );
         println!(
             "whisper_print_timings:   prompt time = {:8.2} ms / {:5} runs ( {:8.2} ms per run)",
-            0.0, 1, 0.0
+            prompt_ms,
+            timings.n_prompt,
+            per_run(timings.prompt_us, timings.n_prompt)
         );
         println!("whisper_print_timings:    total time = {:8.2} ms", total_ms);
     }
@@ -772,6 +870,40 @@ pub fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
     write_output_files(&args, &base_name, &segments)?;
 
     Ok(())
+}
+
+fn cpu_feature_banner() -> String {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let flag = |enabled: bool| if enabled { 1 } else { 0 };
+        format!(
+            "SSE3 = {} | SSSE3 = {} | AVX = {} | AVX2 = {} | AVX512 = {} | VNNI = {} | F16C = {} | FMA = {} | BMI2 = {}",
+            flag(std::is_x86_feature_detected!("sse3")),
+            flag(std::is_x86_feature_detected!("ssse3")),
+            flag(std::is_x86_feature_detected!("avx")),
+            flag(std::is_x86_feature_detected!("avx2")),
+            flag(std::is_x86_feature_detected!("avx512f")),
+            flag(std::is_x86_feature_detected!("avx512vnni")),
+            flag(std::is_x86_feature_detected!("f16c")),
+            flag(std::is_x86_feature_detected!("fma")),
+            flag(std::is_x86_feature_detected!("bmi2")),
+        )
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        format!(
+            "NEON = 1 | DOTPROD = {}",
+            if std::arch::is_aarch64_feature_detected!("dotprod") {
+                1
+            } else {
+                0
+            }
+        )
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        "scalar".to_string()
+    }
 }
 
 fn print_init_banners(
@@ -877,7 +1009,11 @@ fn print_init_banners(
 }
 
 fn main() {
-    let raw_args = std::env::args();
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print!("{}", help::HELP);
+        return;
+    }
     let normalized = normalize_cli_args(raw_args);
     let args = match Args::try_parse_from(normalized) {
         Ok(args) => args,
@@ -1449,5 +1585,59 @@ mod tests {
         assert!(json_content.contains("\"speaker\": \"1\""));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_help_lists_upstream_short_flags() {
+        for flag in ["-bs N", "-mc N", "-vt N", "-vspd N", "-vmsd N", "--vad"] {
+            assert!(
+                help::HELP.contains(flag),
+                "help must list whisper.cpp flag {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_cli_args_vad_aliases() {
+        let input = vec![
+            "whisper-cli",
+            "-vm",
+            "silero.bin",
+            "-vt",
+            "0.7",
+            "-vspd",
+            "300",
+            "-vsd",
+            "50",
+            "-vp",
+            "100",
+            "-vo",
+            "0.2",
+        ];
+        let normalized = normalize_cli_args(input);
+        let args = Args::try_parse_from(normalized).expect("Parse VAD aliases");
+        assert_eq!(args.vad_model.as_deref(), Some("silero.bin"));
+        assert_eq!(args.vad_threshold, 0.7);
+        assert_eq!(args.vad_min_speech_duration_ms, 300);
+        assert_eq!(args.vad_min_silence_duration_ms, 50);
+        assert_eq!(args.vad_speech_pad_ms, 100);
+        assert_eq!(args.vad_samples_overlap, 0.2);
+    }
+
+    #[test]
+    fn test_parse_grammar_and_json_full() {
+        let args = Args::try_parse_from([
+            "whisper-cli",
+            "--grammar",
+            "root ::= \"hello\"",
+            "--output-json-full",
+            "--print-progress",
+            "--print-realtime",
+        ])
+        .expect("Parse grammar and output flags");
+        assert_eq!(args.grammar.as_deref(), Some("root ::= \"hello\""));
+        assert!(args.output_json_full);
+        assert!(args.print_progress);
+        assert!(args.print_realtime);
     }
 }
