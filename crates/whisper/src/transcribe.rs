@@ -425,6 +425,12 @@ impl WhisperContext {
             let mut token_logprobs = Vec::new();
             let mut token_entropies = Vec::new();
             let mut no_speech_prob = 0.01f32;
+            // Upstream retries a failed window at increasing temperature but
+            // returns the best attempt when every temperature fails. Keeping
+            // the last sample is what turned a repetition loop into duplicated
+            // text here: the sampled retry was often shorter and more
+            // repetitive than the beam result it replaced.
+            let mut best_attempt: Option<DecodeAttempt> = None;
 
             let gbnf_grammar = params
                 .grammar
@@ -598,7 +604,7 @@ impl WhisperContext {
                     } else {
                         0.7
                     };
-                    if let Some(best) = beam.best_candidate(length_penalty) {
+                    if let Some(best) = beam.best_candidate(length_penalty, beg) {
                         tokens_cur = best.tokens.clone();
                         token_logprobs = best.token_logprobs.clone();
                     }
@@ -782,6 +788,35 @@ impl WhisperContext {
                     params,
                 );
 
+                let keep = match &best_attempt {
+                    None => true,
+                    Some(previous) => {
+                        if !eval.fallback_needed && previous.eval.fallback_needed {
+                            true
+                        } else if eval.fallback_needed && !previous.eval.fallback_needed {
+                            false
+                        } else if (eval.compression_ratio - previous.eval.compression_ratio).abs()
+                            > 0.05
+                        {
+                            eval.compression_ratio < previous.eval.compression_ratio
+                        } else {
+                            // Same repetition level: prefer the attempt that
+                            // covers more of the window, because a short sample
+                            // silently drops speech that the window contained.
+                            tokens_cur.len() > previous.tokens.len()
+                        }
+                    }
+                };
+                if keep {
+                    best_attempt = Some(DecodeAttempt {
+                        tokens: tokens_cur.clone(),
+                        token_logprobs: token_logprobs.clone(),
+                        token_entropies: token_entropies.clone(),
+                        no_speech_prob,
+                        eval,
+                    });
+                }
+
                 if !eval.fallback_needed || params.temperature_inc <= 0.0 {
                     break;
                 }
@@ -811,13 +846,24 @@ impl WhisperContext {
                 }
             }
 
-            let eval = FallbackEvaluation::evaluate(
-                "",
-                &token_logprobs,
-                &token_entropies,
-                no_speech_prob,
-                params,
-            );
+            // Restore the best-scoring attempt rather than whatever the last
+            // temperature produced; the ladder can end on a short, degenerate
+            // sample even when the beam result was usable.
+            let eval = if let Some(best) = best_attempt {
+                tokens_cur = best.tokens;
+                token_logprobs = best.token_logprobs;
+                token_entropies = best.token_entropies;
+                no_speech_prob = best.no_speech_prob;
+                best.eval
+            } else {
+                FallbackEvaluation::evaluate(
+                    "",
+                    &token_logprobs,
+                    &token_entropies,
+                    no_speech_prob,
+                    params,
+                )
+            };
             let avg_logprob = eval.avg_logprob;
             let avg_entropy = eval.avg_entropy;
 
@@ -893,9 +939,53 @@ impl WhisperContext {
                     break;
                 }
             } else {
+                // Commit only the tokens up to the last timestamp. Anything
+                // after it is an uncommitted tail: the next window re-decodes
+                // that audio, so it must not be emitted here and must not enter
+                // the prompt, where the model would continue its own partial
+                // sentence instead of the new audio.
+                let mut committed_len = 0;
+                let mut last_ts_abs = None;
+                let mut last_ts_index = None;
+                for (index, &tok) in tokens_cur.iter().enumerate() {
+                    if tok >= beg {
+                        last_ts_abs = Some(seek_time + (tok - beg) as f64 * 0.02);
+                        committed_len = index + 1;
+                        last_ts_index = Some(index);
+                    }
+                }
+                // A closed run `[text, timestamp]` means the window is
+                // complete and the next window starts a full chunk later.
+                // Re-decoding that tail adds an extra encoder pass per window;
+                // whisper.cpp resizes to `result_len` before this test, so it
+                // also starts the next window a full chunk later.
+                let ends_text_then_timestamp =
+                    last_ts_index.is_some_and(|index| index > 0 && tokens_cur[index - 1] < eot);
+
+                // Default to a full chunk when the decoder produced no
+                // timestamp (a failed window) or when the last timestamp is at
+                // the window start. A sub-second advance would re-encode the
+                // same audio, so it also falls back to the full chunk. This is
+                // the same 1 s floor the pre-regression loop used.
+                let mut seek_delta = chunk_sec;
+                if let Some(last_abs) = last_ts_abs {
+                    let last_abs = last_abs.clamp(seek_time, seek_time + chunk_sec);
+                    let delta = last_abs - seek_time;
+                    if !ends_text_then_timestamp && delta >= 1.0 && chunk_sec - delta >= 1.0 {
+                        seek_delta = delta;
+                    }
+                    // If the only timestamp is the leading `<|0.00|>`, the
+                    // decode has text but no closing timestamp. Truncating to
+                    // that marker would silently drop the whole window; keep
+                    // the text and advance a full chunk as the pre-regression
+                    // loop did. A real decoder returns a later timestamp.
+                    if committed_len > 1 {
+                        tokens_cur.truncate(committed_len);
+                    }
+                }
+
                 let mut seg_tokens = Vec::new();
                 let mut seg_t0 = seek_time;
-                let mut last_end_time = seek_time;
                 let mut last_ts_time = seek_time;
 
                 for &tok in &tokens_cur {
@@ -932,7 +1022,6 @@ impl WhisperContext {
                             }
                             seg_tokens.clear();
                             seg_t0 = abs_sec;
-                            last_end_time = abs_sec;
                         }
                     } else {
                         seg_tokens.push(tok);
@@ -996,7 +1085,6 @@ impl WhisperContext {
                         }
                         segments.push(seg);
                     }
-                    last_end_time = t1;
                 }
 
                 if params.single_segment && !segments.is_empty() {
@@ -1005,11 +1093,11 @@ impl WhisperContext {
                     break;
                 }
 
-                let advanced_frames = ((last_end_time - seek_time) / 0.01).round() as usize;
-                // Advance by the last emitted timestamp even when it is shorter
-                // than one second; jumping a full window here drops the audio
-                // between the last segment and the window end.
-                let step = if advanced_frames > 0 {
+                let advanced_frames = (seek_delta / 0.01).round() as usize;
+                // A sub-second advance re-encodes the same window; the 1 s
+                // floor keeps a degenerate timestamp from turning the loop
+                // into thousands of overlapping decodes.
+                let step = if advanced_frames >= 100 {
                     advanced_frames
                 } else {
                     chunk_frames
@@ -1024,6 +1112,8 @@ impl WhisperContext {
         if let Some(cb) = &params.on_progress {
             cb(100);
         }
+
+        segments = deduplicate_segments(segments);
 
         if params.max_len > 0 {
             segments = split_segments_by_max_len(segments, params.max_len, params.split_on_word);
@@ -1466,6 +1556,51 @@ fn sample_token(logits: &[f32], state: &mut u64) -> (i32, f32) {
     (logits.len() as i32 - 1, logits[logits.len() - 1])
 }
 
+/// Normalize segment text for duplicate detection without allocating a regex.
+fn normalized_segment_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            out.extend(ch.to_lowercase());
+        } else if !out.is_empty() && !out.ends_with(' ') {
+            out.push(' ');
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Drop segments that repeat an earlier segment over the same audio.
+///
+/// Only the emitted timeline is compared: identical normalized text plus an
+/// identical span (within the 0.05 s timestamp tolerance), or a zero-length run
+/// closed by two equal timestamps. A genuinely repeated reference line, such as
+/// the station ID 5 s after the first copy, has a different span and is kept.
+fn deduplicate_segments(segments: Vec<Segment>) -> Vec<Segment> {
+    let mut kept: Vec<Segment> = Vec::with_capacity(segments.len());
+    let mut normalized: Vec<String> = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let text = normalized_segment_text(&segment.text);
+        let duplicate = !text.is_empty()
+            && kept
+                .iter()
+                .zip(&normalized)
+                .any(|(previous, previous_text)| {
+                    if *previous_text != text {
+                        return false;
+                    }
+                    let same_span = (segment.t0 - previous.t0).abs() <= 0.05
+                        && (segment.t1 - previous.t1).abs() <= 0.05;
+                    let zero_length = segment.t1 - segment.t0 < 0.05;
+                    same_span || zero_length
+                });
+        if !duplicate {
+            normalized.push(text);
+            kept.push(segment);
+        }
+    }
+    kept
+}
+
 /// True when the text contains an obvious repetition loop.
 ///
 /// The compression-ratio check catches many loops, but a repeated phrase inside
@@ -1498,6 +1633,15 @@ fn has_repetition_loop(text: &str) -> bool {
         }
     }
     false
+}
+
+/// One decoded attempt in the temperature fallback ladder.
+struct DecodeAttempt {
+    tokens: Vec<i32>,
+    token_logprobs: Vec<f32>,
+    token_entropies: Vec<f32>,
+    no_speech_prob: f32,
+    eval: FallbackEvaluation,
 }
 
 /// Evaluator for decoding quality metrics against temperature fallback criteria.
@@ -1560,5 +1704,33 @@ mod repetition_guard_tests {
         let text =
             "Sobat Trisma hari ini kita bakal ngebahas tentang perayaan unik di bulan Desember";
         assert!(!has_repetition_loop(text));
+    }
+}
+
+#[cfg(test)]
+mod dedupe_tests {
+    use super::deduplicate_segments;
+    use crate::segment::Segment;
+
+    fn segment(t0: f64, t1: f64, text: &str) -> Segment {
+        Segment::new(t0, t1, text.to_string(), Vec::new())
+    }
+
+    #[test]
+    fn drops_a_collapsed_duplicate_at_a_seam() {
+        let segments = vec![
+            segment(27.94, 29.98, "Jangan lupa buat jaga diri baik-baik"),
+            segment(29.98, 30.00, "Jangan lupa buat jaga diri baik-baik"),
+        ];
+        assert_eq!(deduplicate_segments(segments).len(), 1);
+    }
+
+    #[test]
+    fn keeps_a_genuinely_repeated_reference_line() {
+        let segments = vec![
+            segment(0.00, 3.26, "Voice of Trisma, the best online radio in Bali"),
+            segment(3.26, 8.94, "Voice of Trisma, the best online radio in Bali"),
+        ];
+        assert_eq!(deduplicate_segments(segments).len(), 2);
     }
 }

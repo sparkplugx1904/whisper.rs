@@ -404,14 +404,28 @@ impl BeamSearch {
         self.candidates.is_empty()
     }
 
-    pub fn best_candidate(&self, length_penalty: f32) -> Option<&BeamCandidate> {
+    pub fn best_candidate(&self, length_penalty: f32, beg: i32) -> Option<&BeamCandidate> {
+        // A finished hypothesis must not win merely because it is short. The
+        // model can close after the first sentence of a window with a high
+        // average log-probability, and selecting that branch skips the rest of
+        // the audio. Rank by how much of the window the hypothesis covers (its
+        // last timestamp) first, then by the length-normalized score.
+        let rank = |candidate: &BeamCandidate| {
+            let last_timestamp = candidate.last_timestamp.unwrap_or(beg);
+            (last_timestamp, sequence_score(candidate, length_penalty))
+        };
+
         self.candidates
             .iter()
             .chain(&self.completed_candidates)
             .max_by(|a, b| {
-                sequence_score(a, length_penalty)
-                    .partial_cmp(&sequence_score(b, length_penalty))
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                let (ts_a, score_a) = rank(a);
+                let (ts_b, score_b) = rank(b);
+                ts_a.cmp(&ts_b).then_with(|| {
+                    score_a
+                        .partial_cmp(&score_b)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
             })
     }
 
@@ -451,5 +465,49 @@ mod repetition_tests {
         let tokens = [1, 2, 3, 4, 1, 2, 3];
         assert!(!repeats_ngram(&tokens, 100, 100));
         assert!(!repeats_ngram(&tokens, 150, 100));
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::{BeamCandidate, BeamSearch};
+
+    fn candidate(
+        tokens: Vec<i32>,
+        logprob: f32,
+        result_len: usize,
+        last_timestamp: i32,
+    ) -> BeamCandidate {
+        BeamCandidate {
+            cumulative_logprob: logprob as f64 * tokens.len() as f64,
+            token_logprobs: vec![logprob; tokens.len()],
+            tokens,
+            slot: 0,
+            completed: true,
+            last_timestamp: Some(last_timestamp),
+            result_len,
+        }
+    }
+
+    #[test]
+    fn prefers_coverage_over_a_short_confident_prefix() {
+        // The short branch closes after the first timestamp with high
+        // per-token probability; the long branch covers later audio.
+        let short = candidate(vec![10, 100, 200], -0.1, 3, 200);
+        let long = candidate(vec![10, 100, 200, 11, 12, 300, 13], -0.5, 7, 300);
+        let beam = BeamSearch {
+            beam_size: 2,
+            candidates: vec![long],
+            completed_candidates: vec![short],
+            suppress_indices: Vec::new(),
+            logits_buf: Vec::new(),
+            top_tokens: Vec::new(),
+            slot_reserved: Vec::new(),
+            slot_claimed: Vec::new(),
+            logits_callback: None,
+        };
+
+        let best = beam.best_candidate(0.7, 100).expect("a candidate");
+        assert_eq!(best.tokens.last(), Some(&13));
     }
 }
