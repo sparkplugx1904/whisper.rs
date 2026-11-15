@@ -19,7 +19,7 @@ options:
   -ml N,     --max-len N            [0      ] maximum segment length in characters
   -sow,      --split-on-word        [false  ] split on word rather than on token
   -bs N,     --beam-size N          [1      ] beam size for beam search (1 = greedy)
-  -bo N,     --best-of N            [1      ] best-of width; >1 uses beam search
+  -bo N,     --best-of N            [1      ] best-of width; >1 is rejected until implemented
   -ac N,     --audio-ctx N          [0      ] audio context size (0 - all)
   -wt,       --word-timestamps      [false  ] enable word-level timestamps
   -et N,     --entropy-thold N      [2.40   ] entropy threshold for decoder fail
@@ -46,7 +46,7 @@ options:
              --print-realtime       [true   ] print segments as they are decoded
   -pc,       --print-colors         [false  ] print tokens with ANSI color confidence
              --print-confidence     [false  ] print confidence text styles
-  -ps,       --print-special        [false  ] print special-token ids
+  -ps,       --print-special        [false  ] print special tokens as text
   -nt,       --no-timestamps        [false  ] do not print timestamps
   -l LANG,   --language LANG        [auto   ] spoken language ('auto' for auto-detect)
   -dl,       --detect-language      [false  ] exit after automatically detecting language
