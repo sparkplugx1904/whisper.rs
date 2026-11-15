@@ -4,15 +4,16 @@ set -euo pipefail
 
 WAV_PATH="${1:?merged wav}"
 WORK="${2:?work directory}"
-MODEL_URL="${3:-https://huggingface.co/Sparkplugx1904/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin}"
+MODEL_NAME="${MODEL_NAME:-base}"
+MODEL_URL="${3:-https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${MODEL_NAME}.bin}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 mkdir -p "$WORK/models" "$WORK/out"
-MODEL_PATH="$WORK/models/ggml-large-v3-turbo.bin"
+MODEL_PATH="$WORK/models/ggml-${MODEL_NAME}.bin"
 if [[ ! -s "$MODEL_PATH" ]]; then
-    echo "downloading large-v3-turbo model"
+    echo "downloading ${MODEL_NAME} model"
     curl -L --fail --silent --show-error --retry 5 --retry-delay 3 \
         "$MODEL_URL" -o "$MODEL_PATH"
 fi
@@ -26,7 +27,7 @@ OUT_BASE="$WORK/out/merged"
     -m "$MODEL_PATH" \
     -f "$WAV_PATH" \
     -l id \
-    -t 4 \
+    -t "${THREADS:-4}" \
     -b "${BEAM_SIZE:-5}" \
     --output-json \
     --output-txt \

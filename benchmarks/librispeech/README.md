@@ -31,6 +31,17 @@ order) and `boundaries.json` (per-utterance spans and sentences). The
 checked-in `boundaries.json` / `reference.txt` are the artifacts for this
 chapter; regenerate them only if the concatenation changes.
 
+## Model choice
+
+`models/ggml-base.bin` is the default for direct `bench.sh` runs and for quick
+iteration: it is 142 MB instead of 1.6 GB and is fast enough to keep the
+edit/test loop short. It is multilingual, so it is the right base model for
+Indonesian audio; `base.en` is English-only.
+
+The checked-in WER baseline is calibrated on `large-v3-turbo`. Do not score a
+base-model run against `baseline.json`; either pass `--no-baseline` to
+`gate.py` for a smoke check or create a separate baseline file.
+
 ## Running
 
 `run.sh` expects a built `whisper-cli` and a model; it never builds and never
