@@ -1,13 +1,13 @@
 {
   "schema": "librispeech-gate-baseline/1",
-  "generated_at": "2026-11-15T00:32:57Z",
+  "generated_at": "2026-11-15T00:48:54Z",
   "modes": {
     "full": {
       "utterances": 35,
       "audio_duration_s": 166.38,
-      "commit": "49eb25996cc4",
-      "binary_sha256": "6e09973652fa80a54efb07ac55698b8b899b59f5d6b6a4d9b182cd30cf398dc3",
-      "note": "fix3 accepted (IndependentVerifier, reviews addendum 7); source transcribe 122cba5c, beam 3a6b0899, filter 8f841311; binary sha256 6e099736; local RTF 4.918 vs 4.109 for the accepted pass-2 build (+19.7%, single runs on a contended box; mechanism not established). fix5 (source transcribe 1237ba1f, binary c9471857) is accepted separately; this baseline has not been re-bootstrapped from the clean commit 142ceba9",
+      "commit": "fe63be3af196",
+      "binary_sha256": "878cae19d9908bee2b275fe8ba8899323f0f49048eafdbaf5ec832f8ee5be335",
+      "note": "clean-tree artifact from commit fe63be3af196 (engine commit c638f07); source transcribe 5c30644a, beam 3a6b0899, filter 8f841311; binary sha256 878cae19; WER 0.56%, 0 deletions, 1.00x, 0 duplicates, continuity max gap 0.02 s; local RTF 5.247 (single run on a contended box; base 4.109, fix3 4.918, fix5 5.546 - no performance claim, median-of-3 required)",
       "metrics": {
         "wer": 0.005566,
         "cer": 0.002502,

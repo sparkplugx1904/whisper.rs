@@ -73,11 +73,10 @@ WHISPER_MODEL=... SAVE_BASELINE=1 benchmarks/librispeech/run.sh fast
 ```
 
 That writes `benchmarks/librispeech/baseline.json` with one entry per mode.
-The committed baseline currently has the `full` entry only, produced from
-`/tmp/libri/runs/base` (commit `49eb25996cc4`, binary sha256 `db3c52e3…`,
-WER 1.48 %). The `fast` entry needs one fast run of the reviewed build; until
-then `run.sh fast` exits 3 with that instruction rather than scoring against the
-wrong baseline.
+The committed baseline has the `full` entry only (the clean-tree artifact
+described below). The `fast` entry needs one fast run of the reviewed build;
+until then `run.sh fast` exits 3 with that instruction rather than scoring
+against the wrong baseline.
 A baseline can also be saved from an existing scored run without re-running the
 engine:
 
@@ -99,19 +98,21 @@ OVERWRITE_BASELINE=1 WHISPER_MODEL=... SAVE_BASELINE=1 \
     benchmarks/librispeech/run.sh full
 ```
 
-The committed `full` baseline is `fix3`, accepted by the independent reviewer
-(`reviews.md` addendum 7) from the frozen source `transcribe.rs 122cba5c`,
-`beam.rs 3a6b0899`, `filter.rs 8f841311`, binary sha `6e099736…`, WER 0.56 %
-(2 sub / 1 ins / 0 del) against 1.48 % for the accepted pass-2 build. The note
-in the file records the measurement: local RTF is 4.918 versus 4.109 for pass-2
-(+19.7 %, single runs on a contended box; no mechanism is established, and the
-only paired runs point that way). The frozen rule truncates the sequence to
-`result_len` before the single-timestamp test, which is what upstream
-(`whisper.cpp:7729` then `:7940`) does; `fix3` additionally carried a
-`has_uncommitted_tail` term that `1237ba1f` dropped, leaving the remaining
-behavioural delta that a window ending `[.., timestamp, text]` now skips the
-tail instead of re-decoding it. The continuity and timestamp-bounds checks are
-the guard for that delta and must stay enabled. Do not regenerate the baseline while the
+The committed `full` baseline is the clean-tree artifact from commit
+`fe63be3af196` (engine commit `c638f07`), source `transcribe.rs 5c30644a`,
+`beam.rs 3a6b0899`, `filter.rs 8f841311`, binary sha `878cae19…`, WER 0.56 %
+(2 sub / 1 ins / 0 del) against 1.48 % for the accepted pass-2 build. It
+supersedes the two artifacts accepted before the commit: `fix3` (`6e099736…`,
+source `122cba5c`) and `fix5` (`c9471857…`, source `1237ba1f`), whose
+transcripts are byte-identical. The note in the file records the measurement:
+local RTF is 5.247 versus 4.109 for pass-2 (single runs on a contended box;
+`fix3` 4.918 and `fix5` 5.546 - no mechanism is established and no performance
+claim is made; median-of-3 is required before one). The frozen rule truncates
+the sequence to `result_len` before the single-timestamp test, which is what
+upstream (`whisper.cpp:7729` then `:7940`) does; the remaining behavioural
+delta is that a window ending `[.., timestamp, text]` skips the tail instead of
+re-decoding it. The continuity and timestamp-bounds checks are the guard for
+that delta and must stay enabled. Do not regenerate the baseline while the
 tree is changing: a baseline saved from an unfrozen tree certifies an untested
 grammar. The gate prints the baseline note and the run's binary sha so a
 mismatch is visible in every report. A run is only covered by the accepted
