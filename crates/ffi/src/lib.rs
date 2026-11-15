@@ -1046,6 +1046,13 @@ unsafe fn c_grammar_to_gbnf(
     }
 }
 
+fn print_debug_timings(timings: &whisper_rs::Timings) {
+    eprintln!(
+        "debug: mel {} us, sample {} us, encode {} us, decode {} us, prompt {} us",
+        timings.mel_us, timings.sample_us, timings.encode_us, timings.decode_us, timings.prompt_us
+    );
+}
+
 /// Resolve the C DTW context fields into the engine representation.
 ///
 /// `WHISPER_AHEADS_NONE` keeps the historical ergonomic fallback when token
@@ -1117,6 +1124,28 @@ unsafe fn build_rust_params(
             eprintln!("progress = {progress}%");
         }));
     }
+    let print_realtime = params.print_realtime;
+    let print_timestamps = params.print_timestamps;
+    let print_special = params.print_special;
+    let on_new_segment: Option<whisper_rs::params::NewSegmentCallback> = if print_realtime {
+        Some(Arc::new(move |segment: &whisper_rs::Segment| {
+            if print_timestamps {
+                eprintln!(
+                    "[{:07.3} --> {:07.3}] {}",
+                    segment.t0,
+                    segment.t1,
+                    segment.text.trim()
+                );
+            } else {
+                eprintln!("{}", segment.text.trim());
+            }
+            if print_special && !segment.special_text.is_empty() {
+                eprintln!("  special tokens: {}", segment.special_text);
+            }
+        }))
+    } else {
+        None
+    };
     let abort_callback = wrap_abort_callback(params);
     let on_encoder_begin = wrap_encoder_begin_callback(ctx, state, params);
     let on_logits = wrap_logits_callback(ctx, state, params);
@@ -1262,6 +1291,7 @@ unsafe fn build_rust_params(
         dtw_mem_size,
         thold_pt: params.thold_pt,
         thold_ptsum: params.thold_ptsum,
+        on_new_segment,
         on_progress,
         abort_callback,
         on_encoder_begin,
@@ -1320,6 +1350,9 @@ pub unsafe extern "C" fn whisper_full_with_state(
         state_ref.token_c_strings.push(tok_cstrs);
     }
     dispatch_new_segment_callbacks(ctx, state, &params);
+    if params.debug_mode {
+        print_debug_timings(&state_ref.inner.timings);
+    }
 
     0
 }
@@ -1502,6 +1535,9 @@ pub unsafe extern "C" fn whisper_full_parallel(
     }
 
     dispatch_new_segment_callbacks(ctx, default_state_ref as *mut whisper_state, &params);
+    if params.debug_mode {
+        print_debug_timings(&default_state_ref.inner.timings);
+    }
 
     0
 }
