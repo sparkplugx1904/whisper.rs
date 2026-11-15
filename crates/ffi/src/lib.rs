@@ -152,6 +152,10 @@ pub struct whisper_context {
     pub token_to_str_cache: Vec<CString>,
     pub timings: whisper_timings,
     pub params: whisper_context_params,
+    /// Snapshot of `params.dtw_aheads` taken at init. The C caller owns the
+    /// original array and may release it after `whisper_init_from_*` returns;
+    /// upstream likewise copies the heads into the state.
+    dtw_aheads_owned: Vec<whisper_ahead>,
 }
 
 unsafe impl Send for whisper_context {}
@@ -186,6 +190,14 @@ pub struct whisper_ahead {
 pub struct whisper_aheads {
     pub n_heads: usize,
     pub heads: *const whisper_ahead,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[allow(non_camel_case_types)]
+pub struct whisper_grammar_element {
+    pub r#type: c_int,
+    pub value: u32,
 }
 
 #[repr(C)]
@@ -301,7 +313,7 @@ pub struct whisper_full_params {
     pub logits_filter_callback: *const c_void,
     pub logits_filter_callback_user_data: *mut c_void,
 
-    pub grammar_rules: *const c_void,
+    pub grammar_rules: *const *const whisper_grammar_element,
     pub n_grammar_rules: usize,
     pub i_start_rule: usize,
     pub grammar_penalty: f32,
@@ -319,12 +331,12 @@ pub extern "C" fn whisper_context_default_params() -> whisper_context_params {
         gpu_device: 0,
         dtw_token_timestamps: false,
         dtw_aheads_preset: 0,
-        dtw_n_top: 0,
+        dtw_n_top: -1,
         dtw_aheads: whisper_aheads {
             n_heads: 0,
             heads: ptr::null(),
         },
-        dtw_mem_size: 0,
+        dtw_mem_size: 128 * 1024 * 1024,
     }
 }
 
@@ -455,6 +467,12 @@ unsafe fn init_context_from_model(
         .map(|bytes| CString::new(bytes.clone()).unwrap_or_else(|_| CString::new("").unwrap()))
         .collect();
 
+    let dtw_aheads_owned = if params.dtw_aheads.heads.is_null() || params.dtw_aheads.n_heads == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(params.dtw_aheads.heads, params.dtw_aheads.n_heads).to_vec()
+    };
+
     let ctx = Box::new(whisper_context {
         inner,
         default_state,
@@ -463,6 +481,7 @@ unsafe fn init_context_from_model(
         token_to_str_cache,
         timings: whisper_timings::default(),
         params,
+        dtw_aheads_owned,
     });
 
     Box::into_raw(ctx)
@@ -870,6 +889,219 @@ unsafe fn wrap_logits_callback(
     }))
 }
 
+/// Deliver `new_segment_callback` once per segment.
+///
+/// whisper.cpp invokes the callback as each segment is appended, so the
+/// canonical `n_segments - n_new` index addresses that segment. The engine
+/// materializes the full list in one pass; expose a growing prefix while the
+/// callback runs so the same index arithmetic works here.
+unsafe fn dispatch_new_segment_callbacks(
+    ctx: *mut whisper_context,
+    state: *mut whisper_state,
+    params: &whisper_full_params,
+) {
+    if params.new_segment_callback.is_null() || state.is_null() {
+        return;
+    }
+    let state_ref = &mut *state;
+    let total = state_ref.inner.segments.len();
+    if total == 0 {
+        return;
+    }
+    let all_segments = std::mem::take(&mut state_ref.inner.segments);
+    type NewSegCb = extern "C" fn(*mut whisper_context, *mut whisper_state, c_int, *mut c_void);
+    let cb: NewSegCb = std::mem::transmute(params.new_segment_callback);
+    for segment in all_segments {
+        state_ref.inner.segments.push(segment);
+        cb(ctx, state, 1, params.new_segment_callback_user_data);
+    }
+}
+
+const WHISPER_GRETYPE_END: c_int = 0;
+const WHISPER_GRETYPE_ALT: c_int = 1;
+const WHISPER_GRETYPE_RULE_REF: c_int = 2;
+const WHISPER_GRETYPE_CHAR: c_int = 3;
+const WHISPER_GRETYPE_CHAR_NOT: c_int = 4;
+const WHISPER_GRETYPE_CHAR_RNG_UPPER: c_int = 5;
+const WHISPER_GRETYPE_CHAR_ALT: c_int = 6;
+
+fn escape_grammar_class(ch: char) -> String {
+    match ch {
+        '\\' => "\\\\".to_string(),
+        ']' => "\\]".to_string(),
+        '^' => "\\^".to_string(),
+        '-' => "\\-".to_string(),
+        c => c.to_string(),
+    }
+}
+
+/// Convert the parsed C rule table back to GBNF source. The Rust grammar
+/// parser consumes GBNF text, and the C ABI exposes the parsed table; this is
+/// the bridge between the two representations.
+unsafe fn c_grammar_to_gbnf(
+    rules: *const *const whisper_grammar_element,
+    n_rules: usize,
+    start_rule: usize,
+) -> Option<String> {
+    if rules.is_null() || n_rules == 0 {
+        return None;
+    }
+    let start = if start_rule < n_rules { start_rule } else { 0 };
+    let mut out = String::new();
+
+    for rule_index in 0..n_rules {
+        let mut pos = *rules.add(rule_index);
+        if pos.is_null() {
+            continue;
+        }
+        let name = if rule_index == start {
+            "root".to_string()
+        } else {
+            format!("rule{rule_index}")
+        };
+        let rule_name = |index: usize| {
+            if index == start {
+                "root".to_string()
+            } else {
+                format!("rule{index}")
+            }
+        };
+        let mut alternatives: Vec<String> = Vec::new();
+        let mut sequence = String::new();
+        loop {
+            let element = *pos;
+            match element.r#type {
+                WHISPER_GRETYPE_END => {
+                    alternatives.push(sequence);
+                    break;
+                }
+                WHISPER_GRETYPE_ALT => {
+                    alternatives.push(sequence);
+                    sequence = String::new();
+                    pos = pos.add(1);
+                }
+                WHISPER_GRETYPE_RULE_REF => {
+                    sequence.push_str(&rule_name(element.value as usize));
+                    pos = pos.add(1);
+                }
+                WHISPER_GRETYPE_CHAR | WHISPER_GRETYPE_CHAR_NOT => {
+                    let negated = element.r#type == WHISPER_GRETYPE_CHAR_NOT;
+                    let mut class = String::new();
+                    let mut current = element;
+                    loop {
+                        let Some(ch) = char::from_u32(current.value) else {
+                            pos = pos.add(1);
+                            break;
+                        };
+                        class.push_str(&escape_grammar_class(ch));
+                        pos = pos.add(1);
+                        let next = *pos;
+                        if next.r#type == WHISPER_GRETYPE_CHAR_RNG_UPPER {
+                            let Some(end) = char::from_u32(next.value) else {
+                                break;
+                            };
+                            class.push('-');
+                            class.push_str(&escape_grammar_class(end));
+                            pos = pos.add(1);
+                            if (*pos).r#type == WHISPER_GRETYPE_CHAR_ALT {
+                                pos = pos.add(1);
+                                current = *pos;
+                                continue;
+                            }
+                            break;
+                        }
+                        if next.r#type == WHISPER_GRETYPE_CHAR_ALT {
+                            pos = pos.add(1);
+                            current = *pos;
+                            continue;
+                        }
+                        break;
+                    }
+                    sequence.push('[');
+                    if negated {
+                        sequence.push('^');
+                    }
+                    sequence.push_str(&class);
+                    sequence.push(']');
+                }
+                _ => {
+                    pos = pos.add(1);
+                }
+            }
+        }
+        let body = alternatives
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if !body.is_empty() {
+            out.push_str(&format!("{name} ::= {body}\n"));
+        }
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Resolve the C DTW context fields into the engine representation.
+///
+/// `WHISPER_AHEADS_NONE` keeps the historical ergonomic fallback when token
+/// timestamps are enabled: use the preset calibrated for the loaded model.
+/// `N_TOP_MOST` and `CUSTOM` are explicit caller choices and are passed
+/// through unchanged. Invalid custom head coordinates are dropped here; the
+/// engine additionally checks the layer/head bounds against the model.
+fn map_dtw_params(
+    preset_raw: c_int,
+    token_timestamps: bool,
+    n_top: c_int,
+    heads: &[whisper_ahead],
+    mem_size: usize,
+    model_type: ModelType,
+    is_multilingual: bool,
+) -> (
+    whisper_rs::dtw::AlignmentHeadsPreset,
+    i32,
+    Vec<(usize, usize)>,
+    usize,
+) {
+    use whisper_rs::dtw::{preset_for_model, AlignmentHeadsPreset};
+
+    let preset = match preset_raw {
+        0 if token_timestamps => preset_for_model(model_type, is_multilingual),
+        1 => AlignmentHeadsPreset::NTopMost,
+        2 => AlignmentHeadsPreset::Custom,
+        3 => AlignmentHeadsPreset::TinyEn,
+        4 => AlignmentHeadsPreset::Tiny,
+        5 => AlignmentHeadsPreset::BaseEn,
+        6 => AlignmentHeadsPreset::Base,
+        7 => AlignmentHeadsPreset::SmallEn,
+        8 => AlignmentHeadsPreset::Small,
+        9 => AlignmentHeadsPreset::MediumEn,
+        10 => AlignmentHeadsPreset::Medium,
+        11 => AlignmentHeadsPreset::LargeV1,
+        12 => AlignmentHeadsPreset::LargeV2,
+        13 => AlignmentHeadsPreset::LargeV3,
+        14 => AlignmentHeadsPreset::LargeV3Turbo,
+        _ => AlignmentHeadsPreset::None,
+    };
+
+    let heads = heads
+        .iter()
+        .filter_map(|head| {
+            if head.n_text_layer < 0 || head.n_head < 0 {
+                None
+            } else {
+                Some((head.n_text_layer as usize, head.n_head as usize))
+            }
+        })
+        .collect();
+
+    (preset, n_top, heads, mem_size)
+}
+
 /// Translate the C parameter struct into the engine representation.
 ///
 /// Kept separate from `whisper_full_with_state` so `whisper_full_parallel` can
@@ -879,31 +1111,32 @@ unsafe fn build_rust_params(
     state: *mut whisper_state,
     params: &whisper_full_params,
 ) -> WhisperParams {
-    let on_progress = wrap_progress_callback(ctx, state, params);
+    let mut on_progress = wrap_progress_callback(ctx, state, params);
+    if on_progress.is_none() && params.print_progress {
+        on_progress = Some(Arc::new(|progress: i32| {
+            eprintln!("progress = {progress}%");
+        }));
+    }
     let abort_callback = wrap_abort_callback(params);
     let on_encoder_begin = wrap_encoder_begin_callback(ctx, state, params);
     let on_logits = wrap_logits_callback(ctx, state, params);
     let context = &*ctx;
     let dtw_token_timestamps = context.params.dtw_token_timestamps || params.token_timestamps;
-    let dtw_aheads_preset = match context.params.dtw_aheads_preset {
-        3 => whisper_rs::dtw::AlignmentHeadsPreset::TinyEn,
-        4 => whisper_rs::dtw::AlignmentHeadsPreset::Tiny,
-        5 => whisper_rs::dtw::AlignmentHeadsPreset::BaseEn,
-        6 => whisper_rs::dtw::AlignmentHeadsPreset::Base,
-        7 => whisper_rs::dtw::AlignmentHeadsPreset::SmallEn,
-        8 => whisper_rs::dtw::AlignmentHeadsPreset::Small,
-        9 => whisper_rs::dtw::AlignmentHeadsPreset::MediumEn,
-        10 => whisper_rs::dtw::AlignmentHeadsPreset::Medium,
-        11 => whisper_rs::dtw::AlignmentHeadsPreset::LargeV1,
-        12 => whisper_rs::dtw::AlignmentHeadsPreset::LargeV2,
-        13 => whisper_rs::dtw::AlignmentHeadsPreset::LargeV3,
-        14 => whisper_rs::dtw::AlignmentHeadsPreset::LargeV3Turbo,
-        _ if dtw_token_timestamps => whisper_rs::dtw::preset_for_model(
-            context.inner.model.hparams.model_type,
-            context.inner.model.hparams.is_multilingual(),
-        ),
-        _ => whisper_rs::dtw::AlignmentHeadsPreset::None,
-    };
+    let (dtw_aheads_preset, dtw_n_top, dtw_aheads, dtw_mem_size) = map_dtw_params(
+        context.params.dtw_aheads_preset,
+        dtw_token_timestamps,
+        context.params.dtw_n_top,
+        &context.dtw_aheads_owned,
+        context.params.dtw_mem_size,
+        context.inner.model.hparams.model_type,
+        context.inner.model.hparams.is_multilingual(),
+    );
+
+    if params.thold_pt != 0.01 || params.thold_ptsum != 0.01 {
+        eprintln!(
+            "warning: thold_pt/thold_ptsum are retained for ABI parity but the DTW token-timestamp path does not consume them"
+        );
+    }
 
     let vad_model_path = if params.vad_model.is_null() {
         None
@@ -954,6 +1187,18 @@ unsafe fn build_rust_params(
         lang_str
     };
 
+    let grammar_source = if !params.grammar_rules.is_null() && params.n_grammar_rules > 0 {
+        unsafe {
+            c_grammar_to_gbnf(
+                params.grammar_rules,
+                params.n_grammar_rules,
+                params.i_start_rule,
+            )
+        }
+    } else {
+        None
+    };
+
     let suppress_regex = if !params.suppress_regex.is_null() {
         CStr::from_ptr(params.suppress_regex)
             .to_str()
@@ -992,6 +1237,7 @@ unsafe fn build_rust_params(
         single_segment: params.single_segment,
         suppress_regex,
         audio_ctx: params.audio_ctx.max(0) as usize,
+        grammar: grammar_source.clone(),
         offset_ms: params.offset_ms,
         duration_ms: params.duration_ms,
         tdrz_enable: params.tdrz_enable,
@@ -1011,6 +1257,11 @@ unsafe fn build_rust_params(
         vad_model_path,
         dtw_token_timestamps,
         dtw_aheads_preset,
+        dtw_n_top,
+        dtw_aheads,
+        dtw_mem_size,
+        thold_pt: params.thold_pt,
+        thold_ptsum: params.thold_ptsum,
         on_progress,
         abort_callback,
         on_encoder_begin,
@@ -1068,20 +1319,7 @@ pub unsafe extern "C" fn whisper_full_with_state(
         }
         state_ref.token_c_strings.push(tok_cstrs);
     }
-    // The callback contract is `n_new` new segments since the previous call.
-    // This path delivers after decoding, so all segments are new at once; a
-    // single call lets the canonical `n_segments - n_new` index address them.
-    let n_segments = state_ref.inner.segments.len();
-    if !params.new_segment_callback.is_null() && n_segments > 0 {
-        type NewSegCb = extern "C" fn(*mut whisper_context, *mut whisper_state, c_int, *mut c_void);
-        let cb: NewSegCb = std::mem::transmute(params.new_segment_callback);
-        cb(
-            ctx,
-            state,
-            n_segments as c_int,
-            params.new_segment_callback_user_data,
-        );
-    }
+    dispatch_new_segment_callbacks(ctx, state, &params);
 
     0
 }
@@ -1263,20 +1501,7 @@ pub unsafe extern "C" fn whisper_full_parallel(
         default_state_ref.token_c_strings.push(tok_cstrs);
     }
 
-    // The main chunk bypasses `whisper_full_with_state`; all merged segments are
-    // new when this post-run callback fires, so report them in one call. The
-    // canonical `n_segments - n_new` index then covers the whole list.
-    let n_segments = default_state_ref.inner.segments.len();
-    if !params.new_segment_callback.is_null() && n_segments > 0 {
-        type NewSegCb = extern "C" fn(*mut whisper_context, *mut whisper_state, c_int, *mut c_void);
-        let cb: NewSegCb = std::mem::transmute(params.new_segment_callback);
-        cb(
-            ctx,
-            default_state_ref as *mut whisper_state,
-            n_segments as c_int,
-            params.new_segment_callback_user_data,
-        );
-    }
+    dispatch_new_segment_callbacks(ctx, default_state_ref as *mut whisper_state, &params);
 
     0
 }
@@ -1497,18 +1722,30 @@ pub unsafe extern "C" fn whisper_full_get_token_data_from_state(
 
             let t0_cs = (t0 * 100.0).round() as i64;
             let t1_cs = (t1 * 100.0).round() as i64;
+            let plog = seg
+                .token_logprobs
+                .get(i_token as usize)
+                .copied()
+                .unwrap_or(f32::NAN);
+            let p = if plog.is_finite() { plog.exp() } else { prob };
+            let vlen = seg.token_vlen.get(i_token as usize).copied().unwrap_or(0.0);
 
+            let is_timestamp = tok_id >= 50257;
             return whisper_token_data {
                 id: tok_id,
-                tid: 0,
-                p: prob,
-                plog: prob.max(1e-6).ln(),
-                pt: 1.0,
-                ptsum: 1.0,
+                tid: if is_timestamp { tok_id } else { 0 },
+                p,
+                plog: if plog.is_finite() {
+                    plog
+                } else {
+                    p.max(1e-6).ln()
+                },
+                pt: if is_timestamp { p } else { 0.0 },
+                ptsum: if is_timestamp { p } else { 0.0 },
                 t0: t0_cs,
                 t1: t1_cs,
-                t_dtw: t0_cs,
-                vlen: (t1 - t0) as f32,
+                t_dtw: if seg.words.is_empty() { -1 } else { t0_cs },
+                vlen,
             };
         }
     }
@@ -2427,7 +2664,8 @@ pub unsafe extern "C" fn whisper_full_get_vad_segment_t0_from_state(
     }
     let state_ref = &*state;
     if let Some(&(t0, _)) = state_ref.inner.vad_segments.get(i as usize) {
-        (t0 as f64 * 0.02 * 100.0).round() as i64
+        // SpeechMap stores 100 fps frames; the C API reports source samples.
+        (t0 * 160) as i64
     } else {
         0
     }
@@ -2461,7 +2699,7 @@ pub unsafe extern "C" fn whisper_full_get_vad_segment_t1_from_state(
     }
     let state_ref = &*state;
     if let Some(&(_, t1)) = state_ref.inner.vad_segments.get(i as usize) {
-        (t1 as f64 * 0.02 * 100.0).round() as i64
+        (t1 * 160) as i64
     } else {
         0
     }
@@ -3254,6 +3492,145 @@ pub extern "C" fn whisper_bench_ggml_mul_mat_str(n_threads: c_int) -> *const c_c
             BENCH_MUL_MAT_TIME_BUDGET,
         ),
     )
+}
+
+#[cfg(test)]
+mod dtw_mapping_tests {
+    use super::*;
+
+    fn head(n_text_layer: c_int, n_head: c_int) -> whisper_ahead {
+        whisper_ahead {
+            n_text_layer,
+            n_head,
+        }
+    }
+
+    #[test]
+    fn custom_preset_copies_heads_and_memory_limit() {
+        let heads = [head(1, 2), head(3, 4)];
+        let (preset, n_top, mapped, mem) =
+            map_dtw_params(2, true, 7, &heads, 64 * 1024 * 1024, ModelType::Tiny, false);
+        assert_eq!(preset, whisper_rs::dtw::AlignmentHeadsPreset::Custom);
+        assert_eq!(n_top, 7);
+        assert_eq!(mapped, vec![(1, 2), (3, 4)]);
+        assert_eq!(mem, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn top_most_preset_passes_the_layer_count() {
+        let (preset, n_top, _, _) = map_dtw_params(1, true, 2, &[], 0, ModelType::Base, true);
+        assert_eq!(preset, whisper_rs::dtw::AlignmentHeadsPreset::NTopMost);
+        assert_eq!(n_top, 2);
+    }
+
+    #[test]
+    fn none_preset_uses_the_model_only_when_timestamps_are_enabled() {
+        let (enabled, _, _, _) = map_dtw_params(0, true, -1, &[], 0, ModelType::Tiny, false);
+        assert_eq!(enabled, whisper_rs::dtw::AlignmentHeadsPreset::TinyEn);
+        let (disabled, _, _, _) = map_dtw_params(0, false, -1, &[], 0, ModelType::Tiny, false);
+        assert_eq!(disabled, whisper_rs::dtw::AlignmentHeadsPreset::None);
+    }
+
+    #[test]
+    fn negative_custom_heads_are_dropped() {
+        let heads = [head(-1, 0), head(0, -2), head(2, 3)];
+        let (_, _, mapped, _) = map_dtw_params(2, true, -1, &heads, 0, ModelType::Tiny, false);
+        assert_eq!(mapped, vec![(2, 3)]);
+    }
+}
+
+#[cfg(test)]
+mod grammar_tests {
+    use super::*;
+
+    #[test]
+    fn c_rule_table_serializes_to_gbnf() {
+        let rule = [
+            whisper_grammar_element {
+                r#type: WHISPER_GRETYPE_CHAR,
+                value: 'h' as u32,
+            },
+            whisper_grammar_element {
+                r#type: WHISPER_GRETYPE_CHAR,
+                value: 'i' as u32,
+            },
+            whisper_grammar_element {
+                r#type: WHISPER_GRETYPE_END,
+                value: 0,
+            },
+        ];
+        let rules = [rule.as_ptr()];
+        let source = unsafe { c_grammar_to_gbnf(rules.as_ptr(), 1, 0) }.expect("grammar");
+        assert_eq!(source, "root ::= [h][i]\n");
+    }
+
+    #[test]
+    fn custom_start_rule_is_renamed_to_root() {
+        let word = [
+            whisper_grammar_element {
+                r#type: WHISPER_GRETYPE_CHAR,
+                value: 'o' as u32,
+            },
+            whisper_grammar_element {
+                r#type: WHISPER_GRETYPE_END,
+                value: 0,
+            },
+        ];
+        let start = [
+            whisper_grammar_element {
+                r#type: WHISPER_GRETYPE_RULE_REF,
+                value: 0,
+            },
+            whisper_grammar_element {
+                r#type: WHISPER_GRETYPE_END,
+                value: 0,
+            },
+        ];
+        let rules = [word.as_ptr(), start.as_ptr()];
+        let source = unsafe { c_grammar_to_gbnf(rules.as_ptr(), 2, 1) }.expect("grammar");
+        assert!(source.contains("root ::= rule0"));
+        assert!(source.contains("rule0 ::= [o]"));
+    }
+
+    #[test]
+    fn grammar_rule_refs_and_alternation_round_trip() {
+        let root = [
+            whisper_grammar_element {
+                r#type: WHISPER_GRETYPE_RULE_REF,
+                value: 1,
+            },
+            whisper_grammar_element {
+                r#type: WHISPER_GRETYPE_ALT,
+                value: 0,
+            },
+            whisper_grammar_element {
+                r#type: WHISPER_GRETYPE_CHAR,
+                value: 'x' as u32,
+            },
+            whisper_grammar_element {
+                r#type: WHISPER_GRETYPE_END,
+                value: 0,
+            },
+        ];
+        let word = [
+            whisper_grammar_element {
+                r#type: WHISPER_GRETYPE_CHAR,
+                value: 'o' as u32,
+            },
+            whisper_grammar_element {
+                r#type: WHISPER_GRETYPE_CHAR,
+                value: 'k' as u32,
+            },
+            whisper_grammar_element {
+                r#type: WHISPER_GRETYPE_END,
+                value: 0,
+            },
+        ];
+        let rules = [root.as_ptr(), word.as_ptr()];
+        let source = unsafe { c_grammar_to_gbnf(rules.as_ptr(), 2, 0) }.expect("grammar");
+        assert!(source.contains("root ::= rule1 | [x]"));
+        assert!(source.contains("rule1 ::= [o][k]"));
+    }
 }
 
 #[cfg(test)]

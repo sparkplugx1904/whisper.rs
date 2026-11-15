@@ -51,6 +51,19 @@ pub struct WhisperParams {
     pub on_progress: Option<ProgressCallback>,
     /// Pre-calibrated alignment heads preset for DTW word-level timestamps
     pub dtw_aheads_preset: crate::dtw::AlignmentHeadsPreset,
+    /// Number of top text layers used by `AlignmentHeadsPreset::NTopMost`
+    pub dtw_n_top: i32,
+    /// Caller-provided (text layer, attention head) pairs for `Custom`
+    pub dtw_aheads: Vec<(usize, usize)>,
+    /// Advisory DTW arena budget from the C ABI. The Rust alignment allocates
+    /// exact-size buffers, so this value is retained for ABI parity.
+    pub dtw_mem_size: usize,
+    /// Token timestamp probability threshold from the C ABI. The DTW path does
+    /// not consume it; retained for ABI parity and warned about when changed.
+    pub thold_pt: f32,
+    /// Token timestamp sum-probability threshold from the C ABI. See
+    /// [`Self::thold_pt`].
+    pub thold_ptsum: f32,
     /// Enable the extra alignment pass that produces real word timestamps
     pub dtw_token_timestamps: bool,
     /// Repetition penalty (> 1.0 penalizes already generated tokens, default 1.0)
@@ -170,6 +183,11 @@ impl Default for WhisperParams {
             flash_attn: false,
             tdrz_enable: false,
             dtw_aheads_preset: crate::dtw::AlignmentHeadsPreset::None,
+            dtw_n_top: -1,
+            dtw_aheads: Vec::new(),
+            dtw_mem_size: 128 * 1024 * 1024,
+            thold_pt: 0.01,
+            thold_ptsum: 0.01,
             dtw_token_timestamps: false,
             max_len: 0,
             split_on_word: false,
@@ -322,6 +340,30 @@ impl FullParamsBuilder {
 
     pub fn no_context(mut self, no_context: bool) -> Self {
         self.params.no_context = no_context;
+        self
+    }
+
+    /// Number of top text layers for `NTopMost` alignment heads.
+    pub fn dtw_n_top(mut self, n: i32) -> Self {
+        self.params.dtw_n_top = n;
+        self
+    }
+
+    /// Caller-provided `(text layer, attention head)` pairs for `Custom`.
+    pub fn dtw_aheads(mut self, heads: Vec<(usize, usize)>) -> Self {
+        self.params.dtw_aheads = heads;
+        self
+    }
+
+    /// Token timestamp probability threshold (C ABI parity).
+    pub fn thold_pt(mut self, value: f32) -> Self {
+        self.params.thold_pt = value;
+        self
+    }
+
+    /// Token timestamp sum-probability threshold (C ABI parity).
+    pub fn thold_ptsum(mut self, value: f32) -> Self {
+        self.params.thold_ptsum = value;
         self
     }
 

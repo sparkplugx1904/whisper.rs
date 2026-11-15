@@ -292,6 +292,18 @@ fn test_c_abi_param_allocators_and_deleters() {
         );
         assert!(!(*cparams).use_gpu);
         assert_eq!((*cparams).dtw_aheads_preset, 0);
+        assert_eq!(
+            (*cparams).dtw_n_top,
+            -1,
+            "upstream default is -1; N_TOP_MOST requires an explicit count"
+        );
+        assert_eq!((*cparams).dtw_aheads.n_heads, 0);
+        assert!((*cparams).dtw_aheads.heads.is_null());
+        assert_eq!(
+            (*cparams).dtw_mem_size,
+            128 * 1024 * 1024,
+            "upstream default DTW arena is 128 MiB"
+        );
 
         (*cparams).use_gpu = true;
         assert!((*cparams).use_gpu);

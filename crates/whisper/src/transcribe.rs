@@ -1,8 +1,8 @@
 use crate::beam::BeamSearch;
 use crate::decoder::{DecoderKvCache, DecoderWorkspace, WhisperDecoder};
 use crate::dtw::{
-    align_dtw_from_cost, approximate_word_timings, dtw_cost_from_attention, get_alignment_heads,
-    merge_tokens_to_words_clamped,
+    align_dtw_from_cost, approximate_word_timings, dtw_cost_from_attention,
+    merge_tokens_to_words_clamped, resolve_alignment_heads,
 };
 use crate::encoder::WhisperEncoder;
 use crate::filter::{
@@ -14,6 +14,7 @@ use crate::params::WhisperParams;
 use crate::segment::Segment;
 use crate::speech_map::SpeechMap;
 use crate::state::WhisperState;
+use crate::timing::Timings;
 use std::path::Path;
 use std::time::Instant;
 use whisper_audio::mel::MelSpectrogram;
@@ -90,9 +91,12 @@ impl WhisperContext {
         // of letting the decoder hallucinate text over silence.
         let speech_map = SpeechMap::from_samples(samples, params);
         if let Some(map) = &speech_map {
+            state.vad_segments = map.ranges().to_vec();
             if map.is_empty() {
                 return Ok(());
             }
+        } else {
+            state.clear_vad();
         }
 
         let mel_start = Instant::now();
@@ -109,9 +113,21 @@ impl WhisperContext {
 
     /// Transcribe raw PCM float samples (16,000 Hz mono in range [-1.0, 1.0]).
     pub fn transcribe_pcm(&self, samples: &[f32], params: &WhisperParams) -> Vec<Segment> {
+        self.transcribe_pcm_with_timings(samples, params).0
+    }
+
+    /// Transcribe PCM and return the accumulated phase telemetry alongside the
+    /// segments. `transcribe_pcm` drops the state after the call, which leaves
+    /// CLI callers no way to print the real timings.
+    pub fn transcribe_pcm_with_timings(
+        &self,
+        samples: &[f32],
+        params: &WhisperParams,
+    ) -> (Vec<Segment>, Timings) {
         let mut state = self.create_state();
         let _ = self.full(&mut state, params, samples);
-        state.segments
+        let timings = state.timings;
+        (state.segments, timings)
     }
 
     /// Transcribe a WAV audio file directly from disk.
@@ -902,6 +918,8 @@ impl WhisperContext {
                 self.compute_window_alignment(
                     state,
                     params.dtw_aheads_preset,
+                    params.dtw_n_top,
+                    &params.dtw_aheads,
                     &tokens_cur,
                     &enc_out,
                     seek_time,
@@ -921,8 +939,12 @@ impl WhisperContext {
                 } else {
                     tokens_cur.len().max(1)
                 };
-                for chunk in tokens_cur.chunks(max_tok) {
+                for (chunk_index, chunk) in tokens_cur.chunks(max_tok).enumerate() {
                     let t1 = (seek_time + chunk_sec).min(total_audio_sec);
+                    let start = chunk_index * max_tok;
+                    let chunk_probs = token_logprobs
+                        .get(start..start + chunk.len())
+                        .unwrap_or(&[]);
                     let seg = self.build_segment(
                         params,
                         dtw_alignment.as_ref(),
@@ -930,6 +952,7 @@ impl WhisperContext {
                         seek_time,
                         t1,
                         chunk,
+                        chunk_probs,
                         SegmentStats {
                             avg_logprob,
                             no_speech_prob,
@@ -997,13 +1020,14 @@ impl WhisperContext {
                 }
 
                 let mut seg_tokens = Vec::new();
+                let mut seg_probs = Vec::new();
                 let mut seg_t0 = seek_time;
                 let mut last_ts_time = seek_time;
 
-                for &tok in &tokens_cur {
+                for (token_index, &tok) in tokens_cur.iter().enumerate() {
                     if tok >= beg {
                         let rel_sec = (tok - beg) as f64 * 0.02;
-                        let abs_sec = seek_time + rel_sec;
+                        let abs_sec = (seek_time + rel_sec).min(total_audio_sec);
                         last_ts_time = abs_sec;
 
                         if seg_tokens.is_empty() {
@@ -1016,6 +1040,7 @@ impl WhisperContext {
                                 seg_t0,
                                 abs_sec,
                                 &seg_tokens,
+                                &seg_probs,
                                 SegmentStats {
                                     avg_logprob,
                                     no_speech_prob,
@@ -1029,14 +1054,18 @@ impl WhisperContext {
                                 segments.push(seg);
                                 if params.single_segment {
                                     seg_tokens.clear();
+                                    seg_probs.clear();
                                     break;
                                 }
                             }
                             seg_tokens.clear();
+                            seg_probs.clear();
                             seg_t0 = abs_sec;
                         }
                     } else {
                         seg_tokens.push(tok);
+                        seg_probs
+                            .push(token_logprobs.get(token_index).copied().unwrap_or(f32::NAN));
                         if params.max_tokens > 0 && seg_tokens.len() >= params.max_tokens {
                             let t_mid =
                                 (seg_t0 + (seg_tokens.len() as f64 * 0.2)).min(total_audio_sec);
@@ -1047,6 +1076,7 @@ impl WhisperContext {
                                 seg_t0,
                                 t_mid,
                                 &seg_tokens,
+                                &seg_probs,
                                 SegmentStats {
                                     avg_logprob,
                                     no_speech_prob,
@@ -1060,10 +1090,12 @@ impl WhisperContext {
                                 segments.push(seg);
                                 if params.single_segment {
                                     seg_tokens.clear();
+                                    seg_probs.clear();
                                     break;
                                 }
                             }
                             seg_tokens.clear();
+                            seg_probs.clear();
                             seg_t0 = t_mid;
                         }
                     }
@@ -1085,6 +1117,7 @@ impl WhisperContext {
                         seg_t0,
                         t1,
                         &seg_tokens,
+                        &seg_probs,
                         SegmentStats {
                             avg_logprob,
                             no_speech_prob,
@@ -1134,6 +1167,34 @@ impl WhisperContext {
         segments
     }
 
+    fn voice_length(text: &str) -> f32 {
+        let mut result = 0.0f32;
+        for ch in text.chars() {
+            result += match ch {
+                ' ' | '\u{3000}' => 0.01,
+                ',' | '\u{FF0C}' | '\u{3001}' | '\u{FF1B}' | '\u{FF1A}' => 2.0,
+                '.' | '!' | '?' | '\u{3002}' | '\u{FF0E}' | '\u{FF01}' | '\u{FF1F}'
+                | '\u{2026}' => 3.0,
+                '0'..='9' | '\u{FF10}'..='\u{FF19}' => 3.0,
+                _ => 1.0,
+            };
+        }
+        result
+    }
+
+    /// A segment shorter than this cannot contain more than a few words at a
+    /// human speaking rate. The previous-window prompt echo appears as a 40 ms
+    /// segment carrying a whole window of text; dropping it here keeps it out
+    /// of the output while the timestamp logic still advances normally.
+    const MAX_WORDS_PER_SECOND: f64 = 12.0;
+
+    fn has_plausible_word_density(duration: f64, words: usize) -> bool {
+        if words == 0 {
+            return true;
+        }
+        duration > 0.0 && words as f64 / duration <= Self::MAX_WORDS_PER_SECOND
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_segment(
         &self,
@@ -1143,6 +1204,7 @@ impl WhisperContext {
         seg_t0: f64,
         seg_t1: f64,
         tokens: &[i32],
+        token_logprobs: &[f32],
         stats: SegmentStats,
     ) -> Segment {
         let mut text = self.tokenizer.decode(tokens, true);
@@ -1151,6 +1213,10 @@ impl WhisperContext {
             && !text.starts_with("[SPEAKER_TURN]")
         {
             text = format!("[SPEAKER_TURN] {}", text.trim());
+        }
+
+        if !Self::has_plausible_word_density(seg_t1 - seg_t0, text.split_whitespace().count()) {
+            text.clear();
         }
 
         // Word timings are derived from ordinary text tokens only. Timestamp
@@ -1186,7 +1252,7 @@ impl WhisperContext {
                 approximate_word_timings(&token_tuples, seg_t0, seg_t1, 0.02)
             });
 
-        Segment::with_stats(
+        let mut segment = Segment::with_stats(
             seg_t0,
             seg_t1,
             text,
@@ -1195,7 +1261,26 @@ impl WhisperContext {
             stats.avg_logprob,
             stats.no_speech_prob,
             stats.avg_entropy,
-        )
+        );
+        segment.token_logprobs = token_logprobs.to_vec();
+        segment.token_vlen = tokens
+            .iter()
+            .map(|&tok| {
+                self.tokenizer
+                    .id_to_token(tok)
+                    .map(Self::voice_length)
+                    .unwrap_or(0.0)
+            })
+            .collect();
+        let eot = self.tokenizer.eot();
+        segment.special_text = tokens
+            .iter()
+            .copied()
+            .filter(|&tok| tok >= eot)
+            .filter_map(|tok| self.tokenizer.id_to_token(tok))
+            .collect::<Vec<_>>()
+            .join("");
+        segment
     }
 
     /// Align every text token of one audio window with the decoder's real
@@ -1212,6 +1297,8 @@ impl WhisperContext {
         &self,
         state: &mut WhisperState,
         preset: crate::dtw::AlignmentHeadsPreset,
+        n_top: i32,
+        custom_heads: &[(usize, usize)],
         tokens: &[i32],
         enc_out: &[f32],
         seek_time: f64,
@@ -1219,11 +1306,13 @@ impl WhisperContext {
         total_audio_sec: f64,
         beg: i32,
     ) -> Option<WindowAlignment> {
-        let heads: Vec<(usize, usize)> = get_alignment_heads(preset)
-            .iter()
-            .copied()
-            .filter(|&(layer, head)| layer < self.decoder.n_layers && head < self.decoder.n_heads)
-            .collect();
+        let heads = resolve_alignment_heads(
+            preset,
+            n_top,
+            custom_heads,
+            self.decoder.n_layers,
+            self.decoder.n_heads,
+        );
         if heads.is_empty() || enc_out.is_empty() {
             return None;
         }
@@ -1823,5 +1912,26 @@ mod dedupe_tests {
             segment(3.26, 8.94, "Voice of Trisma, the best online radio in Bali"),
         ];
         assert_eq!(deduplicate_segments(segments).len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod density_tests {
+    use super::WhisperContext;
+
+    #[test]
+    fn rejects_a_window_echo_compressed_into_40_ms() {
+        assert!(!WhisperContext::has_plausible_word_density(0.04, 94));
+    }
+
+    #[test]
+    fn rejects_a_four_word_tail_in_180_ms() {
+        assert!(!WhisperContext::has_plausible_word_density(0.18, 4));
+    }
+
+    #[test]
+    fn keeps_normal_speech_rates() {
+        assert!(WhisperContext::has_plausible_word_density(0.20, 1));
+        assert!(WhisperContext::has_plausible_word_density(30.0, 94));
     }
 }

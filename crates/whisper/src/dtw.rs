@@ -43,6 +43,38 @@ pub fn preset_for_model(
     }
 }
 
+/// Resolve the heads used for DTW, including the two presets that depend on
+/// the loaded model. whisper.cpp selects every head of the `n_top` deepest
+/// text layers for `N_TOP_MOST`, and the caller's list for `CUSTOM`.
+pub fn resolve_alignment_heads(
+    preset: AlignmentHeadsPreset,
+    n_top: i32,
+    custom: &[(usize, usize)],
+    n_layers: usize,
+    n_heads: usize,
+) -> Vec<(usize, usize)> {
+    let valid = |&(layer, head): &(usize, usize)| layer < n_layers && head < n_heads;
+    match preset {
+        AlignmentHeadsPreset::None => Vec::new(),
+        AlignmentHeadsPreset::NTopMost => {
+            let n_top = n_top.max(0) as usize;
+            if n_top == 0 || n_top > n_layers {
+                return Vec::new();
+            }
+            let first = n_layers - n_top;
+            (first..n_layers)
+                .flat_map(|layer| (0..n_heads).map(move |head| (layer, head)))
+                .collect()
+        }
+        AlignmentHeadsPreset::Custom => custom.iter().copied().filter(valid).collect(),
+        preset => get_alignment_heads(preset)
+            .iter()
+            .copied()
+            .filter(valid)
+            .collect(),
+    }
+}
+
 pub fn get_alignment_heads(preset: AlignmentHeadsPreset) -> &'static [(usize, usize)] {
     // Values mirror `g_aheads_*` in whisper.cpp. A head is `(text_layer,
     // attention_head)`, and the upstream presets are the calibration data used
@@ -552,4 +584,34 @@ pub fn approximate_word_timings(
 
     let alignments = align_dtw(&att, tokens.len(), n_frames);
     merge_tokens_to_words_clamped(tokens, &alignments, seg_t0, seg_t1, seg_t0, frame_step_sec)
+}
+
+#[cfg(test)]
+mod head_tests {
+    use super::{resolve_alignment_heads, AlignmentHeadsPreset};
+
+    #[test]
+    fn n_top_most_takes_every_head_of_the_deepest_layers() {
+        let heads = resolve_alignment_heads(AlignmentHeadsPreset::NTopMost, 2, &[], 4, 3);
+        assert_eq!(heads, vec![(2, 0), (2, 1), (2, 2), (3, 0), (3, 1), (3, 2)]);
+    }
+
+    #[test]
+    fn invalid_n_top_disables_alignment_instead_of_panicking() {
+        assert!(resolve_alignment_heads(AlignmentHeadsPreset::NTopMost, 0, &[], 4, 3).is_empty());
+        assert!(resolve_alignment_heads(AlignmentHeadsPreset::NTopMost, 5, &[], 4, 3).is_empty());
+        assert!(resolve_alignment_heads(AlignmentHeadsPreset::NTopMost, -1, &[], 4, 3).is_empty());
+    }
+
+    #[test]
+    fn custom_heads_are_filtered_to_the_model() {
+        let heads = resolve_alignment_heads(
+            AlignmentHeadsPreset::Custom,
+            0,
+            &[(1, 2), (4, 0), (2, 9)],
+            4,
+            3,
+        );
+        assert_eq!(heads, vec![(1, 2)]);
+    }
 }
