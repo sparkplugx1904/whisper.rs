@@ -1730,21 +1730,28 @@ pub unsafe extern "C" fn whisper_full_get_token_data_from_state(
             let p = if plog.is_finite() { plog.exp() } else { prob };
             let vlen = seg.token_vlen.get(i_token as usize).copied().unwrap_or(0.0);
 
-            let is_timestamp = tok_id >= 50257;
+            let tid = seg.token_tid.get(i_token as usize).copied().unwrap_or(0);
+            let pt = seg.token_pt.get(i_token as usize).copied().unwrap_or(0.0);
+            let ptsum = seg
+                .token_ptsum
+                .get(i_token as usize)
+                .copied()
+                .unwrap_or(0.0);
+            let t_dtw = seg.token_t_dtw.get(i_token as usize).copied().unwrap_or(-1);
             return whisper_token_data {
                 id: tok_id,
-                tid: if is_timestamp { tok_id } else { 0 },
+                tid,
                 p,
                 plog: if plog.is_finite() {
                     plog
                 } else {
                     p.max(1e-6).ln()
                 },
-                pt: if is_timestamp { p } else { 0.0 },
-                ptsum: if is_timestamp { p } else { 0.0 },
+                pt,
+                ptsum,
                 t0: t0_cs,
                 t1: t1_cs,
-                t_dtw: if seg.words.is_empty() { -1 } else { t0_cs },
+                t_dtw,
                 vlen,
             };
         }

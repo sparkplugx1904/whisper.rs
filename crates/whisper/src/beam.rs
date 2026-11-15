@@ -12,6 +12,10 @@ pub struct BeamCandidate {
     pub tokens: Vec<i32>,
     /// Per-token log-probability, used for the fallback average-logprob check.
     pub token_logprobs: Vec<f32>,
+    /// Timestamp probability and mass carried by each selected token.
+    pub token_pt: Vec<f32>,
+    pub token_ptsum: Vec<f32>,
+    pub token_tid: Vec<i32>,
     pub cumulative_logprob: f64,
     /// Arena slot holding this hypothesis' self-attention history.
     pub slot: usize,
@@ -20,6 +24,48 @@ pub struct BeamCandidate {
     /// Number of tokens up to and including the last timestamp after the
     /// leading `<|0.00|>` marker. whisper.cpp scores only this prefix.
     pub result_len: usize,
+}
+
+/// Return `(argmax timestamp token, timestamp probability, timestamp mass)`
+/// for one logits row. Timestamp tokens start at `beg`; the probabilities are
+/// normalized over the full row, matching whisper.cpp's token metadata.
+pub(crate) fn timestamp_stats(logits: &[f32], beg: i32) -> (i32, f32, f32) {
+    let mut max_l = f32::NEG_INFINITY;
+    for &l in logits {
+        if l > max_l {
+            max_l = l;
+        }
+    }
+    let mut sum_exp = 0.0f32;
+    for &l in logits {
+        if l > f32::NEG_INFINITY {
+            sum_exp += (l - max_l).exp();
+        }
+    }
+    let total = sum_exp.max(1e-10);
+    let mut sum_ts = 0.0f32;
+    let mut max_ts = 0.0f32;
+    let mut tid = beg.max(0);
+    if beg >= 0 {
+        for (index, &l) in logits.iter().enumerate().skip(beg as usize) {
+            if l == f32::NEG_INFINITY {
+                continue;
+            }
+            let p = (l - max_l).exp();
+            sum_ts += p;
+            if p > max_ts {
+                max_ts = p;
+                tid = index as i32;
+            }
+        }
+    }
+    let ptsum = sum_ts / total;
+    let pt = if ptsum > 0.0 {
+        max_ts / total / ptsum
+    } else {
+        0.0
+    };
+    (tid, pt, ptsum)
 }
 
 pub struct BeamSearch {
@@ -100,6 +146,9 @@ impl BeamSearch {
         let root = BeamCandidate {
             tokens: Vec::new(),
             token_logprobs: Vec::new(),
+            token_pt: Vec::new(),
+            token_ptsum: Vec::new(),
+            token_tid: Vec::new(),
             cumulative_logprob: 0.0,
             slot: 0,
             completed: false,
@@ -310,6 +359,18 @@ impl BeamSearch {
 
                 let mut token_logprobs = cand.token_logprobs.clone();
                 token_logprobs.push(logp);
+                let (ts_tid, ts_pt, ts_ptsum) = timestamp_stats(step_logits, beg);
+                let (step_tid, step_pt) = if tok >= beg {
+                    (tok, logp.exp())
+                } else {
+                    (ts_tid, ts_pt)
+                };
+                let mut token_pt = cand.token_pt.clone();
+                token_pt.push(step_pt);
+                let mut token_ptsum = cand.token_ptsum.clone();
+                token_ptsum.push(ts_ptsum);
+                let mut token_tid = cand.token_tid.clone();
+                token_tid.push(step_tid);
                 let result_len = if tok > beg {
                     new_tokens.len()
                 } else {
@@ -318,6 +379,9 @@ impl BeamSearch {
                 let branch = BeamCandidate {
                     tokens: new_tokens,
                     token_logprobs,
+                    token_pt,
+                    token_ptsum,
+                    token_tid,
                     cumulative_logprob: cand.cumulative_logprob + (logp as f64),
                     slot: cand.slot,
                     completed: is_completed,
@@ -481,12 +545,26 @@ mod selection_tests {
         BeamCandidate {
             cumulative_logprob: logprob as f64 * tokens.len() as f64,
             token_logprobs: vec![logprob; tokens.len()],
+            token_pt: vec![0.0; tokens.len()],
+            token_ptsum: vec![0.0; tokens.len()],
+            token_tid: vec![0; tokens.len()],
             tokens,
             slot: 0,
             completed: true,
             last_timestamp: Some(last_timestamp),
             result_len,
         }
+    }
+
+    #[test]
+    fn timestamp_stats_report_the_timestamp_distribution() {
+        let mut logits = vec![f32::NEG_INFINITY; 7];
+        logits[5] = 0.0;
+        logits[6] = 0.0;
+        let (tid, pt, ptsum) = super::timestamp_stats(&logits, 5);
+        assert_eq!(tid, 5);
+        assert!((pt - 0.5).abs() < 1e-6);
+        assert!((ptsum - 1.0).abs() < 1e-6);
     }
 
     #[test]

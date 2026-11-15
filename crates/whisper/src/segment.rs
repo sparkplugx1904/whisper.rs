@@ -10,6 +10,14 @@ pub struct Segment {
     pub token_logprobs: Vec<f32>,
     /// Weighted token length used by whisper.cpp word timing distribution.
     pub token_vlen: Vec<f32>,
+    /// Timestamp-token probability at each decoding step.
+    pub token_pt: Vec<f32>,
+    /// Total timestamp probability mass at each decoding step.
+    pub token_ptsum: Vec<f32>,
+    /// Argmax timestamp token at each decoding step.
+    pub token_tid: Vec<i32>,
+    /// DTW token start in centiseconds; -1 when no alignment was computed.
+    pub token_t_dtw: Vec<i64>,
     /// Rendered special tokens (timestamps and control tokens) for `-ps`.
     pub special_text: String,
     pub words: Vec<WordTiming>,
@@ -28,6 +36,10 @@ impl Segment {
             tokens,
             token_logprobs: Vec::new(),
             token_vlen: Vec::new(),
+            token_pt: Vec::new(),
+            token_ptsum: Vec::new(),
+            token_tid: Vec::new(),
+            token_t_dtw: Vec::new(),
             special_text: String::new(),
             words: Vec::new(),
             avg_logprob: -0.2,
@@ -51,6 +63,10 @@ impl Segment {
             tokens,
             token_logprobs: Vec::new(),
             token_vlen: Vec::new(),
+            token_pt: Vec::new(),
+            token_ptsum: Vec::new(),
+            token_tid: Vec::new(),
+            token_t_dtw: Vec::new(),
             special_text: String::new(),
             words,
             avg_logprob: -0.2,
@@ -78,6 +94,10 @@ impl Segment {
             tokens,
             token_logprobs: Vec::new(),
             token_vlen: Vec::new(),
+            token_pt: Vec::new(),
+            token_ptsum: Vec::new(),
+            token_tid: Vec::new(),
+            token_t_dtw: Vec::new(),
             special_text: String::new(),
             words,
             avg_logprob,

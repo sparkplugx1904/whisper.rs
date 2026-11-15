@@ -451,6 +451,9 @@ impl WhisperContext {
             let mut temperature = params.temperature;
             let mut tokens_cur = Vec::new();
             let mut token_logprobs = Vec::new();
+            let mut token_pt = Vec::new();
+            let mut token_ptsum = Vec::new();
+            let mut token_tid = Vec::new();
             let mut token_entropies = Vec::new();
             let mut no_speech_prob = 0.01f32;
             // Upstream retries a failed window at increasing temperature but
@@ -479,6 +482,9 @@ impl WhisperContext {
                 };
                 tokens_cur.clear();
                 token_logprobs.clear();
+                token_pt.clear();
+                token_ptsum.clear();
+                token_tid.clear();
                 token_entropies.clear();
                 // Beam search keeps one KV arena slot per branch, so branching
                 // never deep-copies an entire cache; greedy decoding needs one.
@@ -577,6 +583,8 @@ impl WhisperContext {
                         .timings
                         .add_sample(sample_start.elapsed().as_micros() as u64);
 
+                    let (seed_tid, seed_pt, seed_ptsum) =
+                        crate::beam::timestamp_stats(step_logits, beg);
                     beam.set_seeds(
                         seed_tokens
                             .into_iter()
@@ -588,9 +596,17 @@ impl WhisperContext {
                                 if slot > 0 {
                                     cache.copy_slot(slot, 0);
                                 }
+                                let (step_tid, step_pt) = if tok >= beg {
+                                    (tok, l.exp())
+                                } else {
+                                    (seed_tid, seed_pt)
+                                };
                                 crate::beam::BeamCandidate {
                                     tokens: vec![tok],
                                     token_logprobs: vec![l],
+                                    token_pt: vec![step_pt],
+                                    token_ptsum: vec![seed_ptsum],
+                                    token_tid: vec![step_tid],
                                     cumulative_logprob: l as f64,
                                     slot,
                                     completed: tok == eot,
@@ -635,6 +651,9 @@ impl WhisperContext {
                     if let Some(best) = beam.best_candidate(length_penalty, beg) {
                         tokens_cur = best.tokens.clone();
                         token_logprobs = best.token_logprobs.clone();
+                        token_pt = best.token_pt.clone();
+                        token_ptsum = best.token_ptsum.clone();
+                        token_tid = best.token_tid.clone();
                     }
                 } else {
                     // GREEDY DECODING
@@ -787,6 +806,16 @@ impl WhisperContext {
                         let lse = max_l + sum_exp.max(1e-10).ln();
                         let logprob = best_logit - lse;
                         token_logprobs.push(logprob);
+                        let (ts_tid, ts_pt, ts_ptsum) =
+                            crate::beam::timestamp_stats(step_logits, beg);
+                        let (step_tid, step_pt) = if best_id >= beg {
+                            (best_id, logprob.exp())
+                        } else {
+                            (ts_tid, ts_pt)
+                        };
+                        token_tid.push(step_tid);
+                        token_pt.push(step_pt);
+                        token_ptsum.push(ts_ptsum);
 
                         let step_entropy = crate::filter::compute_distribution_entropy(step_logits);
                         token_entropies.push(step_entropy);
@@ -839,6 +868,9 @@ impl WhisperContext {
                     best_attempt = Some(DecodeAttempt {
                         tokens: tokens_cur.clone(),
                         token_logprobs: token_logprobs.clone(),
+                        token_pt: token_pt.clone(),
+                        token_ptsum: token_ptsum.clone(),
+                        token_tid: token_tid.clone(),
                         token_entropies: token_entropies.clone(),
                         no_speech_prob,
                         eval,
@@ -880,6 +912,9 @@ impl WhisperContext {
             let eval = if let Some(best) = best_attempt {
                 tokens_cur = best.tokens;
                 token_logprobs = best.token_logprobs;
+                token_pt = best.token_pt;
+                token_ptsum = best.token_ptsum;
+                token_tid = best.token_tid;
                 token_entropies = best.token_entropies;
                 no_speech_prob = best.no_speech_prob;
                 best.eval
@@ -945,6 +980,9 @@ impl WhisperContext {
                     let chunk_probs = token_logprobs
                         .get(start..start + chunk.len())
                         .unwrap_or(&[]);
+                    let chunk_pt = token_pt.get(start..start + chunk.len()).unwrap_or(&[]);
+                    let chunk_ptsum = token_ptsum.get(start..start + chunk.len()).unwrap_or(&[]);
+                    let chunk_tid = token_tid.get(start..start + chunk.len()).unwrap_or(&[]);
                     let seg = self.build_segment(
                         params,
                         dtw_alignment.as_ref(),
@@ -953,6 +991,9 @@ impl WhisperContext {
                         t1,
                         chunk,
                         chunk_probs,
+                        chunk_pt,
+                        chunk_ptsum,
+                        chunk_tid,
                         SegmentStats {
                             avg_logprob,
                             no_speech_prob,
@@ -1021,6 +1062,9 @@ impl WhisperContext {
 
                 let mut seg_tokens = Vec::new();
                 let mut seg_probs = Vec::new();
+                let mut seg_pt = Vec::new();
+                let mut seg_ptsum = Vec::new();
+                let mut seg_tid = Vec::new();
                 let mut seg_t0 = seek_time;
                 let mut last_ts_time = seek_time;
 
@@ -1041,6 +1085,9 @@ impl WhisperContext {
                                 abs_sec,
                                 &seg_tokens,
                                 &seg_probs,
+                                &seg_pt,
+                                &seg_ptsum,
+                                &seg_tid,
                                 SegmentStats {
                                     avg_logprob,
                                     no_speech_prob,
@@ -1055,11 +1102,17 @@ impl WhisperContext {
                                 if params.single_segment {
                                     seg_tokens.clear();
                                     seg_probs.clear();
+                                    seg_pt.clear();
+                                    seg_ptsum.clear();
+                                    seg_tid.clear();
                                     break;
                                 }
                             }
                             seg_tokens.clear();
                             seg_probs.clear();
+                            seg_pt.clear();
+                            seg_ptsum.clear();
+                            seg_tid.clear();
                             seg_t0 = abs_sec;
                         }
                     } else {
@@ -1077,6 +1130,9 @@ impl WhisperContext {
                                 t_mid,
                                 &seg_tokens,
                                 &seg_probs,
+                                &seg_pt,
+                                &seg_ptsum,
+                                &seg_tid,
                                 SegmentStats {
                                     avg_logprob,
                                     no_speech_prob,
@@ -1091,11 +1147,17 @@ impl WhisperContext {
                                 if params.single_segment {
                                     seg_tokens.clear();
                                     seg_probs.clear();
+                                    seg_pt.clear();
+                                    seg_ptsum.clear();
+                                    seg_tid.clear();
                                     break;
                                 }
                             }
                             seg_tokens.clear();
                             seg_probs.clear();
+                            seg_pt.clear();
+                            seg_ptsum.clear();
+                            seg_tid.clear();
                             seg_t0 = t_mid;
                         }
                     }
@@ -1118,6 +1180,9 @@ impl WhisperContext {
                         t1,
                         &seg_tokens,
                         &seg_probs,
+                        &seg_pt,
+                        &seg_ptsum,
+                        &seg_tid,
                         SegmentStats {
                             avg_logprob,
                             no_speech_prob,
@@ -1205,6 +1270,9 @@ impl WhisperContext {
         seg_t1: f64,
         tokens: &[i32],
         token_logprobs: &[f32],
+        token_pt: &[f32],
+        token_ptsum: &[f32],
+        token_tid: &[i32],
         stats: SegmentStats,
     ) -> Segment {
         let mut text = self.tokenizer.decode(tokens, true);
@@ -1263,6 +1331,10 @@ impl WhisperContext {
             stats.avg_entropy,
         );
         segment.token_logprobs = token_logprobs.to_vec();
+        segment.token_pt = token_pt.to_vec();
+        segment.token_ptsum = token_ptsum.to_vec();
+        segment.token_tid = token_tid.to_vec();
+        segment.token_t_dtw = vec![-1; tokens.len()];
         segment.token_vlen = tokens
             .iter()
             .map(|&tok| {
@@ -1772,6 +1844,9 @@ fn has_repetition_loop(text: &str) -> bool {
 struct DecodeAttempt {
     tokens: Vec<i32>,
     token_logprobs: Vec<f32>,
+    token_pt: Vec<f32>,
+    token_ptsum: Vec<f32>,
+    token_tid: Vec<i32>,
     token_entropies: Vec<f32>,
     no_speech_prob: f32,
     eval: FallbackEvaluation,
