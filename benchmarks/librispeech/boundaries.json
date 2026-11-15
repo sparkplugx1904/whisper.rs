@@ -1,0 +1,358 @@
+{
+  "sample_rate": 16000,
+  "gap_s": 0.2,
+  "total_samples": 2662080,
+  "total_duration_s": 166.38,
+  "clips": [
+    {
+      "index": 0,
+      "utterance": "2277-149896-0000",
+      "sentence": "HE WAS IN A FEVERED STATE OF MIND OWING TO THE BLIGHT HIS WIFE'S ACTION THREATENED TO CAST UPON HIS ENTIRE FUTURE",
+      "start_sample": 0,
+      "end_sample": 105440,
+      "start_s": 0.0,
+      "end_s": 6.59,
+      "samples": 105440
+    },
+    {
+      "index": 1,
+      "utterance": "2277-149896-0001",
+      "sentence": "HE WOULD HAVE TO PAY HER THE MONEY WHICH SHE WOULD NOW REGULARLY DEMAND OR THERE WOULD BE TROUBLE IT DID NOT MATTER WHAT HE DID",
+      "start_sample": 108640,
+      "end_sample": 222960,
+      "start_s": 6.79,
+      "end_s": 13.935,
+      "samples": 114320
+    },
+    {
+      "index": 2,
+      "utterance": "2277-149896-0002",
+      "sentence": "HURSTWOOD WALKED THE FLOOR MENTALLY ARRANGING THE CHIEF POINTS OF HIS SITUATION",
+      "start_sample": 226160,
+      "end_sample": 303520,
+      "start_s": 14.135,
+      "end_s": 18.97,
+      "samples": 77360
+    },
+    {
+      "index": 3,
+      "utterance": "2277-149896-0003",
+      "sentence": "HE ALSO THOUGHT OF HIS MANAGERIAL POSITION",
+      "start_sample": 306720,
+      "end_sample": 352160,
+      "start_s": 19.17,
+      "end_s": 22.01,
+      "samples": 45440
+    },
+    {
+      "index": 4,
+      "utterance": "2277-149896-0004",
+      "sentence": "HOW WOULD THE PAPERS TALK ABOUT IT",
+      "start_sample": 355360,
+      "end_sample": 386640,
+      "start_s": 22.21,
+      "end_s": 24.165,
+      "samples": 31280
+    },
+    {
+      "index": 5,
+      "utterance": "2277-149896-0005",
+      "sentence": "MANY LITTLE WRINKLES GATHERED BETWEEN HIS EYES AS HE CONTEMPLATED THIS AND HIS BROW MOISTENED",
+      "start_sample": 389840,
+      "end_sample": 479440,
+      "start_s": 24.365,
+      "end_s": 29.965,
+      "samples": 89600
+    },
+    {
+      "index": 6,
+      "utterance": "2277-149896-0006",
+      "sentence": "HE COULD ARRANGE THAT SATISFACTORILY FOR CARRIE WOULD BE GLAD TO WAIT IF NECESSARY",
+      "start_sample": 482640,
+      "end_sample": 562160,
+      "start_s": 30.165,
+      "end_s": 35.135,
+      "samples": 79520
+    },
+    {
+      "index": 7,
+      "utterance": "2277-149896-0007",
+      "sentence": "HE WOULD SEE HOW THINGS TURNED OUT TO MORROW AND THEN HE WOULD TALK TO HER THEY WERE GOING TO MEET AS USUAL",
+      "start_sample": 565360,
+      "end_sample": 651360,
+      "start_s": 35.335,
+      "end_s": 40.71,
+      "samples": 86000
+    },
+    {
+      "index": 8,
+      "utterance": "2277-149896-0008",
+      "sentence": "FOR SOME REASON HE FELT AS IF SOMETHING MIGHT COME THAT WAY AND WAS RELIEVED WHEN ALL THE ENVELOPES HAD BEEN SCANNED AND NOTHING SUSPICIOUS NOTICED",
+      "start_sample": 654560,
+      "end_sample": 765600,
+      "start_s": 40.91,
+      "end_s": 47.85,
+      "samples": 111040
+    },
+    {
+      "index": 9,
+      "utterance": "2277-149896-0009",
+      "sentence": "WHILE THE DANGER HAD NOT LESSENED IT HAD NOT AS YET MATERIALISED AND WITH HIM NO NEWS WAS GOOD NEWS",
+      "start_sample": 768800,
+      "end_sample": 861840,
+      "start_s": 48.05,
+      "end_s": 53.865,
+      "samples": 93040
+    },
+    {
+      "index": 10,
+      "utterance": "2277-149896-0010",
+      "sentence": "SO LITTLE DID HE CONSIDER DROUET THAT IT NEVER ONCE OCCURRED TO HIM TO WORRY ABOUT HIS FINDING OUT",
+      "start_sample": 865040,
+      "end_sample": 949440,
+      "start_s": 54.065,
+      "end_s": 59.34,
+      "samples": 84400
+    },
+    {
+      "index": 11,
+      "utterance": "2277-149896-0011",
+      "sentence": "HE GREW RESTLESS AS HE RUMINATED AND THEN DECIDED THAT PERHAPS IT WAS NOTHING",
+      "start_sample": 952640,
+      "end_sample": 1024080,
+      "start_s": 59.54,
+      "end_s": 64.005,
+      "samples": 71440
+    },
+    {
+      "index": 12,
+      "utterance": "2277-149896-0012",
+      "sentence": "SHE HAD NOT BEEN ABLE TO GET AWAY THIS MORNING",
+      "start_sample": 1027280,
+      "end_sample": 1067200,
+      "start_s": 64.205,
+      "end_s": 66.7,
+      "samples": 39920
+    },
+    {
+      "index": 13,
+      "utterance": "2277-149896-0013",
+      "sentence": "HE WOULD GET ONE TO DAY IT WOULD PROBABLY BE ON HIS DESK WHEN HE GOT BACK HE WOULD LOOK FOR IT AT ONCE",
+      "start_sample": 1070400,
+      "end_sample": 1167840,
+      "start_s": 66.9,
+      "end_s": 72.99,
+      "samples": 97440
+    },
+    {
+      "index": 14,
+      "utterance": "2277-149896-0014",
+      "sentence": "AFTER A TIME HE GAVE UP WAITING AND DREARILY HEADED FOR THE MADISON CAR",
+      "start_sample": 1171040,
+      "end_sample": 1236160,
+      "start_s": 73.19,
+      "end_s": 77.26,
+      "samples": 65120
+    },
+    {
+      "index": 15,
+      "utterance": "2277-149896-0015",
+      "sentence": "HE WENT IN AND EXAMINED HIS LETTERS BUT THERE WAS NOTHING FROM CARRIE",
+      "start_sample": 1239360,
+      "end_sample": 1298160,
+      "start_s": 77.46,
+      "end_s": 81.135,
+      "samples": 58800
+    },
+    {
+      "index": 16,
+      "utterance": "2277-149896-0016",
+      "sentence": "FORTUNATELY THERE WAS NOTHING FROM HIS WIFE EITHER",
+      "start_sample": 1301360,
+      "end_sample": 1345920,
+      "start_s": 81.335,
+      "end_s": 84.12,
+      "samples": 44560
+    },
+    {
+      "index": 17,
+      "utterance": "2277-149896-0017",
+      "sentence": "AT ONE THIRTY HE WENT TO RECTOR'S FOR LUNCH AND WHEN HE RETURNED A MESSENGER WAS WAITING FOR HIM",
+      "start_sample": 1349120,
+      "end_sample": 1428880,
+      "start_s": 84.32,
+      "end_s": 89.305,
+      "samples": 79760
+    },
+    {
+      "index": 18,
+      "utterance": "2277-149896-0018",
+      "sentence": "HIS FIRST IMPULSE WAS TO WRITE BUT FOUR WORDS IN REPLY GO TO THE DEVIL",
+      "start_sample": 1432080,
+      "end_sample": 1504800,
+      "start_s": 89.505,
+      "end_s": 94.05,
+      "samples": 72720
+    },
+    {
+      "index": 19,
+      "utterance": "2277-149896-0019",
+      "sentence": "BUT HE COMPROMISED BY TELLING THE BOY THAT THERE WOULD BE NO REPLY",
+      "start_sample": 1508000,
+      "end_sample": 1564960,
+      "start_s": 94.25,
+      "end_s": 97.81,
+      "samples": 56960
+    },
+    {
+      "index": 20,
+      "utterance": "2277-149896-0020",
+      "sentence": "THEN HE SAT DOWN IN HIS CHAIR AND GAZED WITHOUT SEEING CONTEMPLATING THE RESULT OF HIS WORK",
+      "start_sample": 1568160,
+      "end_sample": 1652720,
+      "start_s": 98.01,
+      "end_s": 103.295,
+      "samples": 84560
+    },
+    {
+      "index": 21,
+      "utterance": "2277-149896-0021",
+      "sentence": "WHAT WOULD SHE DO ABOUT THAT THE CONFOUNDED WRETCH",
+      "start_sample": 1655920,
+      "end_sample": 1709840,
+      "start_s": 103.495,
+      "end_s": 106.865,
+      "samples": 53920
+    },
+    {
+      "index": 22,
+      "utterance": "2277-149896-0022",
+      "sentence": "LATER HOWEVER HIS OLD DISCRETION ASSERTED ITSELF",
+      "start_sample": 1713040,
+      "end_sample": 1767120,
+      "start_s": 107.065,
+      "end_s": 110.445,
+      "samples": 54080
+    },
+    {
+      "index": 23,
+      "utterance": "2277-149896-0023",
+      "sentence": "SOMETHING HAD TO BE DONE A CLIMAX WAS NEAR AND SHE WOULD NOT SIT IDLE",
+      "start_sample": 1770320,
+      "end_sample": 1832560,
+      "start_s": 110.645,
+      "end_s": 114.535,
+      "samples": 62240
+    },
+    {
+      "index": 24,
+      "utterance": "2277-149896-0024",
+      "sentence": "HE KNEW HER WELL ENOUGH TO KNOW THAT WHEN SHE HAD DECIDED UPON A PLAN SHE WOULD FOLLOW IT UP",
+      "start_sample": 1835760,
+      "end_sample": 1907760,
+      "start_s": 114.735,
+      "end_s": 119.235,
+      "samples": 72000
+    },
+    {
+      "index": 25,
+      "utterance": "2277-149896-0025",
+      "sentence": "HE AROSE FROM HIS CHAIR AND WENT AND LOOKED OUT INTO THE STREET",
+      "start_sample": 1910960,
+      "end_sample": 1965360,
+      "start_s": 119.435,
+      "end_s": 122.835,
+      "samples": 54400
+    },
+    {
+      "index": 26,
+      "utterance": "2277-149896-0026",
+      "sentence": "THE LONG DRIZZLE HAD BEGUN PEDESTRIANS HAD TURNED UP COLLARS AND TROUSERS AT THE BOTTOM",
+      "start_sample": 1968560,
+      "end_sample": 2047280,
+      "start_s": 123.035,
+      "end_s": 127.955,
+      "samples": 78720
+    },
+    {
+      "index": 27,
+      "utterance": "2277-149896-0027",
+      "sentence": "HURSTWOOD ALMOST EXCLAIMED OUT LOUD AT THE INSISTENCY OF THIS THING",
+      "start_sample": 2050480,
+      "end_sample": 2108000,
+      "start_s": 128.155,
+      "end_s": 131.75,
+      "samples": 57520
+    },
+    {
+      "index": 28,
+      "utterance": "2277-149896-0028",
+      "sentence": "HE PUT ON HIS HAT AND LOOKED AROUND FOR HIS UMBRELLA",
+      "start_sample": 2111200,
+      "end_sample": 2157600,
+      "start_s": 131.95,
+      "end_s": 134.85,
+      "samples": 46400
+    },
+    {
+      "index": 29,
+      "utterance": "2277-149896-0029",
+      "sentence": "HE WOULD HAVE SOME ARRANGEMENT OF THIS THING",
+      "start_sample": 2160800,
+      "end_sample": 2202400,
+      "start_s": 135.05,
+      "end_s": 137.65,
+      "samples": 41600
+    },
+    {
+      "index": 30,
+      "utterance": "2277-149896-0030",
+      "sentence": "HE BEGAN TO WISH THAT HE HAD COMPROMISED IN SOME WAY OR OTHER THAT HE HAD SENT THE MONEY PERHAPS HE COULD DO IT UP HERE",
+      "start_sample": 2205600,
+      "end_sample": 2306400,
+      "start_s": 137.85,
+      "end_s": 144.15,
+      "samples": 100800
+    },
+    {
+      "index": 31,
+      "utterance": "2277-149896-0031",
+      "sentence": "HE WOULD GO IN AND SEE ANYHOW HE WOULD HAVE NO ROW",
+      "start_sample": 2309600,
+      "end_sample": 2367360,
+      "start_s": 144.35,
+      "end_s": 147.96,
+      "samples": 57760
+    },
+    {
+      "index": 32,
+      "utterance": "2277-149896-0032",
+      "sentence": "BY THE TIME HE REACHED HIS OWN STREET HE WAS KEENLY ALIVE TO THE DIFFICULTIES OF HIS SITUATION AND WISHED OVER AND OVER THAT SOME SOLUTION WOULD OFFER ITSELF THAT HE COULD SEE HIS WAY OUT",
+      "start_sample": 2370560,
+      "end_sample": 2542880,
+      "start_s": 148.16,
+      "end_s": 158.93,
+      "samples": 172320
+    },
+    {
+      "index": 33,
+      "utterance": "2277-149896-0033",
+      "sentence": "THEN HE RANG THE BELL NO ANSWER",
+      "start_sample": 2546080,
+      "end_sample": 2591600,
+      "start_s": 159.13,
+      "end_s": 161.975,
+      "samples": 45520
+    },
+    {
+      "index": 34,
+      "utterance": "2277-149896-0034",
+      "sentence": "HE RANG AGAIN THIS TIME HARDER STILL NO ANSWER",
+      "start_sample": 2594800,
+      "end_sample": 2658880,
+      "start_s": 162.175,
+      "end_s": 166.18,
+      "samples": 64080
+    }
+  ]
+}

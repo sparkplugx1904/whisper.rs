@@ -1,0 +1,102 @@
+name: Benchmark LibriSpeech
+
+# Acceptance gate. Runs manually and nightly; engine edits never trigger it.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-librispeech
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      LIBRI_ROOT: ${{ runner.temp }}/libri
+      WHISPER_MODEL: ${{ github.workspace }}/models/ggml-large-v3-turbo.bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg time
+          python -m pip install "jiwer==4.0.0"
+
+      - name: Cache model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: librispeech-ggml-large-v3-turbo-v1
+
+      - name: Download model
+        run: bash scripts/download-ggml-model.sh large-v3-turbo models
+
+      - name: Build whisper-cli
+        run: cargo build --release -p whisper-cli
+
+      - name: Stage LibriSpeech chapter
+        run: |
+          mkdir -p "$LIBRI_ROOT"
+          curl -L --fail --retry 3 -o "$RUNNER_TEMP/dev-clean.tar.gz" \
+            https://www.openslr.org/resources/12/dev-clean.tar.gz
+          python benchmarks/librispeech/prepare_chapter.py \
+            --tar "$RUNNER_TEMP/dev-clean.tar.gz" \
+            --chapter dev-clean/2277/149896 \
+            --out "$LIBRI_ROOT"
+
+      - name: Require baseline
+        run: |
+          if [ ! -f benchmarks/librispeech/baseline.json ]; then
+            echo "::error::benchmarks/librispeech/baseline.json is missing;" \
+                 "bootstrap it from a reviewed build with SAVE_BASELINE=1" \
+                 "benchmarks/librispeech/run.sh full"
+            exit 1
+          fi
+
+      - name: Print baseline provenance
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path("benchmarks/librispeech/baseline.json").read_text())
+          for mode, entry in data.get("modes", {}).items():
+              print(f"{mode}: commit={entry.get('commit')} "
+                    f"binary_sha256={entry.get('binary_sha256')} "
+                    f"note={entry.get('note')}")
+          PY
+
+      - name: Run acceptance gate
+        run: bash benchmarks/librispeech/run.sh full
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: librispeech-gate
+          path: |
+            ${{ env.LIBRI_ROOT }}/runs/librispeech-full/
+            ${{ env.LIBRI_ROOT }}/boundaries.json
+            ${{ env.LIBRI_ROOT }}/reference.txt
+            ${{ env.LIBRI_ROOT }}/chapter.wav
+          if-no-files-found: warn
+          retention-days: 30

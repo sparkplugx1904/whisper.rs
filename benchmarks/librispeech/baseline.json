@@ -1,0 +1,49 @@
+{
+  "schema": "librispeech-gate-baseline/1",
+  "generated_at": "2026-11-15T00:32:57Z",
+  "modes": {
+    "full": {
+      "utterances": 35,
+      "audio_duration_s": 166.38,
+      "commit": "49eb25996cc4",
+      "binary_sha256": "6e09973652fa80a54efb07ac55698b8b899b59f5d6b6a4d9b182cd30cf398dc3",
+      "note": "fix3 accepted (IndependentVerifier, reviews addendum 7); source transcribe 122cba5c, beam 3a6b0899, filter 8f841311; binary sha256 6e099736; local RTF 4.918 vs 4.109 for the accepted pass-2 build (+19.7%, single runs on a contended box; mechanism not established). fix5 (source transcribe 1237ba1f, binary c9471857) is accepted separately; this baseline has not been re-bootstrapped from the clean commit 142ceba9",
+      "metrics": {
+        "wer": 0.005566,
+        "cer": 0.002502,
+        "reference_words": 539,
+        "hypothesis_words": 540,
+        "word_ratio": 1.0019,
+        "duplicate_segments": 0,
+        "repeated_ngrams": 0,
+        "unexplained_repeats": 0
+      },
+      "blocks": {
+        "0-30": {
+          "reference_words": 90,
+          "hypothesis_words": 90
+        },
+        "30-60": {
+          "reference_words": 102,
+          "hypothesis_words": 103
+        },
+        "60-90": {
+          "reference_words": 103,
+          "hypothesis_words": 104
+        },
+        "90-120": {
+          "reference_words": 96,
+          "hypothesis_words": 95
+        },
+        "120-150": {
+          "reference_words": 96,
+          "hypothesis_words": 102
+        },
+        "150-166.38": {
+          "reference_words": 52,
+          "hypothesis_words": 46
+        }
+      }
+    }
+  }
+}

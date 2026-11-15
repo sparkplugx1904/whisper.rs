@@ -1,0 +1,79 @@
+{
+  "schema": "vot-solo-fast-gate-baseline/1",
+  "generated_at": "2026-11-14T22:33:01Z",
+  "commit": null,
+  "label": null,
+  "wav": null,
+  "offset_s": 0.0,
+  "params": {
+    "language": "id",
+    "threads": 4,
+    "beam": 5
+  },
+  "windows": {
+    "0-120": {
+      "wer": 0.358156,
+      "cer": 0.30369,
+      "reference_words": 282,
+      "hypothesis_words": 200,
+      "word_ratio": 0.7092,
+      "duplicate_segments": 0,
+      "repeated_ngrams": 2,
+      "unexplained_repeats": 0,
+      "blocks": {
+        "0-30": {
+          "reference_words": 67,
+          "hypothesis_words": 9,
+          "word_ratio": 0.1343
+        },
+        "30-60": {
+          "reference_words": 48,
+          "hypothesis_words": 63,
+          "word_ratio": 1.3125
+        },
+        "60-90": {
+          "reference_words": 60,
+          "hypothesis_words": 60,
+          "word_ratio": 1.0
+        },
+        "90-120": {
+          "reference_words": 61,
+          "hypothesis_words": 68,
+          "word_ratio": 1.1148
+        }
+      }
+    },
+    "1480-1580": {
+      "wer": 0.466346,
+      "cer": 0.39894,
+      "reference_words": 208,
+      "hypothesis_words": 160,
+      "word_ratio": 0.7692,
+      "duplicate_segments": 0,
+      "repeated_ngrams": 0,
+      "unexplained_repeats": 0,
+      "blocks": {
+        "1480-1510": {
+          "reference_words": 59,
+          "hypothesis_words": 45,
+          "word_ratio": 0.7627
+        },
+        "1510-1540": {
+          "reference_words": 65,
+          "hypothesis_words": 25,
+          "word_ratio": 0.3846
+        },
+        "1540-1570": {
+          "reference_words": 38,
+          "hypothesis_words": 69,
+          "word_ratio": 1.8158
+        },
+        "1570-1580": {
+          "reference_words": 0,
+          "hypothesis_words": 21,
+          "word_ratio": null
+        }
+      }
+    }
+  }
+}

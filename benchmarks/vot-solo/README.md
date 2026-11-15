@@ -56,6 +56,40 @@ computed on the full concatenated transcript and is the primary metric.
 - `worst_error_share` shows how concentrated the errors are: a small set of
   clips dominating the error mass is usually a content problem (names, numbers,
   music), not a uniform model weakness.
+
+## Fast gate
+
+`fast_gate.py` scores an existing run directory over the two staged slices
+(0-120 s and 1480-1580 s) instead of re-transcribing the whole recording:
+
+```bash
+replica/coordination/bench.sh <label> target/release/whisper-cli \
+  /tmp/vot-solo/slice_0_120.wav /tmp/vot-solo/runs/<label> 5
+python3 benchmarks/vot-solo/fast_gate.py /tmp/vot-solo/runs/<label> \
+  --windows 0-120 --baseline benchmarks/vot-solo/baseline_windows.json
+```
+
+`baseline_windows.json` is generated from the `236d89d` artifact:
+
+```bash
+python3 benchmarks/vot-solo/fast_gate.py /tmp/vot-art \
+  --windows 0-120,1480-1580 --no-baseline --max-wer 1.0 \
+  --save-baseline benchmarks/vot-solo/baseline_windows.json
+```
+
+The gate fails on a WER above the baseline window, duplicate segments, an
+8-gram loop, a window that emits more than 1.25x the reference word count with
+words the reference itself never contains, or a 30 s block that emits less than
+half the words the baseline emitted over the same audio (a reintroduced early
+stop is localized; the window aggregate hides it). `fixtures/` holds adversarial
+transcripts that must fail; regenerate them with
+
+```bash
+python3 benchmarks/vot-solo/fixtures/build.py \
+  --boundaries /tmp/vot-solo/boundaries.json \
+  --out benchmarks/vot-solo/fixtures
+```
+
 ## Measurement cadence
 
 Use two loops, not one:
@@ -74,7 +108,7 @@ Measured runs (large-v3-turbo F16, 4 threads, beam 5):
 | `236d89d` baseline | 14.88% | 2038 s | 1.021 | 5522 MB |
 | `13782e1` beam/timestamp/seek + loop fallback | 45.04% | 2830 s | 1.418 | 5532 MB |
 | `268464e` packed F16 + tail seek | 46.11% | 3785 s | 1.896 | 4016 MB |
-| `5e1a0ab` n-gram mask + greedy retry + clean prompt | running | - | - | - |
+| `5e1a0ab` n-gram mask + greedy retry + clean prompt | 35.61% | 4886 s | 2.448 | 4020 MB |
 
 The post-baseline WER numbers are dominated by a repetition-loop failure that
 the later guards target; use the guarded run as the next comparison point.

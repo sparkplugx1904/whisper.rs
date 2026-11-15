@@ -1,12 +1,10 @@
 name: Benchmark VOT solo
 
+# The VOT-Denpasar dataset is retired. This workflow is kept for the historical
+# report only and no longer runs on push; the acceptance gate is
+# benchmark-librispeech.yml.
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "benchmarks/vot-solo/**"
-      - "!benchmarks/vot-solo/**.md"
-      - ".github/workflows/benchmark-vot-solo.yml"
 
 permissions:
   contents: read
